@@ -22,28 +22,30 @@ if _TRITON_AVAILABLE:
         pid   = tl.program_id(0)
         pid_h = tl.program_id(1)
         pid_b = tl.program_id(2)
-        start = pid * BLOCK_N
+        start  = pid * BLOCK_N
         offs_n = start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
-        offs_d  = tl.arange(0, BLOCK_D)
-        mask_d  = offs_d < D
         offs_dh = tl.arange(0, BLOCK_Dh)
-        mask_dh = offs_dh < D_head
 
-        x = tl.load(
-            X_ptr + pid_b * stride_xb + pid_h * stride_xh + offs_n[:, None] * D + offs_d[None, :],
-            mask=mask_n[:, None] & mask_d[None, :], other=0.0,
-        )
-        x_norm_sq = tl.sum(x * x, axis=1)
+        acc_x_norm  = tl.zeros([BLOCK_N], dtype=tl.float32)
+        acc_xv_norm = tl.zeros([BLOCK_N, BLOCK_Dh], dtype=tl.float32)
 
-        wv = tl.load(
-            WV_ptr + pid_h * stride_wh + offs_d[:, None] * D_head + offs_dh[None, :],
-            mask=mask_d[:, None] & mask_dh[None, :], other=0.0,
-        )
-        xv = tl.dot(x, wv)
-        xv_norm_sq = tl.sum(xv * xv, axis=1)
+        for d_start in range(0, D, BLOCK_D):
+            offs_d = d_start + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D
+            x_chunk = tl.load(
+                X_ptr + pid_b * stride_xb + pid_h * stride_xh + offs_n[:, None] * D + offs_d[None, :],
+                mask=mask_n[:, None] & mask_d[None, :], other=0.0,
+            )
+            acc_x_norm += tl.sum(x_chunk * x_chunk, axis=1)
+            wv_chunk = tl.load(
+                WV_ptr + pid_h * stride_wh + offs_d[:, None] * D_head + offs_dh[None, :],
+                mask=mask_d[:, None] & (offs_dh[None, :] < D_head), other=0.0,
+            )
+            acc_xv_norm += tl.dot(x_chunk, wv_chunk)
 
-        tl.store(XNorm_ptr  + pid_b * stride_ob + pid_h * stride_oh + offs_n, tl.sqrt(x_norm_sq),  mask=mask_n)
+        xv_norm_sq = tl.sum(acc_xv_norm * acc_xv_norm, axis=1)
+        tl.store(XNorm_ptr  + pid_b * stride_ob + pid_h * stride_oh + offs_n, tl.sqrt(acc_x_norm),  mask=mask_n)
         tl.store(XVNorm_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_n, tl.sqrt(xv_norm_sq), mask=mask_n)
 
 
@@ -61,7 +63,7 @@ def compute_hybrid_energy_scores(X, WV, alpha=0.6):
 
     if X.is_cuda and _TRITON_AVAILABLE:
         BLOCK_N  = 64
-        BLOCK_D  = triton.next_power_of_2(D)
+        BLOCK_D  = 64
         BLOCK_Dh = triton.next_power_of_2(D_head)
         grid = (triton.cdiv(N, BLOCK_N), H, B)
         _hybrid_energy_kernel[grid](
@@ -90,21 +92,20 @@ def compute_hybrid_energy_scores(X, WV, alpha=0.6):
 
 def select_landmarks(scores, k, window_sizes, exclude_last=0):
     B, H, N = scores.shape
-    device  = scores.device
     cand_scores = scores.clone()
-
-    # Esclude solo i token RECENTI (ultimi max_w) — non i vecchi
-    # Token vecchi (j << i) sono candidati legittimi per ogni query
     max_w = int(window_sizes.max().item())
     if max_w > 0 and N > max_w:
         cand_scores[..., N - max_w:] = float("-inf")
     if exclude_last > 0:
         cand_scores[..., N - exclude_last:] = float("-inf")
-
     k_safe = min(k, N)
     _, top_idx = torch.topk(cand_scores, k=k_safe, dim=-1)
     top_idx, _ = top_idx.sort(dim=-1)
-    return top_idx.to(torch.int32)
+    top_idx = top_idx.to(torch.int32)
+    if k_safe < k:
+        pad = torch.zeros(B, H, k - k_safe, dtype=torch.int32, device=scores.device)
+        top_idx = torch.cat([top_idx, pad], dim=-1)
+    return top_idx
 
 
 def compute_landmark_idx(X, WV, window_sizes, k, alpha=0.6):

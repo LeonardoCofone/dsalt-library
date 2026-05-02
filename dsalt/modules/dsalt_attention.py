@@ -94,4 +94,4 @@ class DSALTAttention(nn.Module):
 
     def extra_repr(self):
         return (f"d_model={self.d_model}, n_heads={self.n_heads}, "
-                f"d_head={self.d_head}, k_lmk={self.k_lmk}, alpha={self.alpha}")
+                f"d_head={self.d_head}, k_lmk={self.k_lmk}, alpha={self.alpha_init}")
