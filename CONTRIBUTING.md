@@ -7,7 +7,7 @@ Thank you for your interest in contributing to DSALT! We welcome contributions f
 1. Fork the repository
 2. Clone your fork:
    ```bash
-   git clone https://github.com/yourusername/dsalt-pytorch.git
+   git clone https://github.com/LeonardoCofone/dsalt-pytorch.git
    cd dsalt-pytorch
    ```
 

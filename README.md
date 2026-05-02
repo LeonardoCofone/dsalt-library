@@ -52,7 +52,7 @@ pip install dsalt[flash-attn]
 
 ### Install from source
 ```bash
-git clone https://github.com/yourusername/dsalt-pytorch.git
+git clone https://github.com/LeonardoCofone/dsalt-pytorch.git
 cd dsalt-pytorch
 pip install -e .
 ```
@@ -164,16 +164,6 @@ python tests/test_sparse_attn.py  # Attention kernels
 python tests/test_dsalt_lm.py     # LM wrapper
 ```
 
-## 📊 Benchmarks
-
-DSALT achieves significant speedups over dense attention:
-
-- **Memory**: O(n) vs O(n²) for dense attention
-- **Speed**: 2-5x faster training on long sequences
-- **Quality**: Maintains perplexity comparable to dense models
-
-*Detailed benchmarks coming soon*
-
 ## 📖 Citation
 
 If you use DSALT in your research, please cite our paper:
@@ -181,9 +171,9 @@ If you use DSALT in your research, please cite our paper:
 ```bibtex
 @article{dsalt2024,
   title={Noise Accumulation and Rank Collapse in Dense Self-Attention: DSALT},
-  author={Your Name et al.},
-  journal={arXiv preprint},
-  year={2024}
+  author={Leonardo et al.},
+  journal={Zenodo preprint},
+  year={2026}
 }
 ```
 
