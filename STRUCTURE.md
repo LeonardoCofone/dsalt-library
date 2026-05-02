@@ -1,25 +1,62 @@
 ```
 └── 📁dsalt_pytorch
+    └── 📁.claude
+        ├── settings.local.json
     └── 📁dsalt
+        └── 📁__pycache__
+            ├── __init__.cpython-314.pyc
         └── 📁kernels
+            └── 📁__pycache__
+                ├── __init__.cpython-314.pyc
+                ├── hybrid_energy.cpython-314.pyc
+                ├── sparse_attn.cpython-314.pyc
+                ├── window_utils.cpython-314.pyc
             ├── __init__.py
             ├── hybrid_energy.py
             ├── sparse_attn.py
             ├── window_utils.py
         └── 📁model
-            ├── dsalt_lm.py (VUOTO)
+            └── 📁__pycache__
+                ├── __init__.cpython-314.pyc
+                ├── dsalt_lm.cpython-314.pyc
+            ├── __init__.py
+            ├── dsalt_lm.py
         └── 📁modules
+            └── 📁__pycache__
+                ├── __init__.cpython-314.pyc
+                ├── dsalt_attention.cpython-314.pyc
+                ├── dsalt_transformer.cpython-314.pyc
             ├── __init__.py
             ├── dsalt_attention.py
             ├── dsalt_transformer.py
         └── 📁training
+            └── 📁__pycache__
+                ├── __init__.cpython-314.pyc
+                ├── trainer.cpython-314.pyc
             ├── __init__.py
             ├── trainer.py
-        └── 📁utils  (VUOTO)
+        └── 📁utils
         ├── __init__.py
-    └── 📁experiments
+        ├── py.typed
+    └── 📁tests
+        └── 📁__pycache__
+            ├── test_dsalt_lm.cpython-314.pyc
+            ├── test_hybrid_energy.cpython-314.pyc
+            ├── test_sparse_attn.cpython-314.pyc
+        ├── test_dsalt_lm.py
+        ├── test_hybrid_energy.py
+        ├── test_sparse_attn.py
         ├── test.py
     ├── .gitignore
+    ├── CHANGELOG.md
+    ├── CONTRIBUTING.md
+    ├── LICENSE
+    ├── Makefile
+    ├── MANIFEST.in
+    ├── pyproject.toml
+    ├── README.md
+    ├── requirements-dev.txt
+    ├── requirements.txt
     ├── setup.py
     └── STRUCTURE.md
 ```

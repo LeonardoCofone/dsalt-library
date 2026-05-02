@@ -41,13 +41,15 @@ if _TRITON_AVAILABLE:
     @triton.jit
     def _hybrid_energy_kernel(
         X_ptr,          # [N, D]  input hidden states (one head, one batch)
-        WV_ptr,         # [D, D]  value projection matrix
+        WV_ptr,         # [D, D_head]  value projection matrix
         XNorm_ptr,      # [N]     output: ‖x_j‖₂
         XVNorm_ptr,     # [N]     output: ‖x_j W_V‖₂
         N: tl.constexpr,
         D: tl.constexpr,
+        D_head: tl.constexpr,
         BLOCK_N: tl.constexpr,   # tokens per program
         BLOCK_D: tl.constexpr,   # must be >= D, power-of-2
+        BLOCK_Dh: tl.constexpr,  # must be >= D_head, power-of-2
     ):
         """
         Grid: (cdiv(N, BLOCK_N),)
@@ -70,16 +72,18 @@ if _TRITON_AVAILABLE:
         # ‖x_j‖₂²
         x_norm_sq = tl.sum(x * x, axis=1)   # [BLOCK_N]
 
-        # x_j W_V :  [BLOCK_N, BLOCK_D] @ [BLOCK_D, BLOCK_D]
+        # x_j W_V :  [BLOCK_N, BLOCK_D] @ [BLOCK_D, BLOCK_Dh]
         # We load WV in column blocks to compute the product tile by tile
-        xv = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
-        # Full product in one dot if BLOCK_D == D (usually true for D <= 256)
+        offs_dh = tl.arange(0, BLOCK_Dh)
+        mask_dh = offs_dh < D_head
+        xv = tl.zeros([BLOCK_N, BLOCK_Dh], dtype=tl.float32)
+        # Full product in one dot if BLOCK_D == D and BLOCK_Dh == D_head (usually true)
         wv = tl.load(
-            WV_ptr + offs_d[:, None] * D + offs_d[None, :],
-            mask=mask_d[:, None] & mask_d[None, :],
+            WV_ptr + offs_d[:, None] * D_head + offs_dh[None, :],
+            mask=mask_d[:, None] & mask_dh[None, :],
             other=0.0,
-        )   # [BLOCK_D, BLOCK_D]
-        xv = tl.dot(x, wv)   # [BLOCK_N, BLOCK_D]
+        )   # [BLOCK_D, BLOCK_Dh]
+        xv = tl.dot(x, wv)   # [BLOCK_N, BLOCK_Dh]
 
         xv_norm_sq = tl.sum(xv * xv, axis=1)   # [BLOCK_N]
 
@@ -124,13 +128,15 @@ def compute_hybrid_energy_scores(
     Returns scores of shape [B, H, N]  (higher = more likely landmark).
     """
     B, H, N, D = X.shape
+    _, _, D_head = WV.shape
     x_norms  = torch.empty(B, H, N, dtype=torch.float32, device=X.device)
     xv_norms = torch.empty(B, H, N, dtype=torch.float32, device=X.device)
 
     if X.is_cuda and _TRITON_AVAILABLE:
-        BLOCK_N = 64
-        BLOCK_D = triton.next_power_of_2(D)
-        grid    = (triton.cdiv(N, BLOCK_N),)
+        BLOCK_N  = 64
+        BLOCK_D  = triton.next_power_of_2(D)
+        BLOCK_Dh = triton.next_power_of_2(D_head)
+        grid     = (triton.cdiv(N, BLOCK_N),)
 
         for b in range(B):
             for h in range(H):
@@ -139,9 +145,10 @@ def compute_hybrid_energy_scores(
                     WV[h].contiguous(),
                     x_norms[b, h],
                     xv_norms[b, h],
-                    N=N, D=D,
+                    N=N, D=D, D_head=D_head,
                     BLOCK_N=BLOCK_N,
                     BLOCK_D=BLOCK_D,
+                    BLOCK_Dh=BLOCK_Dh,
                 )
     else:
         for b in range(B):

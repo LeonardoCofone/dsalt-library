@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -73,6 +75,7 @@ class DSALTTrainer:
     window_reg_coef: coefficient for window entropy regularisation (0 = off)
     device         : torch.device (auto-detected if None)
     resume_from    : path to a checkpoint to resume from
+    ddp            : whether to use DistributedDataParallel (requires torch.distributed.init_process_group)
     """
 
     def __init__(
@@ -93,6 +96,7 @@ class DSALTTrainer:
         window_reg_coef: float = 0.0,
         device:          Optional[torch.device] = None,
         resume_from:     Optional[str] = None,
+        ddp:             bool = False,
     ):
         self.model           = model
         self.train_loader    = train_loader
@@ -105,12 +109,15 @@ class DSALTTrainer:
         self.save_dir        = Path(save_dir)
         self.dtype           = dtype
         self.window_reg_coef = window_reg_coef
+        self.ddp             = ddp
 
         # Device
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
         self.model  = self.model.to(device)
+        if self.ddp:
+            self.model = DDP(self.model, device_ids=[self.device] if self.device.type == "cuda" else None)
 
         # Optimizer (separate WD for embeddings / LayerNorm params)
         decay_params    = []
@@ -148,6 +155,11 @@ class DSALTTrainer:
 
         if resume_from:
             self._load_checkpoint(resume_from)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _is_main_process(self) -> bool:
+        return not self.ddp or dist.get_rank() == 0
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -250,7 +262,7 @@ class DSALTTrainer:
             running_loss += metrics["ce_loss"].item()
 
             # ── Logging ──────────────────────────────────────────────────
-            if self.global_step % self.log_every == 0:
+            if self.global_step % self.log_every == 0 and self._is_main_process():
                 elapsed  = time.time() - t0
                 avg_loss = running_loss / self.log_every
                 ppl      = math.exp(min(avg_loss, 20))  # cap to avoid overflow
@@ -266,7 +278,7 @@ class DSALTTrainer:
                 t0 = time.time()
 
             # ── Validation ───────────────────────────────────────────────
-            if self.val_loader and self.global_step % self.val_every == 0:
+            if self.val_loader and self.global_step % self.val_every == 0 and self._is_main_process():
                 val_ppl = self._validate()
                 print(f"  └─ val_ppl={val_ppl:.2f}")
                 if val_ppl < self.best_val_ppl:
@@ -275,12 +287,13 @@ class DSALTTrainer:
                 self.model.train()
 
             # ── Checkpointing ────────────────────────────────────────────
-            if self.global_step % self.save_every == 0:
+            if self.global_step % self.save_every == 0 and self._is_main_process():
                 self._save_checkpoint(f"step_{self.global_step:07d}.pt")
 
         # Final checkpoint
-        self._save_checkpoint("final.pt")
-        print(f"Training complete. Best val ppl: {self.best_val_ppl:.2f}")
+        if self._is_main_process():
+            self._save_checkpoint("final.pt")
+            print(f"Training complete. Best val ppl: {self.best_val_ppl:.2f}")
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -303,6 +316,15 @@ class DSALTTrainer:
             total_loss   += metrics["ce_loss"].item() * n_toks
             total_tokens += n_toks
 
+        if self.ddp:
+            # Reduce across all processes
+            total_loss_tensor = torch.tensor(total_loss, device=self.device)
+            total_tokens_tensor = torch.tensor(total_tokens, device=self.device)
+            dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_tokens_tensor, op=dist.ReduceOp.SUM)
+            total_loss = total_loss_tensor.item()
+            total_tokens = total_tokens_tensor.item()
+
         avg_loss = total_loss / max(total_tokens, 1)
         return math.exp(min(avg_loss, 20))
 
@@ -310,10 +332,11 @@ class DSALTTrainer:
 
     def _save_checkpoint(self, filename: str) -> None:
         path = self.save_dir / filename
+        model_state = self.model.module.state_dict() if self.ddp else self.model.state_dict()
         torch.save(
             {
                 "step":           self.global_step,
-                "model_state":    self.model.state_dict(),
+                "model_state":    model_state,
                 "optimizer_state": self.optimizer.state_dict(),
                 "scheduler_state": self.scheduler.state_dict(),
                 "best_val_ppl":   self.best_val_ppl,
@@ -323,8 +346,14 @@ class DSALTTrainer:
         print(f"  └─ saved checkpoint → {path}")
 
     def _load_checkpoint(self, path: str) -> None:
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Checkpoint file not found: {path}")
         ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state"])
+        model_state = ckpt["model_state"]
+        if self.ddp:
+            self.model.module.load_state_dict(model_state)
+        else:
+            self.model.load_state_dict(model_state)
         self.optimizer.load_state_dict(ckpt["optimizer_state"])
         self.scheduler.load_state_dict(ckpt["scheduler_state"])
         self.global_step  = ckpt["step"]

@@ -17,12 +17,13 @@ Tests:
 
 import sys
 import math
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-import pytest
 
 # Allow running from repo root
-sys.path.insert(0, str(__file__ + "/../.."))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dsalt.kernels.sparse_attn import (
     _build_sparse_mask,
@@ -173,14 +174,14 @@ def test_hybrid_energy_shape():
 
 
 def test_hybrid_energy_znorm():
-    """Scores should be z-normalised: mean ≈ 0, std ≈ 1 per (b, h)."""
+    """Scores should be z-normalised: mean ~ 0, std ~ 1 per (b, h)."""
     B, H, N, D = 1, 1, 128, 32
     X  = torch.randn(B, H, N, D)
     WV = torch.randn(H, D, D)
     ws = torch.full((B, H, N), 8, dtype=torch.int32)
 
     scores = compute_hybrid_energy_scores(X, WV, alpha=0.6)
-    # The composite score is a sum of two z-normed signals, so its std ≈ sqrt(2)
+    # The composite score is a sum of two z-normed signals, so its std ~ sqrt(2)
     # Just check it's finite and not constant
     assert torch.isfinite(scores).all()
     assert scores.std() > 0.01
