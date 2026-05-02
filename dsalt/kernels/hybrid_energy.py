@@ -110,4 +110,7 @@ def select_landmarks(scores, k, window_sizes, exclude_last=0):
 
 def compute_landmark_idx(X, WV, window_sizes, k, alpha=0.6):
     scores = compute_hybrid_energy_scores(X, WV, alpha)
-    return select_landmarks(scores, k, window_sizes)
+    landmark_idx = select_landmarks(scores, k, window_sizes)
+    B, H, K = landmark_idx.shape
+    N = window_sizes.shape[-1]
+    return landmark_idx.unsqueeze(2).expand(B, H, N, K).contiguous()

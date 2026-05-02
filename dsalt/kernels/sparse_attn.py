@@ -499,7 +499,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
     forward(ctx, Q, K, V, window_sizes, landmark_idx)
       Q, K, V        : [B, H, N, D]  fp16/bf16/fp32
       window_sizes   : [B, H, N]     int32   per-token window size w(i)
-      landmark_idx   : [B, H, N, K]  int32   landmark indices (pre-sorted)
+      landmark_idx   : [B, H, K] or [B, H, N, K]  int32   landmark indices (pre-sorted)
 
     Returns:
       output         : [B, H, N, D]  same dtype as Q
@@ -509,6 +509,12 @@ class DSALTAttentionFunction(torch.autograd.Function):
     def forward(ctx, Q, K, V, window_sizes, landmark_idx):
         B, H, N, D = Q.shape
         K_lmk = landmark_idx.shape[-1]
+
+        # ── Normalize landmark tensor shapes ─────────────────────────────
+        if landmark_idx.ndim == 3:
+            landmark_idx = landmark_idx.unsqueeze(2).expand(B, H, N, K_lmk).contiguous()
+        elif landmark_idx.ndim != 4:
+            raise AssertionError("landmark_idx must be shape [B,H,K] or [B,H,N,K]")
 
         # ── Validate ──────────────────────────────────────────────────────
         assert Q.shape == K.shape == V.shape, "Q/K/V must have same shape"
@@ -680,7 +686,7 @@ def dsalt_attention(
     K:             torch.Tensor,
     V:             torch.Tensor,
     window_sizes:  torch.Tensor,       # [B, H, N]   int32
-    landmark_idx:  torch.Tensor,       # [B, H, N, K] int32
+    landmark_idx:  torch.Tensor,       # [B, H, K] or [B, H, N, K] int32
 ) -> torch.Tensor:
     """
     DSALT sparse causal self-attention.

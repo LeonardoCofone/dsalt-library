@@ -36,13 +36,10 @@ class DSALTLMHeadModel(nn.Module):
         logits, windows = self.transformer(
             input_ids, return_windows=return_windows or labels is not None,
         )
-        output = {"logits": logits}
-        if return_windows:
-            output["windows"] = windows
         if labels is not None:
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1), ignore_index=-100,
             )
-            output["loss"] = loss
-        return output
+            return logits, windows, loss
+        return logits, windows
