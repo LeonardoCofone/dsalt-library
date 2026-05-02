@@ -1,20 +1,20 @@
 # DSALT Feature Catalog
 
-Questo file elenca tutte le funzionalità del progetto DSALT, sia quelle attualmente implementate sia le estensioni naturali/possibili per la libreria. L'obiettivo è avere un unico punto di riferimento per tutte le capacità, i moduli e le estensioni future.
+This file lists all features of the DSALT project, both those currently implemented and natural/possible extensions for the library. The goal is to have a single point of reference for all capabilities, modules, and future extensions.
 
 ---
 
 ## 1. Core Project
 
-- `dsalt` package distribuito come libreria Python su PyPI (`pip install dsalt`).
-- Supporto per installazione da sorgente con `pip install -e .`.
-- Package metadata moderni basati su `pyproject.toml`.
-- Compatibilità Python 3.8+.
-- Licenza Apache 2.0.
-- Documentazione base in `README.md`.
-- File di sviluppo: `requirements.txt`, `requirements-dev.txt`, `Makefile`, `MANIFEST.in`, `CONTRIBUTING.md`, `CHANGELOG.md`, `LICENSE`.
+- `dsalt` package distributed as a Python library on PyPI (`pip install dsalt`).
+- Support for source installation with `pip install -e .`.
+- Modern package metadata based on `pyproject.toml`.
+- Python 3.8+ compatibility.
+- Apache 2.0 license.
+- Basic documentation in `README.md`.
+- Development files: `requirements.txt`, `requirements-dev.txt`, `Makefile`, `MANIFEST.in`, `CONTRIBUTING.md`, `CHANGELOG.md`, `LICENSE`.
 
-## 2. API Esportate
+## 2. Exported API
 
 - `dsalt.DSALTAttention`
 - `dsalt.DSALTTransformer`
@@ -24,83 +24,83 @@ Questo file elenca tutte le funzionalità del progetto DSALT, sia quelle attualm
 - `dsalt.kernels.compute_hybrid_energy_scores`
 - `dsalt.kernels.select_landmarks`
 
-## 3. Kernels e Computazione Sparsa
+## 3. Kernels and Sparse Computation
 
 ### 3.1. Sparse Attention
 
-- Kernel Triton per DSALT sparse causal attention.
-- Pipeline di attenzione che combina:
-  - finestra locale causale variabile, token-by-token
-  - punti di riferimento (landmark tokens) globali
-- Supporto GPU con Triton quando disponibile.
-- Fallback CPU via PyTorch quando Triton non è disponibile.
-- Supporto mixed precision per FP16/BF16/FP32.
-- Test di corrispondenza CPU vs Triton per accuratezza numerica.
-- Test di backward gradients per coerenza del gradiente.
+- Triton kernel for DSALT sparse causal attention.
+- Attention pipeline that combines:
+  - variable local causal window, token-by-token
+  - global landmark tokens
+- GPU support with Triton when available.
+- CPU fallback via PyTorch when Triton is not available.
+- Mixed precision support for FP16/BF16/FP32.
+- CPU vs Triton matching tests for numerical accuracy.
+- Backward gradient tests for gradient consistency.
 
 ### 3.2. Hybrid Energy
 
-- Calcolo punteggio ibrido per landmark selection.
-- Normale z-score dei valori energetici.
-- Selezione Top-k landmark globali.
-- Esclusione dei token già coperti dalla finestra locale.
-- Supporto GPU/Triton e fallback CPU.
+- Hybrid score calculation for landmark selection.
+- Z-score normalization of energy values.
+- Top-k global landmark selection.
+- Exclusion of tokens already covered by local window.
+- GPU/Triton support and CPU fallback.
 
 ### 3.3. Window Utils
 
-- `WindowSizePredictor`: modulo per predire finestre di attenzione continue.
-- Calcolo delle dimensioni di finestra adattive per ogni token.
-- Output di window size continuo per regolarizzazione.
+- `WindowSizePredictor`: module for predicting continuous attention windows.
+- Calculation of adaptive window sizes for each token.
+- Continuous window size output for regularization.
 
-## 4. Modello Transformer
+## 4. Transformer Model
 
-- `DSALTTransformer` come stack di blocchi decoder-only.
-- `DSALTBlock` con:
+- `DSALTTransformer` as a stack of decoder-only blocks.
+- `DSALTBlock` with:
   - pre-norm RMSNorm
-  - DSALTAttention multitasca
+  - Multi-head DSALTAttention
   - SwiGLU feed-forward
-  - dropout e residual connections
-- `DSALTLMHeadModel` wrapper LM completo con:
-  - embeddings token + positional
-  - LM head condiviso con embedding opzionale
-  - supporto labels e loss cross-entropy
-  - ritorno di `windows` per regolarizzazione
+  - dropout and residual connections
+- `DSALTLMHeadModel` complete LM wrapper with:
+  - token + positional embeddings
+  - LM head shared with embedding (optional)
+  - labels support and cross-entropy loss
+  - `windows` return for regularization
 
-## 5. Training e Addestramento
+## 5. Training and Fine-tuning
 
-- `DSALTTrainer` con:
-  - ottimizzatore AdamW
-  - schedule cosine con warmup lineare
-  - clipping dei gradienti
-  - mixed precision (`torch.autocast`) per BF16/FP16
-  - supporto DDP (DistributedDataParallel)
-  - gestione device automatica CPU/GPU
-  - checkpointing periodico e caricamento resume
-  - validazione con calcolo perplexity
-  - regularizzazione di window entropy
-- Supporto per dataset PyTorch standard e batching.
-- Esempi di training single-GPU e multi-GPU.
+- `DSALTTrainer` with:
+  - AdamW optimizer
+  - cosine schedule with linear warmup
+  - gradient clipping
+  - mixed precision (`torch.autocast`) for BF16/FP16
+  - DDP (DistributedDataParallel) support
+  - automatic CPU/GPU device management
+  - periodic checkpointing and resume loading
+  - validation with perplexity calculation
+  - window entropy regularization
+- Support for standard PyTorch datasets and batching.
+- Examples for single-GPU and multi-GPU training.
 
 ## 6. Testing
 
-- Suite di test unitari in `tests/`.
-- Test per:
-  - attenzione sparsa CPU/Triton
-  - coerenza forward/backward
+- Unit test suite in `tests/`.
+- Tests for:
+  - sparse attention CPU/Triton
+  - forward/backward consistency
   - hybrid energy
-  - wrapper LM
-  - allenamento smoke test
-- `pyproject.toml` configurato con Pytest.
-- Coverage report HTML disponibile.
+  - LM wrapper
+  - training smoke test
+- `pyproject.toml` configured with Pytest.
+- HTML coverage report available.
 
-## 7. Packaging e Distribuzione
+## 7. Packaging and Distribution
 
-- pacchetto PyPI `dsalt` prodotto con `python -m build`.
-- file `.whl` e `.tar.gz` generati.
-- upload automatico su PyPI con `twine`.
-- `setup.py` compatibile per installazione legacy.
-- `pyproject.toml` come configurazione principale.
-- `Makefile` con comandi:
+- PyPI `dsalt` package built with `python -m build`.
+- Generated `.whl` and `.tar.gz` files.
+- Automatic upload to PyPI with `twine`.
+- `setup.py` compatible for legacy installation.
+- `pyproject.toml` as main configuration.
+- `Makefile` with commands:
   - `install`
   - `install-dev`
   - `test`
@@ -112,118 +112,118 @@ Questo file elenca tutte le funzionalità del progetto DSALT, sia quelle attualm
   - `publish`
   - `docs`
 
-## 8. Sviluppo e Qualità del Codice
+## 8. Development and Code Quality
 
-- Style formatting con Black.
-- Import sorting con isort.
-- Linting con Flake8.
-- Type checking con Mypy.
-- Pre-commit hook segnalato nei dev requirements.
-- Gestione `.gitignore` personalizzata per Python, build artifacts e checkpoint.
+- Style formatting with Black.
+- Import sorting with isort.
+- Linting with Flake8.
+- Type checking with Mypy.
+- Pre-commit hook mentioned in dev requirements.
+- Custom `.gitignore` for Python, build artifacts, and checkpoints.
 
-## 9. Documentazione e Supporto
+## 9. Documentation and Support
 
-- README con istruzioni di installazione, quick start, API, testing e citazione.
-- CONTRIBUTING per il contributo al progetto.
-- CHANGELOG per tenere traccia delle modifiche.
-- LICENSE Apache 2.0.
+- README with installation instructions, quick start, API, testing, and citation.
+- CONTRIBUTING for project contribution guidelines.
+- CHANGELOG for tracking releases.
+- Apache 2.0 LICENSE.
 
-## 10. Funzionalità Implementate Ma Da Rifinire
+## 10. Implemented Features Needing Refinement
 
 - `dsalt.training.trainer`:
-  - gestione più robusta del checkpointing con `resume_from`
-  - supporto DDP e rank-0 logging
-  - warning di deprecazione `torch.cuda.amp.GradScaler` da aggiornare
-- `tests/test.py`: file `tests/test.py` funzionante ma non allineato al pattern standard `test_*.py`.
+  - more robust checkpointing with `resume_from`
+  - DDP support and rank-0 logging
+  - deprecation warning `torch.cuda.amp.GradScaler` to update
+- `tests/test.py`: working `tests/test.py` file but not aligned with standard `test_*.py` pattern.
 
-## 11. Funzionalità Extra e Possibili Estensioni
+## 11. Extra Features and Possible Extensions
 
-### 11.1. Estensioni di modelli
+### 11.1. Model Extensions
 
-- `DSALTEncoder` per encoder-only o encoder-decoder architetture.
-- Implementazione GPT-style completa con tokenizer e config.
-- Modello `DSALTForSequenceClassification` / `DSALTForQuestionAnswering`.
+- `DSALTEncoder` for encoder-only or encoder-decoder architectures.
+- Complete GPT-style implementation with tokenizer and config.
+- `DSALTForSequenceClassification` / `DSALTForQuestionAnswering` models.
 
-### 11.2. Kernel e Prestazioni
+### 11.2. Kernels and Performance
 
-- supporto attento per raggruppamento token / cluster attention
-- optimizzazioni per sequenze ultra-lunghe (> 8k)
-- fallback automatico a FlashAttention o kernel CUDA nativo
-- uso avanzato di Triton per layout 2D/3D e kernel mixed-precision
+- careful support for token grouping / cluster attention
+- optimizations for ultra-long sequences (> 8k)
+- automatic fallback to FlashAttention or native CUDA kernels
+- advanced Triton usage for 2D/3D layouts and mixed-precision kernels
 
-### 11.3. Addestramento avanzato
+### 11.3. Advanced Training
 
-- learning rate schedule multipli (AdamW, Adam, Adafactor)
-- warmup/decay configurabile con lambda scheduler, cosine, linear, step
-- gradient checkpointing per risparmiare memoria
-- quantizzazione FP8 / int8 during training
-- supporto per pipeline parallelism e model parallelism
-- logging con Weights & Biases / TensorBoard
+- multiple learning rate schedules (AdamW, Adam, Adafactor)
+- configurable warmup/decay with lambda scheduler, cosine, linear, step
+- gradient checkpointing to save memory
+- FP8 / int8 quantization during training
+- support for pipeline parallelism and model parallelism
+- logging with Weights & Biases / TensorBoard
 
-### 11.4. Dataset e Data Loading
+### 11.4. Dataset and Data Loading
 
-- classi dataset per testo tokenizzato e autoregressivo
-- data collator con masking e padding dinamico
-- supporto per dataset HuggingFace
-- generazione campioni in inferenza con beam search, top-k, top-p
+- dataset classes for tokenized text and autoregressive tasks
+- data collator with dynamic masking and padding
+- support for HuggingFace datasets
+- sample generation at inference with beam search, top-k, top-p
 
-### 11.5. Documentazione & UX
+### 11.5. Documentation & UX
 
-- documentazione Sphinx / ReadTheDocs
-- esempi `examples/` per training e inferenza
-- tutorial su how-to per addestramento DSALT
-- notebook demo
+- Sphinx / ReadTheDocs documentation
+- `examples/` for training and inference
+- how-to tutorials for DSALT training
+- demo notebooks
 
-### 11.6. DevOps e CI/CD
+### 11.6. DevOps and CI/CD
 
-- GitHub Actions per test, lint, build e publish
-- packaging per release automatiche su PyPI
-- badge di status build/test/coverage in README
+- GitHub Actions for test, lint, build, and publish
+- packaging for automatic PyPI releases
+- build/test/coverage status badges in README
 
-### 11.7. UX package
+### 11.7. Package UX
 
-- CLI `dsalt` per:
+- `dsalt` CLI for:
   - training
-  - valutazione
+  - evaluation
   - inference
-  - gestione checkpoint
-- configurazione YAML / JSON per esperimenti
+  - checkpoint management
+- YAML / JSON configuration for experiments
 
-## 12. Funzionalità Documentate nel Codebase
+## 12. Features Documented in Codebase
 
-- supporto `return_windows` nel modello per regolarizzazione
-- selezione landmark globale con broadcasting `landmark_idx`
-- gestione window size continua per regolarizzazione
-- fallback CPU per tutti i kernel principali
-- `py.typed` per segnalare type hints nel package
+- `return_windows` support in model for regularization
+- global landmark selection with `landmark_idx` broadcasting
+- continuous window size handling for regularization
+- CPU fallback for all main kernels
+- `py.typed` to signal type hints in package
 
-## 13. Panoramica del Repository
+## 13. Repository Overview
 
 - `dsalt/`
-  - `kernels/`: Triton kernels e CPU fallback
-  - `modules/`: attenzione, transformer e blocco DSALT
-  - `model/`: wrapper LM
-  - `training/`: trainer e scheduler
-  - `utils/`: spazio riservato per utilità future
-- `tests/`: suite di test automatizzati
-- `dist/`: release buildate
-- `pyproject.toml`: configurazione principale
-- `setup.py`: compatibilità legacy
-- `README.md`: documentazione principale
-- `CONTRIBUTING.md`: linee guida per contribuzione
-- `CHANGELOG.md`: cronologia delle release
-- `MANIFEST.in`: inclusione file di package
+  - `kernels/`: Triton kernels and CPU fallback
+  - `modules/`: attention, transformer, and DSALT block
+  - `model/`: LM wrapper
+  - `training/`: trainer and scheduler
+  - `utils/`: reserved space for future utilities
+- `tests/`: automated test suite
+- `dist/`: built releases
+- `pyproject.toml`: main configuration
+- `setup.py`: legacy compatibility
+- `README.md`: main documentation
+- `CONTRIBUTING.md`: contribution guidelines
+- `CHANGELOG.md`: release history
+- `MANIFEST.in`: package file inclusion
 
 ---
 
-## 14. Priorità per il futuro
+## 14. Future Priorities
 
-1. rendere `tests/` completamente compatibile con `pytest` automatico;
-2. aggiornare la configurazione `pyproject.toml` per l’extras `all`;
-3. aggiungere un entrypoint `dsalt` CLI;
-4. completare le funzionalità in `utils/`;
-5. estendere la documentazione con esempi e tutorial.
+1. make `tests/` fully compatible with automatic pytest;
+2. update `pyproject.toml` configuration for `all` extras;
+3. add a `dsalt` CLI entrypoint;
+4. complete features in `utils/`;
+5. extend documentation with examples and tutorials.
 
 ---
 
-Questo documento è pensato per essere la mappa completa delle funzionalità DSALT, utile per definire roadmap, PR, release notes e miglioramenti futuri.
+This document is intended to be the complete map of DSALT features, useful for defining roadmap, PRs, release notes, and future improvements.
