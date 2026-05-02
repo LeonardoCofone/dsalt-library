@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Training & Checkpoints
+checkpoints_dsalt/
+checkpoints_dense/
+*.pt
+*.pth
+
+# C++/Build
+build/
+dist/
+*.so
