@@ -3,6 +3,8 @@
 [![PyPI](https://img.shields.io/pypi/v/dsalt)](https://pypi.org/project/dsalt/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
+See the full feature catalog in [FEATURE.md](FEATURE.md).
+
 A high-performance PyTorch library implementing **DSALT** (Dynamic Sparse Attention with Landmark Tokens), a sparse attention transformer library built for efficient training with Triton and PyTorch.
 
 > Published on PyPI: `pip install dsalt`
