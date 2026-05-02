@@ -1,22 +1,8 @@
-"""
-dsalt/training/trainer.py
---------------------------
-Minimal but complete training loop for DSALT language models.
-
-Features:
-  - Mixed precision (bf16 / fp16) via torch.autocast
-  - Gradient clipping
-  - Cosine LR schedule with linear warmup
-  - Optional window entropy regularisation
-  - Periodic validation + perplexity logging
-  - Checkpoint save / resume
-"""
-
 import math
 import os
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -26,78 +12,23 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# LR Schedule: cosine with linear warmup
-# ═════════════════════════════════════════════════════════════════════════════
-
-def get_cosine_schedule_with_warmup(
-    optimizer:       torch.optim.Optimizer,
-    warmup_steps:    int,
-    total_steps:     int,
-    min_lr_ratio:    float = 0.1,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """
-    Linear warmup then cosine decay to min_lr_ratio * base_lr.
-    """
-    def lr_lambda(step: int) -> float:
+def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
+    def lr_lambda(step):
         if step < warmup_steps:
             return float(step) / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Trainer
-# ═════════════════════════════════════════════════════════════════════════════
-
 class DSALTTrainer:
-    """
-    Training harness for DSALTTransformer.
-
-    Parameters
-    ----------
-    model          : DSALTTransformer instance
-    train_loader   : DataLoader yielding (input_ids,) or (input_ids, labels)
-    val_loader     : DataLoader for validation (optional)
-    lr             : peak learning rate
-    weight_decay   : AdamW weight decay
-    max_grad_norm  : gradient clip norm
-    warmup_steps   : linear warmup steps
-    total_steps    : total training steps
-    log_every      : log interval in steps
-    val_every      : validation interval in steps
-    save_every     : checkpoint interval in steps
-    save_dir       : directory for checkpoints
-    dtype          : torch.bfloat16 / torch.float16 / torch.float32
-    window_reg_coef: coefficient for window entropy regularisation (0 = off)
-    device         : torch.device (auto-detected if None)
-    resume_from    : path to a checkpoint to resume from
-    ddp            : whether to use DistributedDataParallel (requires torch.distributed.init_process_group)
-    """
-
-    def __init__(
-        self,
-        model:           nn.Module,
-        train_loader:    DataLoader,
-        val_loader:      Optional[DataLoader] = None,
-        lr:              float = 3e-4,
-        weight_decay:    float = 0.1,
-        max_grad_norm:   float = 1.0,
-        warmup_steps:    int   = 500,
-        total_steps:     int   = 10_000,
-        log_every:       int   = 50,
-        val_every:       int   = 500,
-        save_every:      int   = 1000,
-        save_dir:        str   = "checkpoints",
-        dtype:           torch.dtype = torch.bfloat16,
-        window_reg_coef: float = 0.0,
-        device:          Optional[torch.device] = None,
-        resume_from:     Optional[str] = None,
-        ddp:             bool = False,
-    ):
+    def __init__(self, model, train_loader, val_loader=None, lr=3e-4,
+                 weight_decay=0.1, max_grad_norm=1.0, warmup_steps=500,
+                 total_steps=10_000, log_every=50, val_every=500,
+                 save_every=1000, save_dir="checkpoints",
+                 dtype=torch.bfloat16, window_reg_coef=0.0,
+                 device=None, resume_from=None, ddp=False):
         self.model           = model
         self.train_loader    = train_loader
         self.val_loader      = val_loader
@@ -111,17 +42,15 @@ class DSALTTrainer:
         self.window_reg_coef = window_reg_coef
         self.ddp             = ddp
 
-        # Device
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
         self.model  = self.model.to(device)
         if self.ddp:
-            self.model = DDP(self.model, device_ids=[self.device] if self.device.type == "cuda" else None)
+            self.model = DDP(self.model,
+                             device_ids=[self.device] if self.device.type == "cuda" else None)
 
-        # Optimizer (separate WD for embeddings / LayerNorm params)
-        decay_params    = []
-        no_decay_params = []
+        decay_params, no_decay_params = [], []
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
@@ -131,121 +60,74 @@ class DSALTTrainer:
                 decay_params.append(p)
 
         self.optimizer = AdamW(
-            [
-                {"params": decay_params,    "weight_decay": weight_decay},
-                {"params": no_decay_params, "weight_decay": 0.0},
-            ],
-            lr=lr,
-            betas=(0.9, 0.95),
-            eps=1e-8,
+            [{"params": decay_params,    "weight_decay": weight_decay},
+             {"params": no_decay_params, "weight_decay": 0.0}],
+            lr=lr, betas=(0.9, 0.95), eps=1e-8,
         )
-
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer, warmup_steps, total_steps
         )
 
-        # Mixed precision scaler (only for fp16; bf16 doesn't need it)
-        self.use_amp  = dtype in (torch.float16, torch.bfloat16) and device.type == "cuda"
-        self.scaler   = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))
+        self.use_amp = dtype in (torch.float16, torch.bfloat16) and device.type == "cuda"
+        # GradScaler aggiornato alla sintassi non deprecata
+        self.scaler  = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
 
-        self.global_step = 0
+        self.global_step  = 0
         self.best_val_ppl = float("inf")
-
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         if resume_from:
             self._load_checkpoint(resume_from)
 
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _is_main_process(self) -> bool:
+    def _is_main_process(self):
         return not self.ddp or dist.get_rank() == 0
 
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _forward_step(
-        self,
-        batch: Any,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Single forward + loss computation.
-        Expects batch to be either:
-          - a Tensor of shape [B, N+1]  (input_ids; last col is target)
-          - a tuple (input_ids [B, N], labels [B, N])
-        """
+    def _forward_step(self, batch):
         if isinstance(batch, (list, tuple)) and len(batch) == 2:
             input_ids, labels = batch[0], batch[1]
-        elif isinstance(batch, (list, tuple)) and len(batch) == 1:
-            # TensorDataset with single tensor → treat as [B, N+1] sequence
-            batch = batch[0]
-            input_ids = batch[:, :-1]
-            labels    = batch[:, 1:]
         else:
-            # Shift: input = batch[:, :-1], label = batch[:, 1:]
+            batch     = batch[0] if isinstance(batch, (list, tuple)) else batch
             input_ids = batch[:, :-1]
             labels    = batch[:, 1:]
 
         input_ids = input_ids.to(self.device)
         labels    = labels.to(self.device)
-
-        # Forward pass (with optional window regularisation)
         return_windows = self.window_reg_coef > 0
-        with torch.autocast(
-            device_type=self.device.type,
-            dtype=self.dtype,
-            enabled=self.use_amp,
-        ):
-            logits, cont_windows = self.model(
-                input_ids, return_windows=return_windows
-            )
-            # logits: [B, N, V]
 
-            # Cross-entropy loss
+        with torch.autocast(device_type=self.device.type, dtype=self.dtype,
+                            enabled=self.use_amp):
+            logits, cont_windows = self.model(input_ids, return_windows=return_windows)
             B, N, V = logits.shape
             ce_loss = nn.functional.cross_entropy(
-                logits.view(B * N, V),
-                labels.contiguous().view(B * N),
+                logits.view(B * N, V), labels.contiguous().view(B * N),
                 ignore_index=-100,
             )
-
-            # Window entropy regularisation
             win_reg = torch.tensor(0.0, device=self.device)
             if return_windows and cont_windows:
                 for cw in cont_windows:
-                    # cw: [B, N]; penalise low variance (collapsed window)
                     win_reg = win_reg + (-cw.var(dim=-1).mean())
                 win_reg = win_reg / len(cont_windows)
-
             total_loss = ce_loss + self.window_reg_coef * win_reg
 
-        return {
-            "loss":     total_loss,
-            "ce_loss":  ce_loss.detach(),
-            "win_reg":  win_reg.detach(),
-        }
+        return {"loss": total_loss, "ce_loss": ce_loss.detach(), "win_reg": win_reg.detach()}
 
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def train(self) -> None:
+    def train(self):
         self.model.train()
-        data_iter   = iter(self.train_loader)
-        t0          = time.time()
+        data_iter    = iter(self.train_loader)
+        t0           = time.time()
         running_loss = 0.0
 
         while self.global_step < self.total_steps:
-            # Fetch next batch (loop around if dataset exhausted)
             try:
                 batch = next(data_iter)
             except StopIteration:
                 data_iter = iter(self.train_loader)
                 batch = next(data_iter)
 
-            # ── Forward ──────────────────────────────────────────────────
             self.optimizer.zero_grad(set_to_none=True)
             metrics = self._forward_step(batch)
             loss    = metrics["loss"]
 
-            # ── Backward ─────────────────────────────────────────────────
             if self.dtype == torch.float16 and self.use_amp:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
@@ -261,23 +143,19 @@ class DSALTTrainer:
             self.global_step += 1
             running_loss += metrics["ce_loss"].item()
 
-            # ── Logging ──────────────────────────────────────────────────
             if self.global_step % self.log_every == 0 and self._is_main_process():
                 elapsed  = time.time() - t0
                 avg_loss = running_loss / self.log_every
-                ppl      = math.exp(min(avg_loss, 20))  # cap to avoid overflow
+                ppl      = math.exp(min(avg_loss, 20))
                 lr_now   = self.scheduler.get_last_lr()[0]
-                print(
-                    f"[step {self.global_step:>6d}/{self.total_steps}] "
-                    f"loss={avg_loss:.4f}  ppl={ppl:.2f}  "
-                    f"lr={lr_now:.2e}  "
-                    f"win_reg={metrics['win_reg'].item():.4f}  "
-                    f"time={elapsed:.1f}s"
-                )
+                print(f"[step {self.global_step:>6d}/{self.total_steps}] "
+                      f"loss={avg_loss:.4f}  ppl={ppl:.2f}  "
+                      f"lr={lr_now:.2e}  "
+                      f"win_reg={metrics['win_reg'].item():.4f}  "
+                      f"time={elapsed:.1f}s")
                 running_loss = 0.0
                 t0 = time.time()
 
-            # ── Validation ───────────────────────────────────────────────
             if self.val_loader and self.global_step % self.val_every == 0 and self._is_main_process():
                 val_ppl = self._validate()
                 print(f"  └─ val_ppl={val_ppl:.2f}")
@@ -286,74 +164,52 @@ class DSALTTrainer:
                     self._save_checkpoint("best.pt")
                 self.model.train()
 
-            # ── Checkpointing ────────────────────────────────────────────
             if self.global_step % self.save_every == 0 and self._is_main_process():
                 self._save_checkpoint(f"step_{self.global_step:07d}.pt")
 
-        # Final checkpoint
         if self._is_main_process():
             self._save_checkpoint("final.pt")
             print(f"Training complete. Best val ppl: {self.best_val_ppl:.2f}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-
     @torch.no_grad()
-    def _validate(self) -> float:
+    def _validate(self):
         self.model.eval()
-        total_loss  = 0.0
-        total_tokens = 0
-
+        total_loss, total_tokens = 0.0, 0
         for batch in self.val_loader:
             metrics = self._forward_step(batch)
-            # Count non-padding tokens
             if isinstance(batch, (list, tuple)) and len(batch) == 2:
                 labels = batch[1].to(self.device)
-            elif isinstance(batch, (list, tuple)) and len(batch) == 1:
-                labels = batch[0][:, 1:].to(self.device)
             else:
-                labels = batch[:, 1:].to(self.device)
+                b = batch[0] if isinstance(batch, (list, tuple)) else batch
+                labels = b[:, 1:].to(self.device)
             n_toks = (labels != -100).sum().item()
             total_loss   += metrics["ce_loss"].item() * n_toks
             total_tokens += n_toks
 
         if self.ddp:
-            # Reduce across all processes
-            total_loss_tensor = torch.tensor(total_loss, device=self.device)
-            total_tokens_tensor = torch.tensor(total_tokens, device=self.device)
-            dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(total_tokens_tensor, op=dist.ReduceOp.SUM)
-            total_loss = total_loss_tensor.item()
-            total_tokens = total_tokens_tensor.item()
+            tl = torch.tensor(total_loss,   device=self.device)
+            tt = torch.tensor(total_tokens, device=self.device)
+            dist.all_reduce(tl, op=dist.ReduceOp.SUM)
+            dist.all_reduce(tt, op=dist.ReduceOp.SUM)
+            total_loss, total_tokens = tl.item(), tt.item()
 
-        avg_loss = total_loss / max(total_tokens, 1)
-        return math.exp(min(avg_loss, 20))
+        return math.exp(min(total_loss / max(total_tokens, 1), 20))
 
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _save_checkpoint(self, filename: str) -> None:
+    def _save_checkpoint(self, filename):
         path = self.save_dir / filename
         model_state = self.model.module.state_dict() if self.ddp else self.model.state_dict()
-        torch.save(
-            {
-                "step":           self.global_step,
-                "model_state":    model_state,
-                "optimizer_state": self.optimizer.state_dict(),
-                "scheduler_state": self.scheduler.state_dict(),
-                "best_val_ppl":   self.best_val_ppl,
-            },
-            path,
-        )
+        torch.save({"step": self.global_step, "model_state": model_state,
+                    "optimizer_state": self.optimizer.state_dict(),
+                    "scheduler_state": self.scheduler.state_dict(),
+                    "best_val_ppl": self.best_val_ppl}, path)
         print(f"  └─ saved checkpoint → {path}")
 
-    def _load_checkpoint(self, path: str) -> None:
+    def _load_checkpoint(self, path):
         if not Path(path).exists():
-            raise FileNotFoundError(f"Checkpoint file not found: {path}")
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
         ckpt = torch.load(path, map_location=self.device)
-        model_state = ckpt["model_state"]
-        if self.ddp:
-            self.model.module.load_state_dict(model_state)
-        else:
-            self.model.load_state_dict(model_state)
+        m = self.model.module if self.ddp else self.model
+        m.load_state_dict(ckpt["model_state"])
         self.optimizer.load_state_dict(ckpt["optimizer_state"])
         self.scheduler.load_state_dict(ckpt["scheduler_state"])
         self.global_step  = ckpt["step"]

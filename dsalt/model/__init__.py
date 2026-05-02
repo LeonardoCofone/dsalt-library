@@ -1,3 +1,3 @@
-from .dsalt_lm import DSALTLMHeadModel
+from dsalt.model.dsalt_lm import DSALTLMHeadModel
 
 __all__ = ["DSALTLMHeadModel"]

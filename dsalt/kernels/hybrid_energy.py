@@ -1,25 +1,3 @@
-"""
-dsalt/kernels/hybrid_energy.py
--------------------------------
-Hybrid Energy scoring and landmark selection for DSALT.
-
-The score for token j (candidate landmark) is:
-
-    s_j = α * z(‖x_j W_V‖₂)  +  (1-α) * z(‖x_j‖₂)
-
-where z(·) is standard-normalization across candidates at the current layer:
-
-    z(x) = (x - mean(x)) / std(x)
-
-Two Triton kernels:
-  1. _compute_norms_kernel  — compute ‖x_j‖₂ and ‖x_j W_V‖₂ for all j in parallel
-  2. Top-k selection        — via PyTorch topk (already O(n log k), GPU-native)
-
-The landmark selection is **global** (shared across all query tokens in the
-sequence), consistent with DSALT's design where each token attends to the
-same top-k globally informative tokens.
-"""
-
 import torch
 import torch.nn.functional as F
 from typing import Tuple
@@ -31,102 +9,51 @@ try:
 except ImportError:
     _TRITON_AVAILABLE = False
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Triton kernel: compute norms in a single fused pass
-# ═════════════════════════════════════════════════════════════════════════════
-
 if _TRITON_AVAILABLE:
-
     @triton.jit
     def _hybrid_energy_kernel(
-        X_ptr,          # [N, D]  input hidden states (one head, one batch)
-        WV_ptr,         # [D, D_head]  value projection matrix
-        XNorm_ptr,      # [N]     output: ‖x_j‖₂
-        XVNorm_ptr,     # [N]     output: ‖x_j W_V‖₂
-        N: tl.constexpr,
-        D: tl.constexpr,
-        D_head: tl.constexpr,
-        BLOCK_N: tl.constexpr,   # tokens per program
-        BLOCK_D: tl.constexpr,   # must be >= D, power-of-2
-        BLOCK_Dh: tl.constexpr,  # must be >= D_head, power-of-2
+        X_ptr, WV_ptr, XNorm_ptr, XVNorm_ptr,
+        N: tl.constexpr, D: tl.constexpr, D_head: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_Dh: tl.constexpr,
+        stride_xb: tl.constexpr, stride_xh: tl.constexpr,
+        stride_wh: tl.constexpr,
+        stride_ob: tl.constexpr, stride_oh: tl.constexpr,
     ):
-        """
-        Grid: (cdiv(N, BLOCK_N),)
-        Each program handles BLOCK_N tokens, computing both norms.
-        """
         pid   = tl.program_id(0)
+        pid_h = tl.program_id(1)
+        pid_b = tl.program_id(2)
         start = pid * BLOCK_N
         offs_n = start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
-        offs_d = tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D
-
-        # Load X tile  [BLOCK_N, BLOCK_D]
-        x = tl.load(
-            X_ptr + offs_n[:, None] * D + offs_d[None, :],
-            mask=mask_n[:, None] & mask_d[None, :],
-            other=0.0,
-        )   # [BLOCK_N, BLOCK_D]
-
-        # ‖x_j‖₂²
-        x_norm_sq = tl.sum(x * x, axis=1)   # [BLOCK_N]
-
-        # x_j W_V :  [BLOCK_N, BLOCK_D] @ [BLOCK_D, BLOCK_Dh]
-        # We load WV in column blocks to compute the product tile by tile
+        offs_d  = tl.arange(0, BLOCK_D)
+        mask_d  = offs_d < D
         offs_dh = tl.arange(0, BLOCK_Dh)
         mask_dh = offs_dh < D_head
-        xv = tl.zeros([BLOCK_N, BLOCK_Dh], dtype=tl.float32)
-        # Full product in one dot if BLOCK_D == D and BLOCK_Dh == D_head (usually true)
+
+        x = tl.load(
+            X_ptr + pid_b * stride_xb + pid_h * stride_xh + offs_n[:, None] * D + offs_d[None, :],
+            mask=mask_n[:, None] & mask_d[None, :], other=0.0,
+        )
+        x_norm_sq = tl.sum(x * x, axis=1)
+
         wv = tl.load(
-            WV_ptr + offs_d[:, None] * D_head + offs_dh[None, :],
-            mask=mask_d[:, None] & mask_dh[None, :],
-            other=0.0,
-        )   # [BLOCK_D, BLOCK_Dh]
-        xv = tl.dot(x, wv)   # [BLOCK_N, BLOCK_Dh]
+            WV_ptr + pid_h * stride_wh + offs_d[:, None] * D_head + offs_dh[None, :],
+            mask=mask_d[:, None] & mask_dh[None, :], other=0.0,
+        )
+        xv = tl.dot(x, wv)
+        xv_norm_sq = tl.sum(xv * xv, axis=1)
 
-        xv_norm_sq = tl.sum(xv * xv, axis=1)   # [BLOCK_N]
-
-        # Store sqrt of norms
-        x_norm  = tl.sqrt(x_norm_sq)
-        xv_norm = tl.sqrt(xv_norm_sq)
-
-        tl.store(XNorm_ptr  + offs_n, x_norm,  mask=mask_n)
-        tl.store(XVNorm_ptr + offs_n, xv_norm, mask=mask_n)
+        tl.store(XNorm_ptr  + pid_b * stride_ob + pid_h * stride_oh + offs_n, tl.sqrt(x_norm_sq),  mask=mask_n)
+        tl.store(XVNorm_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_n, tl.sqrt(xv_norm_sq), mask=mask_n)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CPU fallback
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _cpu_compute_norms(
-    X:  torch.Tensor,    # [N, D_model]
-    WV: torch.Tensor,    # [D_model, D_head]  (already oriented for right-multiply)
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Returns (x_norm [N], xv_norm [N])."""
-    x_norm  = X.float().norm(dim=-1)                    # [N]
-    xv_norm = (X.float() @ WV.float()).norm(dim=-1)     # [N, D_head] → norm → [N]
+def _cpu_compute_norms(X, WV):
+    x_norm  = X.float().norm(dim=-1)
+    xv_norm = (X.float() @ WV.float()).norm(dim=-1)
     return x_norm, xv_norm
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Main entry point
-# ═════════════════════════════════════════════════════════════════════════════
-
-def compute_hybrid_energy_scores(
-    X:     torch.Tensor,   # [B, H, N, D]  hidden states
-    WV:    torch.Tensor,   # [H, D, D]     per-head value projections
-    alpha: float = 0.6,
-) -> torch.Tensor:
-    """
-    Computes the Hybrid Energy score for every token in the sequence.
-
-        s_j = α * z(‖x_j W_V‖₂)  +  (1-α) * z(‖x_j‖₂)
-
-    where z(·) is standard-normalisation over j.
-
-    Returns scores of shape [B, H, N]  (higher = more likely landmark).
-    """
+def compute_hybrid_energy_scores(X, WV, alpha=0.6):
     B, H, N, D = X.shape
     _, _, D_head = WV.shape
     x_norms  = torch.empty(B, H, N, dtype=torch.float32, device=X.device)
@@ -136,20 +63,15 @@ def compute_hybrid_energy_scores(
         BLOCK_N  = 64
         BLOCK_D  = triton.next_power_of_2(D)
         BLOCK_Dh = triton.next_power_of_2(D_head)
-        grid     = (triton.cdiv(N, BLOCK_N),)
-
-        for b in range(B):
-            for h in range(H):
-                _hybrid_energy_kernel[grid](
-                    X[b, h].contiguous(),
-                    WV[h].contiguous(),
-                    x_norms[b, h],
-                    xv_norms[b, h],
-                    N=N, D=D, D_head=D_head,
-                    BLOCK_N=BLOCK_N,
-                    BLOCK_D=BLOCK_D,
-                    BLOCK_Dh=BLOCK_Dh,
-                )
+        grid = (triton.cdiv(N, BLOCK_N), H, B)
+        _hybrid_energy_kernel[grid](
+            X.contiguous(), WV.contiguous(), x_norms, xv_norms,
+            N=N, D=D, D_head=D_head,
+            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Dh=BLOCK_Dh,
+            stride_xb=X.stride(0), stride_xh=X.stride(1),
+            stride_wh=WV.stride(0),
+            stride_ob=x_norms.stride(0), stride_oh=x_norms.stride(1),
+        )
     else:
         for b in range(B):
             for h in range(H):
@@ -157,72 +79,34 @@ def compute_hybrid_energy_scores(
                 x_norms[b, h]  = xn
                 xv_norms[b, h] = xvn
 
-    # Z-normalise each (b, h) independently over the N dimension
-    def _znorm(t: torch.Tensor) -> torch.Tensor:
+    def _znorm(t):
         mu  = t.mean(dim=-1, keepdim=True)
         std = t.std(dim=-1, keepdim=True).clamp(min=1e-6)
         return (t - mu) / std
 
-    scores = alpha * _znorm(xv_norms) + (1.0 - alpha) * _znorm(x_norms)
-    return scores   # [B, H, N]
+    a = alpha if isinstance(alpha, float) else alpha.view(1, -1, 1)
+    return a * _znorm(xv_norms) + (1.0 - a) * _znorm(x_norms)
 
 
-def select_landmarks(
-    scores:       torch.Tensor,    # [B, H, N]
-    k:            int,             # number of landmarks
-    window_sizes: torch.Tensor,    # [B, H, N]   int  — exclude in-window tokens
-    exclude_last: int = 0,         # never select the last `exclude_last` tokens
-                                   # (avoids selecting current token as own landmark)
-) -> torch.Tensor:
-    """
-    Selects k landmark token indices per (batch, head) via top-k on Hybrid Energy.
-
-    Tokens inside the maximum window are excluded from landmark candidacy
-    (they are already covered by the local window pass).
-
-    Returns landmark_idx of shape [B, H, N, k]  (int32).
-    Each query token i gets the SAME global top-k landmarks (the standard
-    DSALT design); the per-query mask is applied inside the attention kernel.
-    """
+def select_landmarks(scores, k, window_sizes, exclude_last=0):
     B, H, N = scores.shape
     device  = scores.device
-
-    # Build candidate mask: exclude tokens too close to the end of the sequence
-    # and tokens that are trivially in the window for most queries.
-    max_w = window_sizes.max()   # conservative: use global max window
-
-    # Mask out the last max_w positions (they're in everyone's window)
     cand_scores = scores.clone()
+
+    # Esclude solo i token RECENTI (ultimi max_w) — non i vecchi
+    # Token vecchi (j << i) sono candidati legittimi per ogni query
+    max_w = int(window_sizes.max().item())
     if max_w > 0 and N > max_w:
-        # Soft exclusion: set in-window region to -inf so they're never picked
-        # as "global" landmarks (they're covered locally).
         cand_scores[..., N - max_w:] = float("-inf")
     if exclude_last > 0:
         cand_scores[..., N - exclude_last:] = float("-inf")
 
-    # Top-k selection  [B, H, k]
     k_safe = min(k, N)
-    _, top_idx = torch.topk(cand_scores, k=k_safe, dim=-1)  # [B, H, k]
-
-    # Sort indices for more cache-friendly access in the attention kernel
+    _, top_idx = torch.topk(cand_scores, k=k_safe, dim=-1)
     top_idx, _ = top_idx.sort(dim=-1)
-
-    # Broadcast to [B, H, N, k]  — same landmarks for every query token
-    landmark_idx = top_idx.unsqueeze(2).expand(B, H, N, k_safe)
-
-    return landmark_idx.to(torch.int32)
+    return top_idx.to(torch.int32)
 
 
-def compute_landmark_idx(
-    X:            torch.Tensor,    # [B, H, N, D]
-    WV:           torch.Tensor,    # [H, D, D]
-    window_sizes: torch.Tensor,    # [B, H, N]
-    k:            int,
-    alpha:        float = 0.6,
-) -> torch.Tensor:
-    """
-    Convenience function: score + select in one call.
-    Returns landmark_idx [B, H, N, k] int32.
-    """
+def compute_landmark_idx(X, WV, window_sizes, k, alpha=0.6):
     scores = compute_hybrid_energy_scores(X, WV, alpha)
     return select_landmarks(scores, k, window_sizes)

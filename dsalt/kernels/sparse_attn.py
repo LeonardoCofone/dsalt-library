@@ -369,11 +369,12 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _dsalt_bwd_kernel_dq(
-        Q_ptr, K_ptr,
+        Q_ptr, K_ptr, V_ptr,
         DO_ptr, LSE_ptr, DQ_ptr,
         Win_ptr, Lmk_ptr,
         stride_qb, stride_qh, stride_qn, stride_qd,
         stride_kb, stride_kh, stride_kn, stride_kd,
+        stride_vb, stride_vh, stride_vn, stride_vd,
         stride_wb, stride_wh, stride_wn,
         stride_lb, stride_lh, stride_ln, stride_lk,
         B: tl.constexpr, H: tl.constexpr, N: tl.constexpr,
@@ -381,10 +382,6 @@ if _TRITON_AVAILABLE:
         SCALE: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
     ):
-        """
-        Grid: (cdiv(N, BLOCK_M), H, B)
-        Each program computes dQ for BLOCK_M query tokens.
-        """
         pid_m = tl.program_id(0)
         pid_h = tl.program_id(1)
         pid_b = tl.program_id(2)
@@ -396,51 +393,93 @@ if _TRITON_AVAILABLE:
 
         Q_bh  = Q_ptr  + pid_b * stride_qb + pid_h * stride_qh
         K_bh  = K_ptr  + pid_b * stride_kb + pid_h * stride_kh
+        V_bh  = V_ptr  + pid_b * stride_vb + pid_h * stride_vh
         DO_bh = DO_ptr + pid_b * stride_qb + pid_h * stride_qh
         DQ_bh = DQ_ptr + pid_b * stride_qb + pid_h * stride_qh
         W_bh  = Win_ptr + pid_b * stride_wb + pid_h * stride_wh
 
-        q    = tl.load(Q_bh + offs_m[:, None] * stride_qn + offs_d[None, :] * stride_qd,
-                       mask=mask_m[:, None] & (offs_d[None, :] < D), other=0.0)
-        do   = tl.load(DO_bh + offs_m[:, None] * stride_qn + offs_d[None, :] * stride_qd,
-                       mask=mask_m[:, None] & (offs_d[None, :] < D), other=0.0)
-        lse  = tl.load(LSE_ptr + pid_b * H * N + pid_h * N + offs_m, mask=mask_m, other=0.0)
-        w_i  = tl.load(W_bh + offs_m * stride_wn, mask=mask_m, other=0)
+        q   = tl.load(Q_bh  + offs_m[:, None] * stride_qn + offs_d[None, :] * stride_qd,
+                    mask=mask_m[:, None] & (offs_d[None, :] < D), other=0.0)
+        do  = tl.load(DO_bh + offs_m[:, None] * stride_qn + offs_d[None, :] * stride_qd,
+                    mask=mask_m[:, None] & (offs_d[None, :] < D), other=0.0)
+        lse = tl.load(LSE_ptr + pid_b * H * N + pid_h * N + offs_m,
+                    mask=mask_m, other=0.0)
+        w_i = tl.load(W_bh + offs_m * stride_wn, mask=mask_m, other=0)
 
-        dq = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+        dq    = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+        max_w = tl.max(w_i, axis=0)
+        k_end = q_start + BLOCK_M
+        k_blk = tl.maximum(0, q_start - max_w) // BLOCK_N * BLOCK_N
 
-        max_w     = tl.max(w_i, axis=0)
-        k_end     = q_start + BLOCK_M
-        k_blk_s   = tl.maximum(0, q_start - max_w) // BLOCK_N * BLOCK_N
-
-        k_blk = k_blk_s
+        # window tiles
         while k_blk < k_end:
             offs_n = k_blk + tl.arange(0, BLOCK_N)
             mask_n = offs_n < N
+
             k_tile = tl.load(
                 K_bh + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
                 mask=mask_n[:, None] & (offs_d[None, :] < D), other=0.0,
-            )   # [BLOCK_N, BLOCK_D]
+            )
+            v_tile = tl.load(
+                V_bh + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+                mask=mask_n[:, None] & (offs_d[None, :] < D), other=0.0,
+            )
 
-            s = tl.dot(q, tl.trans(k_tile)) * SCALE  # [BLOCK_M, BLOCK_N]
-            causal = offs_n[None, :] <= offs_m[:, None]
-            window = offs_n[None, :] >= (offs_m[:, None] - w_i[:, None])
+            s = tl.dot(q, tl.trans(k_tile)) * SCALE
+            causal  = offs_n[None, :] <= offs_m[:, None]
+            window  = offs_n[None, :] >= (offs_m[:, None] - w_i[:, None])
             combined = causal & window & mask_n[None, :] & mask_m[:, None]
             s = tl.where(combined, s, float("-inf"))
             p = tl.exp(s - lse[:, None])
             p = tl.where(combined, p, 0.0)
 
-            # dp = do @ V^T ... we need V here; use K as proxy shape holder
-            # Full dq: sum_j p_ij * (delta_ij - p_ij) * SCALE  rewritten as:
-            # dQ = (p * (dp - rowsum)) @ K  where dp = do @ V^T
-            # Since V is not loaded here, we accumulate p @ K and handle
-            # the softmax Jacobian in a combined pass. For simplicity we do
-            # the standard p*SCALE - dq accumulation after loading V.
-            # Simplified (correct) form:  dq += (p - p*rowsum) @ K * SCALE
-            # This term: p @ K
-            dq += tl.dot(p.to(k_tile.dtype), k_tile) * SCALE
+            # dp = do @ V^T  [BLOCK_M, BLOCK_N]
+            dp     = tl.dot(do, tl.trans(v_tile))
+            rowsum = tl.sum(p * dp, axis=1)
+            ds     = p * (dp - rowsum[:, None]) * SCALE
+            ds     = tl.where(combined, ds, 0.0)
 
+            dq += tl.dot(ds.to(k_tile.dtype), k_tile)
             k_blk += BLOCK_N
+
+        # landmark tiles
+        lmk_base = W_bh + q_start * stride_ln  # riuso W_bh come placeholder — usa L_bh
+        # corretto:
+        L_bh     = Lmk_ptr + pid_b * stride_lb + pid_h * stride_lh
+        lmk_base = L_bh + q_start * stride_ln
+        lmk_blk  = 0
+        while lmk_blk < K:
+            offs_k  = lmk_blk + tl.arange(0, BLOCK_N)
+            valid_k = offs_k < K
+            lmk_idx = tl.load(lmk_base + offs_k * stride_lk, mask=valid_k, other=0)
+
+            min_win_start = tl.maximum(0, q_start - max_w)
+            already_in_window = (lmk_idx >= min_win_start) & (lmk_idx < k_end)
+            lmk_valid = valid_k & ~already_in_window
+
+            k_lmk = tl.load(
+                K_bh + lmk_idx[None, :] * stride_kn + offs_d[:, None] * stride_kd,
+                mask=lmk_valid[None, :] & (offs_d[:, None] < D), other=0.0,
+            )
+            v_lmk = tl.load(
+                V_bh + lmk_idx[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+                mask=lmk_valid[:, None] & (offs_d[None, :] < D), other=0.0,
+            )
+
+            s_lmk    = tl.dot(q, k_lmk) * SCALE
+            lmk_causal = lmk_idx[None, :] <= offs_m[:, None]
+            lmk_mask   = lmk_valid[None, :] & lmk_causal & (~already_in_window[None, :]) & mask_m[:, None]
+            s_lmk = tl.where(lmk_mask, s_lmk, float("-inf"))
+            p_lmk = tl.exp(s_lmk - lse[:, None])
+            p_lmk = tl.where(lmk_mask, p_lmk, 0.0)
+
+            dp_lmk  = tl.dot(do, tl.trans(v_lmk))
+            rowsum_l = tl.sum(p_lmk * dp_lmk, axis=1)
+            ds_lmk  = p_lmk * (dp_lmk - rowsum_l[:, None]) * SCALE
+            ds_lmk  = tl.where(lmk_mask, ds_lmk, 0.0)
+
+            dq += tl.dot(ds_lmk.to(k_lmk.dtype), k_lmk)
+            lmk_blk += BLOCK_N
 
         tl.store(
             DQ_bh + offs_m[:, None] * stride_qn + offs_d[None, :] * stride_qd,
@@ -534,28 +573,13 @@ class DSALTAttentionFunction(torch.autograd.Function):
             BLOCK_N = ctx.BLOCK_N
             BLOCK_D = ctx.BLOCK_D
 
-            # dK, dV pass
             grid_n = (triton.cdiv(N, BLOCK_N), H, B)
             _dsalt_bwd_kernel_dkdv[grid_n](
-                Q, K, V, dOut, LSE, dK, dV,
+                Q, K, V, dOut, LSE, dK, dV, dQ,
                 window_sizes, landmark_idx,
                 Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
                 K.stride(0), K.stride(1), K.stride(2), K.stride(3),
                 V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-                window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
-                landmark_idx.stride(0), landmark_idx.stride(1),
-                landmark_idx.stride(2), landmark_idx.stride(3),
-                B=B, H=H, N=N, D=D, K=K_lmk,
-                SCALE=ctx.scale,
-                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
-            )
-            # dQ pass
-            grid_m = (triton.cdiv(N, BLOCK_M), H, B)
-            _dsalt_bwd_kernel_dq[grid_m](
-                Q, K, dOut, LSE, dQ,
-                window_sizes, landmark_idx,
-                Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-                K.stride(0), K.stride(1), K.stride(2), K.stride(3),
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
                 landmark_idx.stride(0), landmark_idx.stride(1),
                 landmark_idx.stride(2), landmark_idx.stride(3),
