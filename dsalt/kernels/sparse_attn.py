@@ -548,7 +548,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
                 landmark_idx.stride(0), landmark_idx.stride(1),
                 landmark_idx.stride(2), landmark_idx.stride(3),
-                B=B, H=H, N=N, D=D, K=K_lmk,
+                N=N, D=D, K=K_lmk,
                 SCALE=scale,
                 BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
             )
@@ -589,7 +589,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
                 landmark_idx.stride(0), landmark_idx.stride(1),
                 landmark_idx.stride(2), landmark_idx.stride(3),
-                B=B, H=H, N=N, D=D, K=K_lmk,
+                N=N, D=D, K=K_lmk,
                 SCALE=ctx.scale,
                 BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
             )
