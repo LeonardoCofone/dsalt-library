@@ -32,9 +32,9 @@ class DSALTLMHeadModel(nn.Module):
     def tie_weights(self):
         self.transformer.lm_head.weight = self.transformer.tok_emb.weight
 
-    def forward(self, input_ids, labels=None, return_windows=False):
+    def forward(self, input_ids, labels=None, return_window=False):
         logits, windows = self.transformer(
-            input_ids, return_windows=return_windows or labels is not None,
+            input_ids, return_window=return_window or labels is not None,
         )
         if labels is not None:
             loss = F.cross_entropy(

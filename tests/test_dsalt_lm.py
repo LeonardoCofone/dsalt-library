@@ -42,7 +42,7 @@ def test_dsalt_lm_loss_and_windows():
     )
     input_ids = torch.randint(0, 32, (1, 10))
     labels = torch.randint(0, 32, (1, 10))
-    out = model(input_ids, labels=labels, return_windows=True)
+    out = model(input_ids, labels=labels, return_window=True)
     assert "loss" in out
     assert out["loss"].item() >= 0
     assert "windows" in out

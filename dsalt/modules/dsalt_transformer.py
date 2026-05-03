@@ -80,17 +80,17 @@ class DSALTTransformer(nn.Module):
         nn.init.normal_(self.tok_emb.weight, std=0.02)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
 
-    def forward(self, input_ids, return_windows=False):
+    def forward(self, input_ids, return_window=False):
         B, N = input_ids.shape
         assert N <= self.max_seq_len
         pos = torch.arange(N, device=input_ids.device).unsqueeze(0)
         x   = self.emb_drop(self.tok_emb(input_ids) + self.pos_emb(pos))
-        cont_windows = [] if return_windows else None
+        cont_windows = [] if return_window else None
         x_prev = None
         for block in self.blocks:
-            x, cont_w = block(x, x_prev=x_prev, return_window=return_windows)
+            x, cont_w = block(x, x_prev=x_prev, return_window=return_window)
             x_prev    = x
-            if return_windows and cont_w is not None:
+            if return_window and cont_w is not None:
                 cont_windows.append(cont_w)
         x      = self.final_norm(x)
         logits = self.lm_head(x)
