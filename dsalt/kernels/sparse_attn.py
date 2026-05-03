@@ -395,17 +395,17 @@ if _TRITON_AVAILABLE:
             lmk_ok_v = valid_k & ~already
 
             k_lmk = tl.load(
-                K_bh + lmk_idx[None, :] * stride_kn + offs_d[:, None] * stride_kd,
-                mask=lmk_ok_v[None, :] & (offs_d[:, None] < D), other=0.0,
+                K_bh + lmk_idx[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                mask=lmk_ok_v[:, None] & (offs_d[None, :] < D), other=0.0,
             )
             v_lmk = tl.load(
                 V_bh + lmk_idx[:, None] * stride_vn + offs_d[None, :] * stride_vd,
                 mask=lmk_ok_v[:, None] & (offs_d[None, :] < D), other=0.0,
             )
 
-            s_lmk    = tl.dot(q, k_lmk) * SCALE
+            s_lmk    = tl.dot(q, tl.trans(k_lmk)) * SCALE
             lmk_causal = lmk_idx[None, :] <= offs_m[:, None]
-            lmk_mask   = lmk_ok_v[None, :] & lmk_causal & mask_m[:, None]
+            lmk_mask   = lmk_ok_v[:, None] & lmk_causal & mask_m[:, None]
             s_lmk      = tl.where(lmk_mask, s_lmk, float("-inf"))
             p_lmk      = tl.exp(s_lmk - lse[:, None])
             p_lmk      = tl.where(lmk_mask, p_lmk, 0.0)
