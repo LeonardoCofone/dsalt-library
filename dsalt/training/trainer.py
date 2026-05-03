@@ -218,7 +218,7 @@ class DSALTTrainer:
     def _forward(self, x: torch.Tensor, y: torch.Tensor):
         device_type = self.device.type
         with torch.autocast(device_type=device_type, dtype=self.dtype, enabled=self.use_amp):
-            logits, cont_windows = self.model(x, return_windows=self.window_reg_coef > 0)
+            logits, cont_windows = self.model(x, return_window=self.window_reg_coef > 0)
             B, N, V = logits.shape
             ce = nn.functional.cross_entropy(
                 logits.view(B * N, V),
