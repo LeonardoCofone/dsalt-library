@@ -314,7 +314,7 @@ class DSALTTrainer:
                         if k in m:
                             self.history[k].append(m[k])
 
-                print(f"\n{'─'*24}{log_str}{'─'*24}")
+                print(f"{'─'*50}\n{log_str}")
                 self.history["train_loss"].append(avg_loss)
                 self.history["step_time"].append(elapsed / self.log_every)
                 self.history["gpu_mem_gb"].append(mem_gb)
