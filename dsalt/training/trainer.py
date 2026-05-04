@@ -264,7 +264,7 @@ class DSALTTrainer:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
-                loss_accum += ce.item()
+                loss_accum += ce.item() / self.grad_accum 
 
             # ── Optimizer step ─────────────────────────────────────────
             if self.scaler is not None:
@@ -284,7 +284,7 @@ class DSALTTrainer:
             if self.global_step % self.log_every == 0 and self._is_main():
                 elapsed  = time.time() - t0
                 avg_loss = loss_accum / self.log_every
-                ppl      = math.exp(min(avg_loss, 20))
+                ppl      = math.exp(min(avg_loss, 1000))
                 lr_now   = self.scheduler.get_last_lr()[0]
                 mem_gb   = (
                     torch.cuda.memory_allocated(self.device) / 1e9
@@ -314,7 +314,7 @@ class DSALTTrainer:
                         if k in m:
                             self.history[k].append(m[k])
 
-                print(log_str)
+                print(f"\n{'─'*24}{log_str}{'─'*24}")
                 self.history["train_loss"].append(avg_loss)
                 self.history["step_time"].append(elapsed / self.log_every)
                 self.history["gpu_mem_gb"].append(mem_gb)

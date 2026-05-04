@@ -7,8 +7,8 @@ A high-performance PyTorch library implementing **DSALT** (Dynamic Sparse Attent
 
 > **Install from PyPI**: `pip install dsalt`  
 > **GitHub**: [dsalt-pytorch](https://github.com/LeonardoCofone/dsalt-pytorch)  
-> **Paper**: [Zenodo Preprint](https://zenodo.org/records/19312827)  
-> **Feature Roadmap**: See [FEATURE.md](FEATURE.md)
+> **Paper**: [Zenodo Preprint](https://zenodo.org/records/19312826)  
+> **Feature Roadmap**: See [FEATURE.md](https://github.com/LeonardoCofone/dsalt-pytorch/blob/main/FEATURE.md)
 
 ## 🚀 Key Features
 
@@ -19,23 +19,6 @@ A high-performance PyTorch library implementing **DSALT** (Dynamic Sparse Attent
 - **Distributed Training**: Full support for DDP and FSDP (model sharding across 2+ GPUs)
 - **Numerically Verified**: CPU/GPU equivalence tests ensure correctness; gradient stability validated
 
-### Recent Optimizations (2024)
-
-✅ **Eliminated Silent Memory Replication**
-- Landmark tensor shape: `[B, H, K]` (was `[B, H, N, K]`) — saves O(N) allocation  
-- Hidden state input: `[B, N, D]` (was `[B, H, N, D]`) — eliminates `H×` copy per head  
-- Combined effect: **4–8× memory reduction** in landmark computation
-
-✅ **Fixed Correctness Issues**
-- Gradient checkpointing now properly checkpoints full attention block (not lambda-wrapped)
-- Backward kernel signatures cleaned: removed dead code and unused parameters  
-- Distributed training fixed: `_is_main` no longer silently defined twice
-
-✅ **Enhanced Distributed Training**
-- FSDP support for 2+ GPU model sharding: `torchrun --nproc_per_node=2 train.py --fsdp`
-- Gradient accumulation optimized: `no_sync()` eliminates intermediate all-reduce cost
-- DataParallel removed: unsuitable overhead for sparse patterns
-
 ---
 
 ## 📋 Table of Contents
@@ -43,12 +26,13 @@ A high-performance PyTorch library implementing **DSALT** (Dynamic Sparse Attent
 1. [Installation](#installation)
 2. [Quick Start](#quick-start)
 3. [Architecture](#architecture)
-4. [Training Examples](#training-examples)
+4. [Training & Generation](#training--generation)
 5. [API Reference](#api-reference)
-6. [Testing](#testing)
-7. [Citation](#citation)
-8. [Contributing](#contributing)
-9. [License](#license)
+6. [Hyperparameter Guide](#hyperparameter-guide)
+7. [Testing](#testing)
+8. [Citation](#citation)
+9. [Contributing](#contributing)
+10. [License](#license)
 
 ---
 
@@ -155,7 +139,76 @@ trainer = DSALTTrainer(
 trainer.train()
 ```
 
-### 3. Training: Multi-GPU with FSDP (Fully Sharded Data Parallel)
+### 2b. Text Generation
+```python
+import torch
+from transformers import GPT2TokenizerFast
+from dsalt.model import DSALTLMHeadModel
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
+# Load trained model
+model = DSALTLMHeadModel(
+    vocab_size=32000,
+    d_model=768,
+    n_layers=12,
+    n_heads=12,
+).to(device)
+model.load_state_dict(torch.load("checkpoints/best.pt")["model_state"])
+
+# Generate text
+prompt = "Once upon a time"
+input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
+
+# ✅ Generate with top-k sampling
+generated_ids = model.generate(
+    input_ids=input_ids,
+    max_new_tokens=200,
+    temperature=0.8,
+    top_k=50,
+    device=device,
+    tokenizer=tokenizer,
+)
+print(generated_ids)
+```
+
+### 3. Training: Multi-GPU with DataParallel (Simple Multi-GPU)
+```python
+import torch
+import torch.nn as nn
+from dsalt.model import DSALTLMHeadModel
+from dsalt.training import DSALTTrainer
+
+# Create model and wrap with DataParallel for multi-GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = DSALTLMHeadModel(
+    vocab_size=32000,
+    d_model=768,
+    n_layers=12,
+    n_heads=12,
+    n_min=32,
+    n_max=256,
+    k_lmk=32,
+).to(device)
+
+# ✅ Wrap with DataParallel — automatically uses all available GPUs
+model = nn.DataParallel(model)
+
+trainer = DSALTTrainer(
+    model=model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    lr=3e-4,
+    total_steps=100000,
+    dtype=torch.bfloat16,
+    save_dir="checkpoints",
+    device=device,
+)
+trainer.train()
+```
+
+### 4. Training: Multi-GPU with FSDP (Fully Sharded Data Parallel)
 ```python
 # Command: torchrun with FSDP enabled
 # torchrun --nproc_per_node=2 train.py
@@ -235,7 +288,7 @@ DSALT combines **local causal windows** (adaptive, growing with position) with *
 
 ---
 
-## 🎯 Training
+## 🎯 Training & Generation
 
 ### Configuration
 
@@ -302,21 +355,32 @@ Language model wrapper for autoregressive training/inference.
 
 ```python
 model = DSALTLMHeadModel(
-    vocab_size=32000,
-    d_model=1024,
-    n_layers=24,
-    n_heads=16,
-    n_min=32,           # Min window size
-    n_max=512,          # Max window size
-    k_lmk=64,           # Landmarks per head
-    norm_eps=1e-6,
-    dropout=0.1,
-    bias=False,
+    # Required
+    vocab_size=32000,           # Size of vocabulary
+    d_model=1024,               # Hidden dimension (must be divisible by n_heads)
+    n_layers=24,                # Number of transformer blocks
+    n_heads=16,                 # Number of attention heads
+    
+    # Sparse Attention Config
+    n_min=32,                   # Minimum local window size (default: 32)
+    n_max=512,                  # Maximum local window size (default: 256)
+    k_lmk=64,                   # Landmark tokens per head (default: 16)
+    alpha=0.6,                  # Initial value for learnable alpha_w per head (default: 0.6)
+                                # → alpha_w becomes nn.Parameter and is trained
+    
+    # Architecture & Regularization
+    d_ff=None,                  # Feed-forward hidden dim (None = 4*d_model) (default: None)
+    max_seq_len=2048,           # Maximum sequence length (default: 2048)
+    dropout=0.0,                # Dropout rate (default: 0.0)
+    use_fa2=True,               # Use FlashAttention 2 if available (default: True)
+    tie_weights=True,           # Tie embedding & output layer weights (default: True)
 )
 
-# Forward: returns logits or (loss, logits) if labels provided
-outputs = model(input_ids, labels=None)
-logits = outputs.logits
+# Forward: returns (logits, windows) tuple
+logits, windows = model(input_ids)
+logits.shape  # [batch, seq_len, vocab_size]
+
+# With labels: trainer handles loss internally
 ```
 
 #### `DSALTTransformer`
@@ -337,21 +401,32 @@ x = transformer(input_embeddings)
 ```
 
 #### `DSALTAttention`
-Single attention layer.
+Single multi-head sparse attention layer.
 
 ```python
 attn = DSALTAttention(
-    d_model=1024,
-    n_heads=16,
-    n_min=32,
-    n_max=512,
-    k_lmk=64,
-    dropout=0.1,
-    gradient_checkpointing=False,
+    # Required
+    d_model=1024,                       # Hidden dimension
+    n_heads=16,                         # Number of heads
+    
+    # Sparse Attention Config
+    n_min=32,                           # Min window size (default: 32)
+    n_max=512,                          # Max window size (default: 256)
+    k_lmk=64,                           # Landmarks per head (default: 16)
+    alpha=0.6,                          # Initial alpha value (default: 0.6)
+                                        # → becomes learnable nn.Parameter
+    
+    # Regularization & Optimization
+    dropout=0.0,                        # Attention dropout (default: 0.0)
+    use_fa2=True,                       # Use FlashAttention 2 (default: True)
+    gradient_checkpointing=False,       # Gradient checkpointing (default: False)
+    compile_attention=False,            # torch.compile attention kernel (default: False)
 )
 
-# Returns (output, window_sizes) if return_window=True
-out, _ = attn(x, x_prev=None, return_window=True)
+# Forward: returns (output, windows) if return_window=True
+out, windows = attn(x, return_window=True)
+out.shape  # [batch, seq_len, d_model]
+windows.shape  # [batch, n_heads, seq_len] - window sizes per position
 ```
 
 #### `DSALTTrainer`
@@ -359,19 +434,63 @@ Training loop with mixed precision, DDP/FSDP, checkpointing.
 
 ```python
 trainer = DSALTTrainer(
-    model=model,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    lr=3e-4,
-    total_steps=100_000,
-    dtype=torch.bfloat16,
-    ddp=False,
-    fsdp=True,
-    gradient_checkpointing=True,
+    # Required
+    model=model,                            # DSALTLMHeadModel or wrapped (DataParallel/DDP/FSDP)
+    train_loader=train_loader,              # Training DataLoader
+    
+    # Optimization Hyperparameters
+    lr=3e-4,                                # Learning rate (default: 3e-4)
+    weight_decay=0.1,                       # Weight decay / L2 reg (default: 0.1)
+    max_grad_norm=1.0,                      # Gradient clipping norm (default: 1.0)
+    grad_accum=1,                           # Gradient accumulation steps (default: 1)
+    
+    # Schedule Hyperparameters
+    warmup_steps=500,                       # LR warmup steps (default: 500)
+    total_steps=100_000,                    # Total training steps (default: 10_000)
+    
+    # Logging & Checkpointing
+    log_every=50,                           # Log interval (default: 50)
+    val_every=500,                          # Validation interval (default: 500)
+    save_every=1000,                        # Checkpoint save interval (default: 1000)
+    save_dir="checkpoints",                 # Checkpoint directory (default: "checkpoints")
+    
+    # Optional: Validation
+    val_loader=None,                        # Validation DataLoader (optional)
+    
+    # Precision & Device
+    dtype=torch.bfloat16,                   # Precision: bfloat16, float32, float16 (default: bfloat16)
+    device=torch.device("cuda:0"),          # Device (default: auto-detect)
+    
+    # Multi-GPU Parallelism (choose ONE or NONE)
+    ddp=False,                              # Standard DDP (default: False)
+    fsdp=False,                             # FSDP model sharding (default: False)
+    fsdp_cpu_offload=False,                 # CPU offload params in FSDP (default: False)
+    
+    # Memory Optimization
+    gradient_checkpointing=False,           # Gradient checkpointing (default: False)
+    
+    # Regularization
+    window_reg_coef=0.0,                    # Window entropy regularization coefficient (default: 0.0)
+    
+    # Advanced: Custom metrics
+    compute_metrics_fn=None,                # Custom metrics fn(model, x) → dict (optional)
+    
+    # Resume from checkpoint
+    resume_from=None,                       # Path to checkpoint to resume from (optional)
 )
 
-trainer.train()  # Blocking: runs until total_steps
+history = trainer.train()  # Blocking call: runs until total_steps
+# Returns: dict with keys ['train_loss', 'val_ppl', 'step_time', ...]
 ```
+
+### Multi-GPU Parallelism Options
+
+| Mode | Setup | Use Case | Overhead |
+|:---|:---|:---|:---|
+| **Single GPU** | `device=torch.device("cuda:0")` | Small models, development | None |
+| **DataParallel** | `model = nn.DataParallel(model)` | Multi-GPU, simple, automatic batching | Medium (batch splits) |
+| **DDP** | `torchrun --nproc_per_node=2 train.py`<br/>`ddp=True` | Multi-GPU, distributed, one process per GPU | Low (true parallel) |
+| **FSDP** | `torchrun --nproc_per_node=2 train.py`<br/>`fsdp=True` | Large models, sharding across GPUs | Low (true parallel + sharding) |
 
 ### Kernel Functions
 
@@ -407,6 +526,19 @@ landmark_idx = compute_hybrid_energy_scores(
     alpha=torch.tensor([0.6] * n_heads),
 )
 ```
+
+---
+
+## 📖 Hyperparameter Guide
+
+For complete documentation of all hyperparameters for each component, see **[FEATURE.md](FEATURE.md)**:
+
+- **DSALTLMHeadModel**: Model architecture, sparse attention, embedding configuration
+- **DSALTAttention**: Attention-specific parameters, optimization flags
+- **WindowSizePredictor**: Dynamic window learning
+- **DSALTTransformer**: Stack configuration
+- **DSALTTrainer**: Optimization, scheduling, distributed training, precision
+- **Tuning Guide**: Example configs for different hardware (mobile → enterprise)
 
 ---
 
@@ -471,7 +603,7 @@ If DSALT is useful in your research, please cite:
   author={Leonardo Cofone},
   journal={Zenodo Preprint},
   year={2026},
-  url={https://zenodo.org/records/19312827},
+  url={https://zenodo.org/records/19312826},
   note={Dynamic Sparse Attention with Landmark Tokens}
 }
 ```
@@ -480,7 +612,7 @@ If DSALT is useful in your research, please cite:
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please see [CONTRIBUTING.md]([CONTRIBUTING.md](https://github.com/LeonardoCofone/dsalt-pytorch/blob/main/contributing.md)) for guidelines.
 
 **Areas for contribution:**
 - Performance tuning (Triton kernel optimization)
@@ -493,7 +625,7 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 
 ## 📄 License
 
-Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the Apache License 2.0. See [LICENSE]([LICENSE](https://github.com/LeonardoCofone/dsalt-pytorch/blob/main/LICENSE)) for details.
 
 ---
 
@@ -509,10 +641,9 @@ Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
 
 - **Issues**: [GitHub Issues](https://github.com/LeonardoCofone/dsalt-pytorch/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/LeonardoCofone/dsalt-pytorch/discussions)
-- **Paper**: [Zenodo Preprint](https://zenodo.org/records/19312827)
+- **Paper**: [Zenodo Preprint](https://zenodo.org/records/19312826)
 
 ---
 
 **Last Updated**: May 2026  
-**Version**: 1.2.0  
 **Status**: ✅ Production-Ready

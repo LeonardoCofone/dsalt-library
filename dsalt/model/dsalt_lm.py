@@ -43,3 +43,32 @@ class DSALTLMHeadModel(nn.Module):
             )
             return logits, windows, loss
         return logits, windows
+
+    @torch.no_grad()
+    def generate(self, input_ids, max_new_tokens=200, temperature=1.0, top_k=50,
+                 device=None, tokenizer=None):
+        if device is None:
+            device = next(self.parameters()).device
+
+        self.eval()
+        max_seq_len = self.transformer.pos_emb.weight.shape[0]
+        ids = input_ids.to(device)
+
+        for _ in range(max_new_tokens):
+            ids_cond = ids[:, -max_seq_len:]
+            logits, _ = self(ids_cond)
+            logits = logits[:, -1, :] / (temperature + 1e-9)
+
+            if top_k > 0:
+                vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < vals[:, -1:]] = float('-inf')
+
+            probs = torch.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            ids = torch.cat([ids, next_id], dim=1)
+
+        self.train()
+
+        if tokenizer is not None:
+            return tokenizer.decode(ids[0].tolist(), skip_special_tokens=True)
+        return ids
