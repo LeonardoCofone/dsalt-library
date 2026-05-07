@@ -1,18 +1,3 @@
-"""
-dsalt/training/trainer.py
---------------------------
-Trainer per DSALT.
-
-Cambiamenti rispetto alla versione precedente:
-  - Bug fix: _is_main era definita due volte (override silenzioso).
-  - DataParallel rimosso: replica il modello intero su ogni GPU → inutile per OOM.
-    Usare DDP (un processo per GPU) o FSDP per modelli grandi.
-  - Aggiunto supporto FSDP per sharding del modello su due GPU.
-  - gradient_checkpointing attivabile dal trainer senza toccare i moduli.
-  - Checkpointing: salva solo model_base.state_dict() (non il wrapper DDP/FSDP).
-  - _forward: autocast corretto per bfloat16 su CPU e CUDA.
-"""
-
 import math
 import os
 import time
@@ -24,6 +9,8 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.optim import AdamW
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from dsalt.training.gpu_auto import GPUAutoConfig
 
 try:
     from torch.distributed.fsdp import (
@@ -40,9 +27,7 @@ except ImportError:
     _FSDP_AVAILABLE = False
 
 
-def get_cosine_schedule_with_warmup(
-    optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.1
-):
+def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.1):
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step) / max(1, warmup_steps)
@@ -56,56 +41,65 @@ class DSALTTrainer:
         self,
         model: nn.Module,
         train_loader,
-        val_loader: Optional[Any]         = None,
-        lr: float                          = 3e-4,
-        weight_decay: float                = 0.1,
-        max_grad_norm: float               = 1.0,
-        warmup_steps: int                  = 500,
-        total_steps: int                   = 10_000,
-        grad_accum: int                    = 1,
-        log_every: int                     = 50,
-        val_every: int                     = 500,
-        save_every: int                    = 1000,
-        save_dir: str                      = "checkpoints",
-        dtype: torch.dtype                 = torch.bfloat16,
-        window_reg_coef: float             = 0.0,
-        compute_metrics_fn: Optional[Callable] = None,
-        device: Optional[torch.device]    = None,
-        resume_from: Optional[str]         = None,
-        # Parallelismo — scegliere UNO:
-        ddp: bool                          = False,   # DDP standard
-        fsdp: bool                         = False,   # FSDP (sharding su 2+ GPU)
-        fsdp_cpu_offload: bool             = False,   # CPU offload parametri (molto lento)
-        gradient_checkpointing: bool       = False,   # attiva nel modello
+        val_loader: Optional[Any]               = None,
+        lr: float                               = 3e-4,
+        weight_decay: float                     = 0.1,
+        max_grad_norm: float                    = 1.0,
+        warmup_steps: int                       = 500,
+        total_steps: int                        = 10_000,
+        grad_accum: int                         = 1,
+        log_every: int                          = 50,
+        val_every: int                          = 500,
+        save_every: int                         = 1000,
+        save_dir: str                           = "checkpoints",
+        dtype: torch.dtype                      = torch.bfloat16,
+        window_reg_coef: float                  = 0.0,
+        compute_metrics_fn: Optional[Callable]  = None,
+        resume_from: Optional[str]              = None,
+        ddp: bool                               = False,
+        fsdp: bool                              = False,
+        fsdp_cpu_offload: bool                  = False,
+        gradient_checkpointing: bool            = False,
     ):
-        # ── Device ────────────────────────────────────────────────────────
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
+        assert not (ddp and fsdp), "Choose DDP or FSDP, not both."
 
-        # ── Gradient checkpointing ────────────────────────────────────────
+        self.gpu_config = GPUAutoConfig(verbose=True)
+
+        in_torchrun = self.gpu_config.in_torchrun
+        if in_torchrun and not dist.is_initialized():
+            dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+
+        if in_torchrun and not ddp and not fsdp:
+            ddp = True
+
+        self.ddp  = ddp
+        self.fsdp = fsdp
+        self.device = self.gpu_config.device
+
         if gradient_checkpointing:
             self._enable_gradient_checkpointing(model)
 
-        # ── Parallelismo ──────────────────────────────────────────────────
-        assert not (ddp and fsdp), "Scegliere DDP oppure FSDP, non entrambi"
-        self.ddp  = ddp
-        self.fsdp = fsdp
-
-        model = model.to(device)
+        model = model.to(self.device)
 
         if ddp:
-            assert dist.is_initialized(), "Inizializza dist prima di creare il trainer (torchrun)"
-            model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
-        elif fsdp and _FSDP_AVAILABLE:
-            assert dist.is_initialized(), "FSDP richiede dist inizializzato"
-            mp_policy = MixedPrecision(
-                param_dtype=dtype,
-                reduce_dtype=torch.float32,
-                buffer_dtype=dtype,
-            ) if dtype in (torch.float16, torch.bfloat16) else None
+            assert dist.is_initialized(), "dist not initialized. Use torchrun."
+            model = DDP(
+                model,
+                device_ids=[self.device.index] if self.device.type == "cuda" else None,
+            )
+        elif fsdp:
+            assert _FSDP_AVAILABLE, "FSDP not available in this version of PyTorch."
+            assert dist.is_initialized(), "dist not initialized. Use torchrun."
+            mp_policy = (
+                MixedPrecision(
+                    param_dtype=dtype,
+                    reduce_dtype=torch.float32,
+                    buffer_dtype=dtype,
+                )
+                if dtype in (torch.float16, torch.bfloat16)
+                else None
+            )
             cpu_off = CPUOffload(offload_params=True) if fsdp_cpu_offload else None
-            # Wrappa i DSALTBlock — importa qui per evitare dipendenze circolari
             from dsalt.modules.dsalt_transformer import DSALTBlock
             wrap_policy = functools.partial(
                 transformer_auto_wrap_policy,
@@ -118,23 +112,19 @@ class DSALTTrainer:
                 sharding_strategy=ShardingStrategy.FULL_SHARD,
                 backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
                 cpu_offload=cpu_off,
-                device_id=device,
+                device_id=self.device,
             )
-        elif fsdp and not _FSDP_AVAILABLE:
-            raise RuntimeError("FSDP non disponibile in questa versione di PyTorch")
 
         self.model = model
-        # model_base: usato per save/load state_dict senza wrapper
         self._model_base = (
-            model.module if isinstance(model, (DDP,))
-            else model  # FSDP gestisce il proprio state_dict
+            model.module
+            if isinstance(model, (DDP, nn.DataParallel))
+            else model
         )
 
-        # ── Optimizer ─────────────────────────────────────────────────────
-        # Raggruppa i parametri: DSALT-specific, no-decay, decay
         decay, no_decay, dsalt_params = [], [], []
-        base_model = self._model_base if not fsdp else model
-        for name, p in base_model.named_parameters():
+        param_source = self._model_base if not fsdp else model
+        for name, p in param_source.named_parameters():
             if not p.requires_grad:
                 continue
             if any(kw in name for kw in ("window_pred", "alpha_w")):
@@ -150,23 +140,19 @@ class DSALTTrainer:
                 {"params": no_decay,     "lr": lr,       "weight_decay": 0.0},
                 {"params": dsalt_params, "lr": lr * 2.0, "weight_decay": 0.0},
             ],
-            betas=(0.9, 0.95), eps=1e-8,
+            betas=(0.9, 0.95),
+            eps=1e-8,
         )
-        self.scheduler = get_cosine_schedule_with_warmup(
-            self.optimizer, warmup_steps, total_steps
-        )
+        self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, warmup_steps, total_steps)
 
-        # ── AMP ───────────────────────────────────────────────────────────
-        self.dtype    = dtype
-        self.use_amp  = dtype in (torch.float16, torch.bfloat16) and device.type == "cuda"
-        # GradScaler solo per fp16 (bf16 non ne ha bisogno)
-        self.scaler   = (
+        self.dtype   = dtype
+        self.use_amp = dtype in (torch.float16, torch.bfloat16) and self.device.type == "cuda"
+        self.scaler  = (
             torch.amp.GradScaler("cuda")
             if dtype == torch.float16 and self.use_amp
             else None
         )
 
-        # ── Stato training ────────────────────────────────────────────────
         self.train_loader       = train_loader
         self.val_loader         = val_loader
         self.max_grad_norm      = max_grad_norm
@@ -194,11 +180,8 @@ class DSALTTrainer:
         if resume_from:
             self._load_checkpoint(resume_from)
 
-    # ── Helper ────────────────────────────────────────────────────────────
-
     @staticmethod
     def _enable_gradient_checkpointing(model: nn.Module) -> None:
-        """Attiva gradient checkpointing su tutti i DSALTBlock."""
         try:
             from dsalt.modules.dsalt_attention import DSALTAttention
             for module in model.modules():
@@ -208,16 +191,28 @@ class DSALTTrainer:
             pass
 
     def _is_main(self) -> bool:
-        """True se questo è il processo principale (rank 0 o single-GPU)."""
         if self.ddp or self.fsdp:
             return dist.get_rank() == 0
         return True
 
-    # ── Forward ───────────────────────────────────────────────────────────
+    def print_training_setup(self):
+        if not self._is_main():
+            return
+        print(f"\n{'='*70}")
+        print(f"Training Setup Summary")
+        print(f"{'='*70}")
+        print(f"Model:               {self.model.__class__.__name__}")
+        print(f"Device:              {self.device}")
+        print(f"Dtype:               {self.dtype}")
+        print(f"Strategy:            {self.gpu_config.recommended_strategy()}")
+        print(f"DDP:                 {self.ddp}")
+        print(f"FSDP:                {self.fsdp}")
+        print(f"Total Steps:         {self.total_steps}")
+        print(f"Grad Accum:          {self.grad_accum}")
+        print(f"{'='*70}\n")
 
     def _forward(self, x: torch.Tensor, y: torch.Tensor):
-        device_type = self.device.type
-        with torch.autocast(device_type=device_type, dtype=self.dtype, enabled=self.use_amp):
+        with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=self.use_amp):
             logits, cont_windows = self.model(x, return_window=self.window_reg_coef > 0)
             B, N, V = logits.shape
             ce = nn.functional.cross_entropy(
@@ -226,23 +221,23 @@ class DSALTTrainer:
                 ignore_index=-100,
             )
             win_reg = torch.tensor(0.0, device=self.device)
-            if self.window_reg_coef > 0 and cont_windows:
+            if self.window_reg_coef > 0 and cont_windows is not None:
+                if isinstance(cont_windows, torch.Tensor):
+                    cont_windows = [cont_windows]
                 for cw in cont_windows:
-                    win_reg = win_reg - cw.var(dim=-1).mean()
-                win_reg = win_reg / len(cont_windows)
+                    win_reg = win_reg - cw.float().var(dim=-1).mean()
+                win_reg = win_reg / max(len(cont_windows), 1)
         return ce + self.window_reg_coef * win_reg, ce.detach(), win_reg.detach()
-
-    # ── Train loop ────────────────────────────────────────────────────────
 
     def train(self) -> Dict[str, list]:
         self.model.train()
         data_iter  = iter(self.train_loader)
         loss_accum = 0.0
-        t0         = time.time()
+        n_steps_accumulated = 0
+        t0 = time.time()
         self.optimizer.zero_grad(set_to_none=True)
 
         while self.global_step < self.total_steps:
-            # ── Gradient accumulation ──────────────────────────────────
             for acc_step in range(self.grad_accum):
                 try:
                     x, y = next(data_iter)
@@ -251,7 +246,6 @@ class DSALTTrainer:
                     x, y = next(data_iter)
                 x, y = x.to(self.device), y.to(self.device)
 
-                # DDP: disabilita sync su tutti i passi tranne l'ultimo
                 ctx = (
                     self.model.no_sync()
                     if (self.ddp and acc_step < self.grad_accum - 1)
@@ -264,9 +258,10 @@ class DSALTTrainer:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
-                loss_accum += ce.item() / self.grad_accum 
+                loss_accum += ce.item()
 
-            # ── Optimizer step ─────────────────────────────────────────
+            n_steps_accumulated += 1
+
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -280,10 +275,9 @@ class DSALTTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1
 
-            # ── Logging ────────────────────────────────────────────────
             if self.global_step % self.log_every == 0 and self._is_main():
                 elapsed  = time.time() - t0
-                avg_loss = loss_accum / self.log_every
+                avg_loss = loss_accum / n_steps_accumulated
                 ppl      = math.exp(min(avg_loss, 1000))
                 lr_now   = self.scheduler.get_last_lr()[0]
                 mem_gb   = (
@@ -320,9 +314,9 @@ class DSALTTrainer:
                 self.history["gpu_mem_gb"].append(mem_gb)
                 self.history["lr"].append(lr_now)
                 loss_accum = 0.0
+                n_steps_accumulated = 0
                 t0 = time.time()
 
-            # ── Validation ─────────────────────────────────────────────
             if self.val_loader and self.global_step % self.val_every == 0 and self._is_main():
                 val_ppl = self._validate()
                 self.history["val_ppl"].append(val_ppl)
@@ -333,7 +327,6 @@ class DSALTTrainer:
                     self._save_checkpoint("best.pt")
                 self.model.train()
 
-            # ── Checkpoint periodico ───────────────────────────────────
             if self.global_step % self.save_every == 0 and self._is_main():
                 self._save_checkpoint(f"step_{self.global_step:07d}.pt")
 
@@ -343,8 +336,6 @@ class DSALTTrainer:
 
         return self.history
 
-    # ── Validation ────────────────────────────────────────────────────────
-
     @torch.no_grad()
     def _validate(self) -> float:
         self.model.eval()
@@ -352,7 +343,7 @@ class DSALTTrainer:
         for x, y in self.val_loader:
             x, y = x.to(self.device), y.to(self.device)
             _, ce, _ = self._forward(x, y)
-            n_toks       = (y != -100).sum().item()
+            n_toks        = (y != -100).sum().item()
             total_loss   += ce.item() * n_toks
             total_tokens += n_toks
 
@@ -365,10 +356,7 @@ class DSALTTrainer:
 
         return math.exp(min(total_loss / max(total_tokens, 1), 20))
 
-    # ── Checkpoint ────────────────────────────────────────────────────────
-
     def _get_state_dict(self):
-        """Gestisce DDP, FSDP, e modello semplice."""
         if self.fsdp and _FSDP_AVAILABLE:
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
             cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -378,20 +366,23 @@ class DSALTTrainer:
 
     def _save_checkpoint(self, filename: str) -> None:
         path = self.save_dir / filename
-        torch.save({
-            "step":            self.global_step,
-            "model_state":     self._get_state_dict(),
-            "optimizer_state": self.optimizer.state_dict(),
-            "scheduler_state": self.scheduler.state_dict(),
-            "best_val_ppl":    self.best_val_ppl,
-            "history":         self.history,
-        }, path)
+        torch.save(
+            {
+                "step":            self.global_step,
+                "model_state":     self._get_state_dict(),
+                "optimizer_state": self.optimizer.state_dict(),
+                "scheduler_state": self.scheduler.state_dict(),
+                "best_val_ppl":    self.best_val_ppl,
+                "history":         self.history,
+            },
+            path,
+        )
         print(f"  ╰─ checkpoint → {path}")
 
     def _load_checkpoint(self, path: str) -> None:
         if not Path(path).exists():
             raise FileNotFoundError(f"Checkpoint non trovato: {path}")
-        ckpt = torch.load(path, map_location=self.device, weights_only=True)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self._model_base.load_state_dict(ckpt["model_state"])
         self.optimizer.load_state_dict(ckpt["optimizer_state"])
         self.scheduler.load_state_dict(ckpt["scheduler_state"])
@@ -401,35 +392,6 @@ class DSALTTrainer:
         print(f"Ripreso da {path} al passo {self.global_step}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utility
-# ─────────────────────────────────────────────────────────────────────────────
-
 class _nullctx:
-    """Context manager nullo (sostituisce contextlib.nullcontext per compatibilità)."""
     def __enter__(self): return self
     def __exit__(self, *_): pass
-
-
-def launch_ddp_training(
-    train_fn,
-    world_size: int,
-    backend: str = "nccl",
-):
-    """
-    Helper per lanciare il training DDP con torchrun.
-
-    Esempio di utilizzo nel tuo script:
-
-        def main(rank, world_size):
-            dist.init_process_group("nccl", rank=rank, world_size=world_size)
-            torch.cuda.set_device(rank)
-            model = DSALTLMHeadModel(...)
-            trainer = DSALTTrainer(model, ..., ddp=True, device=torch.device(f"cuda:{rank}"))
-            trainer.train()
-            dist.destroy_process_group()
-
-        # Lancia con: torchrun --nproc_per_node=2 train.py
-    """
-    import torch.multiprocessing as mp
-    mp.spawn(train_fn, args=(world_size,), nprocs=world_size, join=True)

@@ -1,55 +1,37 @@
 ```
 └── 📁dsalt_pytorch
-    └── 📁.claude
-        ├── settings.local.json
+        ├── .gitignore
+        ├── README.md
     └── 📁dsalt
-        └── 📁__pycache__
-            ├── __init__.cpython-314.pyc
         └── 📁kernels
-            └── 📁__pycache__
-                ├── __init__.cpython-314.pyc
-                ├── hybrid_energy.cpython-314.pyc
-                ├── sparse_attn.cpython-314.pyc
-                ├── window_utils.cpython-314.pyc
-            ├── __init__.py
+            ├── __init__.py  
+            ├── energy_topk_fused.py  
             ├── hybrid_energy.py
             ├── sparse_attn.py
             ├── window_utils.py
         └── 📁model
-            └── 📁__pycache__
-                ├── __init__.cpython-314.pyc
-                ├── dsalt_lm.cpython-314.pyc
             ├── __init__.py
             ├── dsalt_lm.py
         └── 📁modules
-            └── 📁__pycache__
-                ├── __init__.cpython-314.pyc
-                ├── dsalt_attention.cpython-314.pyc
-                ├── dsalt_transformer.cpython-314.pyc
             ├── __init__.py
             ├── dsalt_attention.py
             ├── dsalt_transformer.py
         └── 📁training
-            └── 📁__pycache__
-                ├── __init__.cpython-314.pyc
-                ├── trainer.cpython-314.pyc
-            ├── __init__.py
+            ├── __init__.py  
+            ├── gpu_auto.py  
             ├── trainer.py
-        └── 📁utils
         ├── __init__.py
         ├── py.typed
     └── 📁tests
-        └── 📁__pycache__
-            ├── test_dsalt_lm.cpython-314.pyc
-            ├── test_hybrid_energy.cpython-314.pyc
-            ├── test_sparse_attn.cpython-314.pyc
         ├── test_dsalt_lm.py
         ├── test_hybrid_energy.py
+        ├── test_main.py
         ├── test_sparse_attn.py
-        ├── test.py
+    ├── .env
     ├── .gitignore
     ├── CHANGELOG.md
     ├── CONTRIBUTING.md
+    ├── FEATURE.md
     ├── LICENSE
     ├── Makefile
     ├── MANIFEST.in
