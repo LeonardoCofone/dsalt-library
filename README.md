@@ -239,7 +239,7 @@ Key test modules:
 
 ## 📄 License
 
-Apache License 2.0.
+See here: <https://github.com/LeonardoCofone/dsalt-pytorch/blob/main/LICENSE>
 
 ---
 

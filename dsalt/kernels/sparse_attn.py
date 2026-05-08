@@ -150,8 +150,8 @@ if _TRITON_AVAILABLE:
             idx_k = tl.minimum(idx_k, N - 1)
 
             kl_tile = tl.load(
-                K_bh + idx_k[:, None] * stride_kn + offs_d[None, :],
-                mask=valid_k[:, None] & mask_d[None, :], other=0.0,
+                K_bh + offs_d[:, None] * stride_kd + idx_k[None, :] * stride_kn,
+                mask=mask_d[:, None] & valid_k[None, :], other=0.0,
             )
             s_lmk = tl.dot(q, kl_tile, out_dtype=tl.float32) * SCALE
             lmk_ok = valid_k[None, :] & mask_m[:, None]
@@ -163,8 +163,8 @@ if _TRITON_AVAILABLE:
             p_lmk  = tl.where(lmk_ok, p_lmk, 0.0)
 
             vl_tile = tl.load(
-                V_bh + idx_k[:, None] * stride_vn + offs_d[None, :],
-                mask=valid_k[:, None] & mask_d[None, :], other=0.0,
+                V_bh + offs_d[:, None] * stride_vd + idx_k[None, :] * stride_vn,
+                mask=mask_d[:, None] & valid_k[None, :], other=0.0,
             )
             acc = acc * alpha_[:, None] + tl.dot(p_lmk.to(vl_tile.dtype), vl_tile)
             l_i = l_i * alpha_ + tl.sum(p_lmk, axis=1)
@@ -316,12 +316,12 @@ if _TRITON_AVAILABLE:
         idx_k = tl.minimum(idx_k, N - 1)
 
         kl_tile = tl.load(
-            K_bh + idx_k[:, None] * stride_kn + offs_d[None, :],
-            mask=valid_k[:, None] & mask_d[None, :], other=0.0,
+            K_bh + offs_d[:, None] * stride_kd + idx_k[None, :] * stride_kn,
+            mask=mask_d[:, None] & valid_k[None, :], other=0.0,
         )
         vl_tile = tl.load(
-            V_bh + idx_k[:, None] * stride_vn + offs_d[None, :],
-            mask=valid_k[:, None] & mask_d[None, :], other=0.0,
+            V_bh + offs_d[:, None] * stride_vd + idx_k[None, :] * stride_vn,
+            mask=mask_d[:, None] & valid_k[None, :], other=0.0,
         )
 
         dkl = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
@@ -472,15 +472,15 @@ if _TRITON_AVAILABLE:
             idx_k = tl.minimum(idx_k, N - 1)
 
             kl_tile = tl.load(
-                K_bh + idx_k[:, None] * stride_kn + offs_d[None, :],
-                mask=valid_k[:, None] & mask_d[None, :], other=0.0,
+                K_bh + offs_d[:, None] * stride_kd + idx_k[None, :] * stride_kn,
+                mask=mask_d[:, None] & valid_k[None, :], other=0.0,
             )
             vl_tile = tl.load(
-                V_bh + idx_k[:, None] * stride_vn + offs_d[None, :],
-                mask=valid_k[:, None] & mask_d[None, :], other=0.0,
+                V_bh + offs_d[:, None] * stride_vd + idx_k[None, :] * stride_vn,
+                mask=mask_d[:, None] & valid_k[None, :], other=0.0,
             )
 
-            s_lmk  = tl.dot(q, tl.trans(kl_tile), out_dtype=tl.float32) * SCALE
+            s_lmk  = tl.dot(q, kl_tile, out_dtype=tl.float32) * SCALE
             lmk_ok = valid_k[None, :] & mask_m[:, None]
             s_lmk  = tl.where(lmk_ok, s_lmk, float("-inf"))
             p_lmk  = tl.exp(s_lmk - lse[:, None])
