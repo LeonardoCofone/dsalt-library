@@ -1,89 +1,52 @@
-import os
-import sys
-import subprocess
-from typing import Tuple
+import logging
 import torch
 import torch.nn as nn
-import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
 
 
-class GPUAutoConfig:
-    def __init__(self, verbose: bool = True):
-        self.verbose = verbose
-        self.cuda_available = torch.cuda.is_available()
-        self.num_gpus = torch.cuda.device_count() if self.cuda_available else 0
-        self.is_distributed = (
-            dist.is_available()
-            and dist.is_initialized()
-        )
-        self.rank = dist.get_rank() if self.is_distributed else int(os.environ.get("RANK", 0))
-        self.world_size = dist.get_world_size() if self.is_distributed else int(os.environ.get("WORLD_SIZE", 1))
+def resolve_device(device: str = "cpu", num_gpus: int = 1) -> tuple[torch.device, list[int]]:
+    """
+    Resolve the primary device and list of GPU IDs based on the requested device and number of GPUs.
 
-        if self.verbose and self.rank == 0:
-            self._print_info()
+    Args:
+        device (str): The device type, either "cpu" or "cuda".
+        num_gpus (int): The number of GPUs to use.
 
-    def _print_info(self):
-        print(f"\n{'='*60}")
-        print(f"GPU Auto-Config Report")
-        print(f"{'='*60}")
-        print(f"CUDA Available:      {self.cuda_available}")
-        print(f"Number of GPUs:      {self.num_gpus}")
-        print(f"Is Distributed:      {self.is_distributed}")
-        if self.num_gpus > 0:
-            for i in range(min(self.num_gpus, 8)):
-                try:
-                    prop = torch.cuda.get_device_properties(i)
-                    print(f"  GPU{i}: {prop.name} ({prop.total_memory / 1e9:.1f}GB)")
-                except Exception:
-                    pass
-        if self.is_distributed:
-            print(f"Rank:                {self.rank}/{self.world_size}")
-        print(f"{'='*60}\n")
+    Returns:
+        tuple: (primary_device, gpu_ids) where gpu_ids is an empty list for CPU or a list of GPU indices.
+    """
+    if device == "cpu":
+        return torch.device("cpu"), []
 
-    @property
-    def device(self) -> torch.device:
-        if self.cuda_available:
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            return torch.device(f"cuda:{local_rank}")
-        return torch.device("cpu")
-
-    @property
-    def is_main_process(self) -> bool:
-        return self.rank == 0
-
-    @property
-    def in_torchrun(self) -> bool:
-        return "RANK" in os.environ and "WORLD_SIZE" in os.environ
-
-    def recommended_strategy(self) -> str:
-        if not self.cuda_available:
-            return "cpu"
-        if self.in_torchrun and self.world_size > 1:
-            return "distributed_ddp"
-        if self.num_gpus == 1:
-            return "single_gpu"
-        return "cpu"
-
-
-def auto_detect_gpus_simple() -> Tuple[int, torch.device]:
     if not torch.cuda.is_available():
-        return 0, torch.device("cpu")
-    num_gpus = torch.cuda.device_count()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = torch.device(f"cuda:{local_rank}" if num_gpus > 0 else "cpu")
-    return num_gpus, device
+        logger.warning("CUDA not available, using CPU.")
+        return torch.device("cpu"), []
+
+    available = torch.cuda.device_count()
+    n = min(num_gpus, available)
+
+    if n <= 0:
+        return torch.device("cpu"), []
+
+    gpu_ids = list(range(n))
+    primary = torch.device(f"cuda:{gpu_ids[0]}")  # Primary device is the first GPU
+    return primary, gpu_ids
 
 
-def print_gpu_info():
+def print_gpu_info() -> str:
+    """
+    Return formatted information about available GPUs as a string.
+
+    Returns:
+        str: Formatted GPU information.
+    """
     if not torch.cuda.is_available():
-        print("CUDA not available.")
-        return
-    print(f"\n{'='*70}")
-    print(f"GPU Information")
-    print(f"{'='*70}")
+        return "CUDA not available."
+    
+    lines = [f"\n{'='*60}"]
     for i in range(torch.cuda.device_count()):
-        prop = torch.cuda.get_device_properties(i)
-        print(f"GPU {i}: {prop.name}")
-        print(f"  Memory: {prop.total_memory / 1e9:.2f} GB")
-        print(f"  Multiprocessors: {prop.multi_processor_count}")
-    print(f"{'='*70}\n")
+        p = torch.cuda.get_device_properties(i)
+        lines.append(f"GPU {i}: {p.name}  {p.total_memory/1e9:.1f}GB")
+    lines.append(f"{'='*60}\n")
+    return "\n".join(lines)

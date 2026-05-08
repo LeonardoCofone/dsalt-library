@@ -19,6 +19,7 @@
         └── 📁training
             ├── __init__.py  
             ├── gpu_auto.py  
+            ├── logging_config.py  
             ├── trainer.py
         ├── __init__.py
         ├── py.typed

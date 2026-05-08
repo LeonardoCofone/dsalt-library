@@ -1,30 +1,21 @@
 import math
-import os
 import time
+import logging
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict
 
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from torch.optim import AdamW
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
 
-from dsalt.training.gpu_auto import GPUAutoConfig
+from dsalt.training.gpu_auto import resolve_device, print_gpu_info
 
-try:
-    from torch.distributed.fsdp import (
-        FullyShardedDataParallel as FSDP,
-        MixedPrecision,
-        ShardingStrategy,
-        BackwardPrefetch,
-        CPUOffload,
-    )
-    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-    import functools
-    _FSDP_AVAILABLE = True
-except ImportError:
-    _FSDP_AVAILABLE = False
+logger = logging.getLogger(__name__)
+
+# Parameter grouping keywords for optimization
+DSALT_PARAM_KEYWORDS = ("window_pred", "alpha_w")
+NO_DECAY_KEYWORDS = ("norm", "bias", "emb", "tok_emb", "pos_emb")
 
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.1):
@@ -37,11 +28,14 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: i
 
 
 class DSALTTrainer:
+    """
+    Trainer for DSALT models with support for multi-GPU training, mixed precision, and gradient accumulation.
+    """
     def __init__(
         self,
         model: nn.Module,
-        train_loader,
-        val_loader: Optional[Any]               = None,
+        train_loader: DataLoader,
+        val_loader: Optional[DataLoader]        = None,
         lr: float                               = 3e-4,
         weight_decay: float                     = 0.1,
         max_grad_norm: float                    = 1.0,
@@ -56,80 +50,41 @@ class DSALTTrainer:
         window_reg_coef: float                  = 0.0,
         compute_metrics_fn: Optional[Callable]  = None,
         resume_from: Optional[str]              = None,
-        ddp: bool                               = False,
-        fsdp: bool                              = False,
-        fsdp_cpu_offload: bool                  = False,
         gradient_checkpointing: bool            = False,
+        device: str                             = "cpu",
+        num_gpus: int                           = 1,
     ):
-        assert not (ddp and fsdp), "Choose DDP or FSDP, not both."
+        self.primary_device, self.gpu_ids = resolve_device(device, num_gpus)
+        self.use_dp = len(self.gpu_ids) > 1
 
-        self.gpu_config = GPUAutoConfig(verbose=True)
+        if self.primary_device.type == "cuda":
+            logger.info(print_gpu_info())
 
-        in_torchrun = self.gpu_config.in_torchrun
-        if in_torchrun and not dist.is_initialized():
-            dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
-
-        if in_torchrun and not ddp and not fsdp:
-            ddp = True
-
-        self.ddp  = ddp
-        self.fsdp = fsdp
-        self.device = self.gpu_config.device
-
+        self._gradient_checkpointing_enabled = False
         if gradient_checkpointing:
-            self._enable_gradient_checkpointing(model)
+            self._gradient_checkpointing_enabled = self._enable_gradient_checkpointing(model)
 
-        model = model.to(self.device)
+        model = model.to(self.primary_device)
 
-        if ddp:
-            assert dist.is_initialized(), "dist not initialized. Use torchrun."
-            model = DDP(
-                model,
-                device_ids=[self.device.index] if self.device.type == "cuda" else None,
-            )
-        elif fsdp:
-            assert _FSDP_AVAILABLE, "FSDP not available in this version of PyTorch."
-            assert dist.is_initialized(), "dist not initialized. Use torchrun."
-            mp_policy = (
-                MixedPrecision(
-                    param_dtype=dtype,
-                    reduce_dtype=torch.float32,
-                    buffer_dtype=dtype,
-                )
-                if dtype in (torch.float16, torch.bfloat16)
-                else None
-            )
-            cpu_off = CPUOffload(offload_params=True) if fsdp_cpu_offload else None
-            from dsalt.modules.dsalt_transformer import DSALTBlock
-            wrap_policy = functools.partial(
-                transformer_auto_wrap_policy,
-                transformer_layer_cls={DSALTBlock},
-            )
-            model = FSDP(
-                model,
-                auto_wrap_policy=wrap_policy,
-                mixed_precision=mp_policy,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-                cpu_offload=cpu_off,
-                device_id=self.device,
-            )
+        if self.use_dp:
+            model = nn.DataParallel(model, device_ids=self.gpu_ids)
+            logger.info(f"DataParallel on GPUs: {self.gpu_ids}")
+        elif len(self.gpu_ids) > 0:
+            logger.info(f"Single GPU: {self.primary_device}")
+        else:
+            logger.info("CPU mode.")
 
         self.model = model
-        self._model_base = (
-            model.module
-            if isinstance(model, (DDP, nn.DataParallel))
-            else model
-        )
+        self._model_base = model.module if self.use_dp else model
+        self.device = self.primary_device
 
         decay, no_decay, dsalt_params = [], [], []
-        param_source = self._model_base if not fsdp else model
-        for name, p in param_source.named_parameters():
+        for name, p in self._model_base.named_parameters():
             if not p.requires_grad:
                 continue
-            if any(kw in name for kw in ("window_pred", "alpha_w")):
+            if any(kw in name for kw in DSALT_PARAM_KEYWORDS):
                 dsalt_params.append(p)
-            elif any(kw in name for kw in ("norm", "bias", "emb", "tok_emb", "pos_emb")):
+            elif any(kw in name for kw in NO_DECAY_KEYWORDS):
                 no_decay.append(p)
             else:
                 decay.append(p)
@@ -146,10 +101,11 @@ class DSALTTrainer:
         self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, warmup_steps, total_steps)
 
         self.dtype   = dtype
-        self.use_amp = dtype in (torch.float16, torch.bfloat16) and self.device.type == "cuda"
+        self.use_amp = self.device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
+        # GradScaler is only needed for float16; bfloat16 doesn't require scaling
         self.scaler  = (
             torch.amp.GradScaler("cuda")
-            if dtype == torch.float16 and self.use_amp
+            if self.use_amp and dtype == torch.float16
             else None
         )
 
@@ -166,14 +122,12 @@ class DSALTTrainer:
         self.compute_metrics_fn = compute_metrics_fn
         self.global_step        = 0
         self.best_val_ppl       = float("inf")
+        self._zero_tensor       = torch.tensor(0.0, device=self.device)
         self.history: Dict[str, list] = {
             "train_loss": [], "val_ppl": [], "val_steps": [],
             "step_time": [], "gpu_mem_gb": [], "lr": [],
             "sigma2": [], "eff_rank": [], "res_norm": [], "attn_entropy": [],
             "noise_norm": [], "head_spec_std": [], "attn_sink": [],
-            "token_dist": [], "sigma2_per_layer": [], "entropy_per_layer": [],
-            "noise_per_layer": [], "eff_rank_per_layer": [], "res_per_layer": [],
-            "token_dist_per_layer": [], "alpha_per_head": [], "oow_mass_per_layer": [],
         }
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -181,35 +135,40 @@ class DSALTTrainer:
             self._load_checkpoint(resume_from)
 
     @staticmethod
-    def _enable_gradient_checkpointing(model: nn.Module) -> None:
+    def _enable_gradient_checkpointing(model: nn.Module) -> bool:
+        """Enable gradient checkpointing for DSALT layers to reduce memory usage."""
         try:
             from dsalt.modules.dsalt_attention import DSALTAttention
+            count = 0
             for module in model.modules():
                 if isinstance(module, DSALTAttention):
                     module.gradient_checkpointing = True
+                    count += 1
+            if count > 0:
+                logger.debug(f"Gradient checkpointing enabled for {count} DSALTAttention modules.")
+                return True
+            return False
         except ImportError:
-            pass
-
-    def _is_main(self) -> bool:
-        if self.ddp or self.fsdp:
-            return dist.get_rank() == 0
-        return True
+            logger.warning("Could not import DSALTAttention for gradient checkpointing.")
+            return False
 
     def print_training_setup(self):
-        if not self._is_main():
-            return
-        print(f"\n{'='*70}")
-        print(f"Training Setup Summary")
-        print(f"{'='*70}")
-        print(f"Model:               {self.model.__class__.__name__}")
-        print(f"Device:              {self.device}")
-        print(f"Dtype:               {self.dtype}")
-        print(f"Strategy:            {self.gpu_config.recommended_strategy()}")
-        print(f"DDP:                 {self.ddp}")
-        print(f"FSDP:                {self.fsdp}")
-        print(f"Total Steps:         {self.total_steps}")
-        print(f"Grad Accum:          {self.grad_accum}")
-        print(f"{'='*70}\n")
+        """Log training configuration summary."""
+        setup_info = (
+            f"\n{'='*70}\n"
+            f"Training Setup Summary\n"
+            f"{'='*70}\n"
+            f"Model:               {self.model.__class__.__name__}\n"
+            f"Device:              {self.device}\n"
+            f"Dtype:               {self.dtype}\n"
+            f"DataParallel:        {self.use_dp}\n"
+            f"GPU IDs:             {self.gpu_ids}\n"
+            f"Gradient Checkpointing: {self._gradient_checkpointing_enabled}\n"
+            f"Total Steps:         {self.total_steps}\n"
+            f"Grad Accum:          {self.grad_accum}\n"
+            f"{'='*70}\n"
+        )
+        logger.info(setup_info)
 
     def _forward(self, x: torch.Tensor, y: torch.Tensor):
         with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=self.use_amp):
@@ -220,7 +179,7 @@ class DSALTTrainer:
                 y.contiguous().view(B * N),
                 ignore_index=-100,
             )
-            win_reg = torch.tensor(0.0, device=self.device)
+            win_reg = self._zero_tensor.clone()
             if self.window_reg_coef > 0 and cont_windows is not None:
                 if isinstance(cont_windows, torch.Tensor):
                     cont_windows = [cont_windows]
@@ -231,11 +190,10 @@ class DSALTTrainer:
 
     def train(self) -> Dict[str, list]:
         self.model.train()
-        data_iter  = iter(self.train_loader)
-        loss_accum = 0.0
+        data_iter           = iter(self.train_loader)
+        loss_accum          = 0.0
         n_steps_accumulated = 0
-        t0 = time.time()
-        self.optimizer.zero_grad(set_to_none=True)
+        t0                  = time.time()
 
         while self.global_step < self.total_steps:
             for acc_step in range(self.grad_accum):
@@ -246,18 +204,12 @@ class DSALTTrainer:
                     x, y = next(data_iter)
                 x, y = x.to(self.device), y.to(self.device)
 
-                ctx = (
-                    self.model.no_sync()
-                    if (self.ddp and acc_step < self.grad_accum - 1)
-                    else _nullctx()
-                )
-                with ctx:
-                    loss, ce, win_reg = self._forward(x, y)
-                    loss = loss / self.grad_accum
-                    if self.scaler is not None:
-                        self.scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                loss, ce, win_reg = self._forward(x, y)
+                loss = loss / self.grad_accum
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
                 loss_accum += ce.item()
 
             n_steps_accumulated += 1
@@ -275,7 +227,7 @@ class DSALTTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1
 
-            if self.global_step % self.log_every == 0 and self._is_main():
+            if self.global_step % self.log_every == 0:
                 elapsed  = time.time() - t0
                 avg_loss = loss_accum / n_steps_accumulated
                 ppl      = math.exp(min(avg_loss, 1000))
@@ -284,13 +236,15 @@ class DSALTTrainer:
                     torch.cuda.memory_allocated(self.device) / 1e9
                     if self.device.type == "cuda" else 0.0
                 )
+                it_per_sec = self.log_every / elapsed if elapsed > 0 else float('inf')
                 log_str = (
                     f"step {self.global_step:>6d}/{self.total_steps} │ "
                     f"loss {avg_loss:.4f} │ ppl {ppl:.2f} │ "
                     f"lr {lr_now:.2e} │ win_reg {win_reg.item():.4f} │ "
-                    f"mem {mem_gb:.2f}GB │ {self.log_every / elapsed:.2f}it/s"
+                    f"mem {mem_gb:.2f}GB │ {it_per_sec:.2f}it/s"
                 )
-                if self.compute_metrics_fn is not None:
+                # Compute metrics less frequently (every 5 logs) to reduce overhead
+                if self.compute_metrics_fn is not None and self.global_step % (self.log_every * 5) == 0:
                     m = self.compute_metrics_fn(self._model_base, x[:1])
                     log_str += (
                         f"\n        σ₂ {m['sigma2']:.4f} │ rank {m['eff_rank']:.1f} │ "
@@ -300,40 +254,35 @@ class DSALTTrainer:
                     )
                     for k in [
                         "sigma2", "eff_rank", "res_norm", "attn_entropy", "noise_norm",
-                        "head_spec_std", "attn_sink", "token_dist", "sigma2_per_layer",
-                        "entropy_per_layer", "noise_per_layer", "eff_rank_per_layer",
-                        "res_per_layer", "token_dist_per_layer", "alpha_per_head",
-                        "oow_mass_per_layer",
+                        "head_spec_std", "attn_sink",
                     ]:
                         if k in m:
                             self.history[k].append(m[k])
 
-                print(f"{'─'*50}\n{log_str}")
+                logger.info(f"{'─'*50}\n{log_str}")
                 self.history["train_loss"].append(avg_loss)
                 self.history["step_time"].append(elapsed / self.log_every)
                 self.history["gpu_mem_gb"].append(mem_gb)
                 self.history["lr"].append(lr_now)
-                loss_accum = 0.0
+                loss_accum          = 0.0
                 n_steps_accumulated = 0
-                t0 = time.time()
+                t0                  = time.time()
 
-            if self.val_loader and self.global_step % self.val_every == 0 and self._is_main():
+            if self.val_loader and self.global_step % self.val_every == 0:
                 val_ppl = self._validate()
                 self.history["val_ppl"].append(val_ppl)
                 self.history["val_steps"].append(self.global_step)
-                print(f"  ╰─ val_ppl {val_ppl:.2f} at step {self.global_step}")
+                logger.info(f"  ╰─ val_ppl {val_ppl:.2f} at step {self.global_step}")
                 if val_ppl < self.best_val_ppl:
                     self.best_val_ppl = val_ppl
                     self._save_checkpoint("best.pt")
                 self.model.train()
 
-            if self.global_step % self.save_every == 0 and self._is_main():
+            if self.global_step % self.save_every == 0:
                 self._save_checkpoint(f"step_{self.global_step:07d}.pt")
 
-        if self._is_main():
-            self._save_checkpoint("final.pt")
-            print(f"Done. Best val ppl: {self.best_val_ppl:.2f}")
-
+        self._save_checkpoint("final.pt")
+        logger.info(f"Done. Best val ppl: {self.best_val_ppl:.2f}")
         return self.history
 
     @torch.no_grad()
@@ -346,30 +295,14 @@ class DSALTTrainer:
             n_toks        = (y != -100).sum().item()
             total_loss   += ce.item() * n_toks
             total_tokens += n_toks
-
-        if self.ddp or self.fsdp:
-            tl_ = torch.tensor(total_loss,   device=self.device)
-            tt_ = torch.tensor(total_tokens, device=self.device)
-            dist.all_reduce(tl_, op=dist.ReduceOp.SUM)
-            dist.all_reduce(tt_, op=dist.ReduceOp.SUM)
-            total_loss, total_tokens = tl_.item(), tt_.item()
-
         return math.exp(min(total_loss / max(total_tokens, 1), 20))
-
-    def _get_state_dict(self):
-        if self.fsdp and _FSDP_AVAILABLE:
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, cfg):
-                return self.model.state_dict()
-        return self._model_base.state_dict()
 
     def _save_checkpoint(self, filename: str) -> None:
         path = self.save_dir / filename
         torch.save(
             {
                 "step":            self.global_step,
-                "model_state":     self._get_state_dict(),
+                "model_state":     self._model_base.state_dict(),
                 "optimizer_state": self.optimizer.state_dict(),
                 "scheduler_state": self.scheduler.state_dict(),
                 "best_val_ppl":    self.best_val_ppl,
@@ -377,21 +310,20 @@ class DSALTTrainer:
             },
             path,
         )
-        print(f"  ╰─ checkpoint → {path}")
+        logger.info(f"  ╰─ checkpoint → {path}")
 
     def _load_checkpoint(self, path: str) -> None:
-        if not Path(path).exists():
-            raise FileNotFoundError(f"Checkpoint non trovato: {path}")
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self._model_base.load_state_dict(ckpt["model_state"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state"])
-        self.scheduler.load_state_dict(ckpt["scheduler_state"])
-        self.global_step  = ckpt["step"]
-        self.best_val_ppl = ckpt.get("best_val_ppl", float("inf"))
-        self.history      = ckpt.get("history", self.history)
-        print(f"Ripreso da {path} al passo {self.global_step}")
-
-
-class _nullctx:
-    def __enter__(self): return self
-    def __exit__(self, *_): pass
+        try:
+            if not Path(path).exists():
+                raise FileNotFoundError(f"Checkpoint not found: {path}")
+            ckpt = torch.load(path, map_location=self.device, weights_only=True)
+            self._model_base.load_state_dict(ckpt["model_state"])
+            self.optimizer.load_state_dict(ckpt["optimizer_state"])
+            self.scheduler.load_state_dict(ckpt["scheduler_state"])
+            self.global_step  = ckpt["step"]
+            self.best_val_ppl = ckpt.get("best_val_ppl", float("inf"))
+            self.history      = ckpt.get("history", self.history)
+            logger.info(f"Resumed from {path} at step {self.global_step}")
+        except (FileNotFoundError, IOError, RuntimeError) as e:
+            logger.error(f"Failed to load checkpoint from {path}: {e}")
+            raise

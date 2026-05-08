@@ -28,7 +28,7 @@ def _dummy_inputs(
     # finestra locale: tutti i token hanno una finestra di 4 posizioni
     win = torch.full((batch, heads, seq_len), 4, dtype=torch.int32, device=device)
     # landmark: scegliamo i primi 2 token come landmark per tutti
-    lmk = torch.arange(2, device=device).repeat(batch, heads, seq_len, 1)
+    lmk = torch.arange(2, device=device).repeat(batch, heads, 1)
     return Q, K, V, win, lmk
 
 
