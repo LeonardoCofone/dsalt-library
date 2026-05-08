@@ -47,14 +47,14 @@ if _TRITON_AVAILABLE:
         BLOCK_D: tl.constexpr,
         BLOCK_Dh: tl.constexpr,
         # strides X [B, N, D]
-        stride_xb: tl.constexpr,
-        stride_xn: tl.constexpr,
+        stride_xb,
+        stride_xn,
         # stride WV [H, D, D_head]
-        stride_wh: tl.constexpr,
-        stride_wd: tl.constexpr,
+        stride_wh,
+        stride_wd,
         # strides output [B, H, N]
-        stride_ob: tl.constexpr,
-        stride_oh: tl.constexpr,
+        stride_ob,
+        stride_oh,
     ):
         """
         Grid: (cdiv(N, BLOCK_N), H, B)
@@ -145,58 +145,18 @@ def _cpu_compute_norms(
 # API pubblica
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_hybrid_energy_scores(
-    X: torch.Tensor,      # [B, N, D]       — NON [B, H, N, D]
-    WV: torch.Tensor,     # [H, D, D_head]
-    alpha: torch.Tensor,  # [H] o scalar
-) -> torch.Tensor:
-    """
-    Calcola gli score ibridi s_j = α‖x_j W_V‖ + (1-α)‖x_j‖ per ogni token j.
-
-    Input:
-      X   : [B, N, D]       hidden states (non replicati per head)
-      WV  : [H, D, D_head]  value projection weights
-      alpha: [H] float in [0,1]
-
-    Output:
-      scores: [B, H, N]  z-normalizzati per (b, h)
-    """
+def compute_hybrid_energy_scores(X: torch.Tensor, WV: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     B, N, D = X.shape
     H, _, D_head = WV.shape
 
-    x_norms  = torch.empty(B, H, N, dtype=torch.float32, device=X.device)
-    xv_norms = torch.empty(B, H, N, dtype=torch.float32, device=X.device)
-
-    if X.is_cuda and _TRITON_AVAILABLE:
-        BLOCK_N  = 64
-        BLOCK_D  = min(64, triton.next_power_of_2(D))
-        BLOCK_Dh = triton.next_power_of_2(D_head)
-
-        X_c  = X.contiguous()
-        WV_c = WV.contiguous()
-
-        grid = (triton.cdiv(N, BLOCK_N), H, B)
-        _hybrid_energy_kernel[grid](
-            X_c, WV_c, x_norms, xv_norms,
-            N=N, D=D, D_head=D_head,
-            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Dh=BLOCK_Dh,
-            stride_xb=X_c.stride(0),
-            stride_xn=X_c.stride(1),
-            stride_wh=WV_c.stride(0),
-            stride_wd=WV_c.stride(1),
-            stride_ob=x_norms.stride(0),
-            stride_oh=x_norms.stride(1),
-        )
-    else:
-        x_norms, xv_norms = _cpu_compute_norms(X, WV)
+    x_norms, xv_norms = _cpu_compute_norms(X, WV)
 
     def _znorm(t: torch.Tensor) -> torch.Tensor:
-        mu  = t.mean(dim=-1, keepdim=True)
+        mu = t.mean(dim=-1, keepdim=True)
         std = t.std(dim=-1, keepdim=True).clamp(min=1e-6)
         return (t - mu) / std
 
-    # alpha: [H] → [1, H, 1] per broadcast su [B, H, N]
-    if isinstance(alpha, float):
+    if isinstance(alpha, (float, int)):
         a = alpha
     else:
         a = alpha.view(1, -1, 1)

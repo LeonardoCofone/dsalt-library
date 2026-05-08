@@ -539,7 +539,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 landmark_idx.stride(0), landmark_idx.stride(1), landmark_idx.stride(2),
                 Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
-                B, H, N, D, K_lmk, scale, BLOCK_D,
+                B=B, H=H, N=N, D=D, K=K_lmk, SCALE=scale, BLOCK_D=BLOCK_D,
             )
         else:
             Out, LSE = _cpu_reference_forward(Q, K, V, window_sizes, landmark_idx, scale)
@@ -577,7 +577,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 dKL.stride(0), dKL.stride(1), dKL.stride(2), dKL.stride(3),
                 dVL.stride(0), dVL.stride(1), dVL.stride(2), dVL.stride(3),
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
-                B, H, N, D, K_lmk, ctx.scale, BD,
+                B=B, H=H, N=N, D=D, K=K_lmk, SCALE=ctx.scale, BLOCK_D=BD,
             )
 
             grid_m = lambda meta: (triton.cdiv(N, meta["BLOCK_M"]), H, B)
@@ -590,7 +590,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 V.stride(0), V.stride(1), V.stride(2), V.stride(3),
                 landmark_idx.stride(0), landmark_idx.stride(1), landmark_idx.stride(2),
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
-                B, H, N, D, K_lmk, ctx.scale, BD,
+                B=B, H=H, N=N, D=D, K=K_lmk, SCALE=ctx.scale, BLOCK_D=BD,
             )
 
             idx = landmark_idx.long().clamp(0, N - 1)
