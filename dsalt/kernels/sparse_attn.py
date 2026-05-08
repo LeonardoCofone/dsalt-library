@@ -151,7 +151,7 @@ if _TRITON_AVAILABLE:
 
             kl_tile = tl.load(
                 K_bh + idx_k[:, None] * stride_kn + offs_d[None, :],
-                mask=valid_k[:, None] & mask_d[:, None], other=0.0,
+                mask=valid_k[:, None] & mask_d[None, :], other=0.0,
             )
             s_lmk = tl.dot(q, kl_tile, out_dtype=tl.float32) * SCALE
             lmk_ok = valid_k[None, :] & mask_m[:, None]
