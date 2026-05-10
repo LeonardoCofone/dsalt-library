@@ -1,17 +1,3 @@
-"""
-dsalt/modules/dsalt_attention.py
----------------------------------
-DSALTAttention — Multi-head sparse attention con finestre adattive e landmark.
-
-Cambiamenti rispetto alla versione precedente:
-  - x_pred NON viene espanso a [B,H,N,D]: compute_landmark_idx ora accetta [B,N,D]
-  - _get_wv_per_head ritorna [H, D, D_head] (invariato)
-  - landmark_idx ha shape [B,H,K] invece di [B,H,N,K] — risparmia N× memoria
-  - gradient_checkpointing funziona correttamente: fa checkpoint del blocco
-    attention completo, non di un lambda su un tensore già calcolato
-  - alpha_w: sigmoid applicato una volta sola al momento del calcolo
-"""
-
 import math
 from typing import Optional, Tuple
 
@@ -58,13 +44,11 @@ class DSALTAttention(nn.Module):
 
         self.qkv_proj  = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj  = nn.Linear(d_model, d_model,     bias=False)
-        # alpha per head: sigmoid(alpha_w) in [0,1]
         self.alpha_w   = nn.Parameter(torch.full((n_heads,), alpha))
         self.window_pred = WindowSizePredictor(d_model, n_heads, n_min, n_max)
         self.scale = 1.0 / math.sqrt(self.d_head)
         self._init_weights()
 
-        # torch.compile opzionale sul solo blocco di attenzione
         self._attn_fn = (
             torch.compile(self._compute_attention, mode="reduce-overhead")
             if compile_attention else self._compute_attention
@@ -75,42 +59,25 @@ class DSALTAttention(nn.Module):
         nn.init.xavier_uniform_(self.out_proj.weight)
 
     def _get_wv_weights(self) -> torch.Tensor:
-        """
-        Estrae le proiezioni Value dalla matrice QKV.
-
-        qkv_proj.weight: [3*D, D]
-        Righe V:         [2D : 3D]   → shape [D, D]
-        Per head h:      righe [h*Dh : (h+1)*Dh]
-
-        Ritorna: [H, D, D_head]   (usato da compute_landmark_idx)
-        """
         D  = self.d_model
         H  = self.n_heads
         Dh = self.d_head
-        Wv = self.qkv_proj.weight[2 * D : 3 * D, :]   # [D, D]
-        # Wv[h*Dh:(h+1)*Dh, :] è la proiezione dell'head h
-        # Vogliamo [H, D, Dh] = per ogni head, la matrice che proietta D → Dh
-        # La matrice del kernel è W tale che output = input @ W.T
-        # qkv_proj: y = x @ weight.T  →  V_h = x @ Wv[h].T
-        # Wv[h]: [Dh, D] — righe = output dims
-        # Per calcolare ‖x @ Wv[h].T‖ = ‖x @ Wv_h‖ con Wv_h = Wv[h].T: [D, Dh]
-        Wv_h = Wv.view(H, Dh, D)          # [H, Dh, D]
-        return Wv_h.permute(0, 2, 1).contiguous()  # [H, D, Dh]
+        Wv = self.qkv_proj.weight[2 * D : 3 * D, :]  
+        Wv_h = Wv.view(H, Dh, D)     
+        return Wv_h.permute(0, 2, 1).contiguous() 
 
     def _compute_attention(
         self,
-        Q: torch.Tensor,              # [B, H, N, Dh]
+        Q: torch.Tensor,         
         K: torch.Tensor,
         V: torch.Tensor,
-        window_sizes: torch.Tensor,   # [B, H, N]  int32
-        landmark_idx: torch.Tensor,   # [B, H, K]  int32
+        window_sizes: torch.Tensor,  
+        landmark_idx: torch.Tensor,  
     ) -> torch.Tensor:
-        """Dispatching FlashAttention2 o kernel DSALT."""
         N = Q.shape[2]
         max_w = int(window_sizes.max().item())
 
         if self.use_fa2 and N <= max_w:
-            # Se tutti i token cadono nella finestra locale, FA2 è equivalente
             return flash_attn_func(
                 Q.transpose(1, 2), K.transpose(1, 2), V.transpose(1, 2),
                 dropout_p=self.dropout if self.training else 0.0,
@@ -119,55 +86,43 @@ class DSALTAttention(nn.Module):
         else:
             return dsalt_attention(Q, K, V, window_sizes, landmark_idx)
 
-    def forward(
-        self,
-        x: torch.Tensor,                      # [B, N, D]
-        x_prev: Optional[torch.Tensor] = None, # [B, N, D]  hidden state prev layer
-        return_window: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x, x_prev=None, return_window=False):
         B, N, D = x.shape
-        H, Dh   = self.n_heads, self.d_head
+        H, Dh = self.n_heads, self.d_head
+        dev = x.device
 
-        # Usiamo x_prev per predire le finestre (layer l-1), fallback a x
+        print(f"[ATT] forward start dev={dev} B={B} N={N}", flush=True)
+        
         x_pred = x_prev if x_prev is not None else x
 
-        # ── Window size prediction ────────────────────────────────────────
+        print(f"[ATT] window_pred start dev={dev}", flush=True)
         window_sizes, cont_w = self.window_pred(x_pred, training=self.training)
-        # window_sizes: [B, H, N]  int32
-        # cont_w:       [B, N]     float — per regularizzazione
+        print(f"[ATT] window_pred done dev={dev}", flush=True)
 
         qkv = self.qkv_proj(x)
         qkv = qkv.view(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
         Q, K, V = qkv[0], qkv[1], qkv[2]
+        print(f"[ATT] qkv done dev={dev}", flush=True)
 
         Wv = self._get_wv_weights().detach()
-        with torch.no_grad():     
-            alpha = torch.sigmoid(self.alpha_w)           # [H]
+        print(f"[ATT] wv done dev={dev}", flush=True)
+
+        with torch.no_grad():
+            alpha = torch.sigmoid(self.alpha_w)
+            print(f"[ATT] landmark start dev={dev}", flush=True)
             landmark_idx = compute_landmark_idx(
-                X=x_pred,                  # [B, N, D]
-                WV=Wv,                     # [H, D, Dh]
-                window_sizes=window_sizes, # [B, H, N]
-                k=self.k_lmk,
-                alpha=alpha,               # [H]
+                X=x_pred, WV=Wv, window_sizes=window_sizes,
+                k=self.k_lmk, alpha=alpha,
             )
-            # landmark_idx: [B, H, K]  int32
+        print(f"[ATT] landmark done dev={dev}", flush=True)
 
-        # ── Attention ────────────────────────────────────────────────────
-        if self.gradient_checkpointing and self.training:
-            # Gradient checkpointing reale: ricalcola il forward durante il backward
-            # Risparmia la memoria di Q,K,V activations nel graph
-            out = ckpt_utils.checkpoint(
-                self._attn_fn,
-                Q, K, V, window_sizes, landmark_idx,
-                use_reentrant=False,
-            )
-        else:
-            out = self._attn_fn(Q, K, V, window_sizes, landmark_idx)
+        print(f"[ATT] attn_fn start dev={dev}", flush=True)
+        out = self._attn_fn(Q, K, V, window_sizes, landmark_idx)
+        print(f"[ATT] attn_fn done dev={dev}", flush=True)
 
-        # ── Output projection ────────────────────────────────────────────
-        # out: [B, H, N, Dh] → [B, N, D]
         out = out.permute(0, 2, 1, 3).contiguous().view(B, N, D)
         out = self.out_proj(out)
+        print(f"[ATT] out_proj done dev={dev}", flush=True)
 
         if return_window:
             return out, cont_w
