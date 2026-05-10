@@ -70,7 +70,7 @@ class DSALTTrainer:
             self._gradient_checkpointing_enabled = self._enable_gradient_checkpointing(model)
             logger.info(f"Gradient checkpointing  →  {self._gradient_checkpointing_enabled}")
 
-        logger.info(f"Moving model to {self.primary_device} ...")
+        logger.info(f"Moving model to {self.primary_device}")
         model = model.to(self.primary_device)
         logger.info("Model on device  ✓")
 

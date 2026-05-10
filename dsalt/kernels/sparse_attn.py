@@ -42,6 +42,15 @@ def _get_gpu_config(device: Optional[int] = None):
     else: 
         return 64, 64, 4, 1
 
+def _log_gpu_config(device: int):
+      sm = torch.cuda.get_device_capability(device)
+      cfg = _get_gpu_config(device)
+      print(
+          f"[DSALT] CUDA device {device} (SM {sm[0]}.{sm[1]}) → "
+          f"BLOCK_M={cfg[0]}, BLOCK_N={cfg[1]}, WARPS={cfg[2]}, STAGES={cfg[3]}"
+      )
+
+
 if _TRITON_AVAILABLE:
     _BLOCK_M, _BLOCK_N, _WARPS, _STAGES = _get_gpu_config()
 
@@ -498,6 +507,8 @@ class DSALTAttentionFunction(torch.autograd.Function):
         LSE = torch.empty(B, H, N, dtype=torch.float32, device=Q.device)
 
         if Q.is_cuda and _TRITON_AVAILABLE:
+            dev_id = Q.get_device()
+            _log_gpu_config(dev_id)
             Q  = Q.contiguous()
             K  = K.contiguous()
             V  = V.contiguous()
