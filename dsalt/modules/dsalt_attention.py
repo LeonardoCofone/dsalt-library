@@ -136,15 +136,12 @@ class DSALTAttention(nn.Module):
         # window_sizes: [B, H, N]  int32
         # cont_w:       [B, N]     float — per regularizzazione
 
-        # ── QKV projection ────────────────────────────────────────────────
-        qkv = self.qkv_proj(x)                           # [B, N, 3D]
+        qkv = self.qkv_proj(x)
         qkv = qkv.view(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
-        Q, K, V = qkv[0], qkv[1], qkv[2]                # [B, H, N, Dh]
+        Q, K, V = qkv[0], qkv[1], qkv[2]
 
-        # ── Landmark selection (no grad) ──────────────────────────────────
-        # x_pred: [B, N, D]  — NON espanso per head, risparmia O(H) memoria
-        with torch.no_grad():
-            Wv = self._get_wv_weights()                   # [H, D, Dh]
+        Wv = self._get_wv_weights().detach()
+        with torch.no_grad():     
             alpha = torch.sigmoid(self.alpha_w)           # [H]
             landmark_idx = compute_landmark_idx(
                 X=x_pred,                  # [B, N, D]
