@@ -10,15 +10,15 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from dsalt.training.gpu_auto import resolve_device, print_gpu_info
+from dsalt.training.logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
 
-# Parameter grouping keywords for optimization
 DSALT_PARAM_KEYWORDS = ("window_pred", "alpha_w")
-NO_DECAY_KEYWORDS = ("norm", "bias", "emb", "tok_emb", "pos_emb")
+NO_DECAY_KEYWORDS    = ("norm", "bias", "emb", "tok_emb", "pos_emb")
 
 
-def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.1):
+def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step) / max(1, warmup_steps)
@@ -28,9 +28,7 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: i
 
 
 class DSALTTrainer:
-    """
-    Trainer for DSALT models with support for multi-GPU training, mixed precision, and gradient accumulation.
-    """
+
     def __init__(
         self,
         model: nn.Module,
@@ -53,9 +51,16 @@ class DSALTTrainer:
         gradient_checkpointing: bool            = False,
         device: str                             = "cpu",
         num_gpus: int                           = 1,
+        log_file: Optional[str]                 = None,
     ):
+        setup_logging(level=logging.INFO, log_file=log_file)
+        logger.info("=" * 60)
+        logger.info("DSALT Trainer init starting")
+        logger.info("=" * 60)
+
         self.primary_device, self.gpu_ids = resolve_device(device, num_gpus)
         self.use_dp = len(self.gpu_ids) > 1
+        logger.info(f"Device resolved  →  primary={self.primary_device}  gpu_ids={self.gpu_ids}  DataParallel={self.use_dp}")
 
         if self.primary_device.type == "cuda":
             logger.info(print_gpu_info())
@@ -63,20 +68,23 @@ class DSALTTrainer:
         self._gradient_checkpointing_enabled = False
         if gradient_checkpointing:
             self._gradient_checkpointing_enabled = self._enable_gradient_checkpointing(model)
+            logger.info(f"Gradient checkpointing  →  {self._gradient_checkpointing_enabled}")
 
+        logger.info(f"Moving model to {self.primary_device} ...")
         model = model.to(self.primary_device)
+        logger.info("Model on device  ✓")
 
         if self.use_dp:
             model = nn.DataParallel(model, device_ids=self.gpu_ids)
-            logger.info(f"DataParallel on GPUs: {self.gpu_ids}")
+            logger.info(f"Wrapped in DataParallel  →  GPUs {self.gpu_ids}")
         elif len(self.gpu_ids) > 0:
-            logger.info(f"Single GPU: {self.primary_device}")
+            logger.info(f"Single GPU mode  →  {self.primary_device}")
         else:
-            logger.info("CPU mode.")
+            logger.info("CPU mode")
 
-        self.model = model
+        self.model       = model
         self._model_base = model.module if self.use_dp else model
-        self.device = self.primary_device
+        self.device      = self.primary_device
 
         decay, no_decay, dsalt_params = [], [], []
         for name, p in self._model_base.named_parameters():
@@ -89,6 +97,11 @@ class DSALTTrainer:
             else:
                 decay.append(p)
 
+        total_params = sum(p.numel() for p in self._model_base.parameters())
+        trainable    = sum(p.numel() for p in self._model_base.parameters() if p.requires_grad)
+        logger.info(f"Parameters  →  total={total_params:,}  trainable={trainable:,}")
+        logger.info(f"Param groups  →  decay={len(decay)}  no_decay={len(no_decay)}  dsalt={len(dsalt_params)}")
+
         self.optimizer = AdamW(
             [
                 {"params": decay,        "lr": lr,       "weight_decay": weight_decay},
@@ -99,15 +112,16 @@ class DSALTTrainer:
             eps=1e-8,
         )
         self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, warmup_steps, total_steps)
+        logger.info(f"Optimizer  →  AdamW  lr={lr}  wd={weight_decay}  warmup={warmup_steps}  total={total_steps}")
 
         self.dtype   = dtype
         self.use_amp = self.device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
-        # GradScaler is only needed for float16; bfloat16 doesn't require scaling
         self.scaler  = (
             torch.amp.GradScaler("cuda")
             if self.use_amp and dtype == torch.float16
             else None
         )
+        logger.info(f"AMP  →  use_amp={self.use_amp}  dtype={dtype}  scaler={'yes (fp16)' if self.scaler else 'no'}")
 
         self.train_loader       = train_loader
         self.val_loader         = val_loader
@@ -130,13 +144,17 @@ class DSALTTrainer:
             "noise_norm": [], "head_spec_std": [], "attn_sink": [],
         }
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Checkpoints  →  {self.save_dir.resolve()}")
 
         if resume_from:
             self._load_checkpoint(resume_from)
 
+        logger.info("=" * 60)
+        logger.info(f"Trainer ready  →  steps={total_steps}  log_every={log_every}  val_every={val_every}  save_every={save_every}  grad_accum={grad_accum}")
+        logger.info("=" * 60)
+
     @staticmethod
     def _enable_gradient_checkpointing(model: nn.Module) -> bool:
-        """Enable gradient checkpointing for DSALT layers to reduce memory usage."""
         try:
             from dsalt.modules.dsalt_attention import DSALTAttention
             count = 0
@@ -145,30 +163,12 @@ class DSALTTrainer:
                     module.gradient_checkpointing = True
                     count += 1
             if count > 0:
-                logger.debug(f"Gradient checkpointing enabled for {count} DSALTAttention modules.")
+                logger.debug(f"Gradient checkpointing enabled for {count} DSALTAttention modules")
                 return True
             return False
         except ImportError:
-            logger.warning("Could not import DSALTAttention for gradient checkpointing.")
+            logger.warning("Could not import DSALTAttention for gradient checkpointing")
             return False
-
-    def print_training_setup(self):
-        """Log training configuration summary."""
-        setup_info = (
-            f"\n{'='*70}\n"
-            f"Training Setup Summary\n"
-            f"{'='*70}\n"
-            f"Model:               {self.model.__class__.__name__}\n"
-            f"Device:              {self.device}\n"
-            f"Dtype:               {self.dtype}\n"
-            f"DataParallel:        {self.use_dp}\n"
-            f"GPU IDs:             {self.gpu_ids}\n"
-            f"Gradient Checkpointing: {self._gradient_checkpointing_enabled}\n"
-            f"Total Steps:         {self.total_steps}\n"
-            f"Grad Accum:          {self.grad_accum}\n"
-            f"{'='*70}\n"
-        )
-        logger.info(setup_info)
 
     def _forward(self, x: torch.Tensor, y: torch.Tensor):
         with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=self.use_amp):
@@ -190,10 +190,23 @@ class DSALTTrainer:
 
     def train(self) -> Dict[str, list]:
         self.model.train()
+        logger.info(f"train() starting from step {self.global_step}")
+
+        # Log dataloader info
+        try:
+            n_batches = len(self.train_loader)
+            logger.info(f"Train loader  →  {n_batches} batches/epoch")
+        except TypeError:
+            logger.info("Train loader  →  iterable (no len)")
+
         data_iter           = iter(self.train_loader)
         loss_accum          = 0.0
         n_steps_accumulated = 0
         t0                  = time.time()
+        t_train_start       = time.time()
+
+        # Log first batch shape
+        _first_batch_logged = False
 
         while self.global_step < self.total_steps:
             for acc_step in range(self.grad_accum):
@@ -204,12 +217,25 @@ class DSALTTrainer:
                     x, y = next(data_iter)
                 x, y = x.to(self.device), y.to(self.device)
 
+                if not _first_batch_logged:
+                    logger.info(f"First batch  →  x={tuple(x.shape)}  y={tuple(y.shape)}  x.dtype={x.dtype}")
+                    logger.info("Running first forward pass (Triton JIT compile on first call, may take ~10s) ...")
+                    _first_batch_logged = True
+
                 loss, ce, win_reg = self._forward(x, y)
+
+                if self.global_step == 0 and acc_step == 0:
+                    logger.info(f"First forward done  →  ce={ce.item():.4f}")
+
                 loss = loss / self.grad_accum
                 if self.scaler is not None:
                     self.scaler.scale(loss).backward()
                 else:
                     loss.backward()
+
+                if self.global_step == 0 and acc_step == 0:
+                    logger.info("First backward done  ✓")
+
                 loss_accum += ce.item()
 
             n_steps_accumulated += 1
@@ -227,39 +253,51 @@ class DSALTTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1
 
+            if self.global_step == 1:
+                logger.info(f"Step 1 complete  →  total elapsed {time.time() - t_train_start:.1f}s")
+
             if self.global_step % self.log_every == 0:
-                elapsed  = time.time() - t0
-                avg_loss = loss_accum / n_steps_accumulated
-                ppl      = math.exp(min(avg_loss, 1000))
-                lr_now   = self.scheduler.get_last_lr()[0]
-                mem_gb   = (
+                elapsed    = time.time() - t0
+                avg_loss   = loss_accum / n_steps_accumulated
+                ppl        = math.exp(min(avg_loss, 1000))
+                lr_now     = self.scheduler.get_last_lr()[0]
+                it_per_sec = self.log_every / elapsed if elapsed > 0 else float("inf")
+                mem_gb     = (
                     torch.cuda.memory_allocated(self.device) / 1e9
                     if self.device.type == "cuda" else 0.0
                 )
-                it_per_sec = self.log_every / elapsed if elapsed > 0 else float('inf')
-                log_str = (
-                    f"step {self.global_step:>6d}/{self.total_steps} │ "
-                    f"loss {avg_loss:.4f} │ ppl {ppl:.2f} │ "
-                    f"lr {lr_now:.2e} │ win_reg {win_reg.item():.4f} │ "
-                    f"mem {mem_gb:.2f}GB │ {it_per_sec:.2f}it/s"
+                mem_reserved = (
+                    torch.cuda.memory_reserved(self.device) / 1e9
+                    if self.device.type == "cuda" else 0.0
                 )
-                # Compute metrics less frequently (every 5 logs) to reduce overhead
+
+                log_str = (
+                    f"step {self.global_step:>6d}/{self.total_steps}"
+                    f"  loss={avg_loss:.4f}"
+                    f"  ppl={ppl:.2f}"
+                    f"  lr={lr_now:.2e}"
+                    f"  win_reg={win_reg.item():.4f}"
+                    f"  mem={mem_gb:.2f}/{mem_reserved:.2f}GB"
+                    f"  {it_per_sec:.2f}it/s"
+                )
+
                 if self.compute_metrics_fn is not None and self.global_step % (self.log_every * 5) == 0:
                     m = self.compute_metrics_fn(self._model_base, x[:1])
                     log_str += (
-                        f"\n        σ₂ {m['sigma2']:.4f} │ rank {m['eff_rank']:.1f} │ "
-                        f"res {m['res_norm']:.4f} │ H {m['attn_entropy']:.4f} │ "
-                        f"noise {m['noise_norm']:.4f} │ sink {m['attn_sink']:.4f} │ "
-                        f"head_std {m['head_spec_std']:.4f}"
+                        f"\n         σ₂={m['sigma2']:.4f}"
+                        f"  rank={m['eff_rank']:.1f}"
+                        f"  res={m['res_norm']:.4f}"
+                        f"  H={m['attn_entropy']:.4f}"
+                        f"  noise={m['noise_norm']:.4f}"
+                        f"  sink={m['attn_sink']:.4f}"
+                        f"  head_std={m['head_spec_std']:.4f}"
                     )
-                    for k in [
-                        "sigma2", "eff_rank", "res_norm", "attn_entropy", "noise_norm",
-                        "head_spec_std", "attn_sink",
-                    ]:
+                    for k in ["sigma2", "eff_rank", "res_norm", "attn_entropy",
+                              "noise_norm", "head_spec_std", "attn_sink"]:
                         if k in m:
                             self.history[k].append(m[k])
 
-                logger.info(f"{'─'*50}\n{log_str}")
+                logger.info(log_str)
                 self.history["train_loss"].append(avg_loss)
                 self.history["step_time"].append(elapsed / self.log_every)
                 self.history["gpu_mem_gb"].append(mem_gb)
@@ -269,11 +307,17 @@ class DSALTTrainer:
                 t0                  = time.time()
 
             if self.val_loader and self.global_step % self.val_every == 0:
+                logger.info(f"Running validation at step {self.global_step} ...")
                 val_ppl = self._validate()
                 self.history["val_ppl"].append(val_ppl)
                 self.history["val_steps"].append(self.global_step)
-                logger.info(f"  ╰─ val_ppl {val_ppl:.2f} at step {self.global_step}")
-                if val_ppl < self.best_val_ppl:
+                improved = val_ppl < self.best_val_ppl
+                logger.info(
+                    f"Validation  →  ppl={val_ppl:.2f}"
+                    f"  best={self.best_val_ppl:.2f}"
+                    f"{'  [NEW BEST]' if improved else ''}"
+                )
+                if improved:
                     self.best_val_ppl = val_ppl
                     self._save_checkpoint("best.pt")
                 self.model.train()
@@ -281,8 +325,11 @@ class DSALTTrainer:
             if self.global_step % self.save_every == 0:
                 self._save_checkpoint(f"step_{self.global_step:07d}.pt")
 
+        total_time = time.time() - t_train_start
+        logger.info("=" * 60)
+        logger.info(f"Training complete  →  steps={self.global_step}  best_val_ppl={self.best_val_ppl:.2f}  total_time={total_time/60:.1f}min")
+        logger.info("=" * 60)
         self._save_checkpoint("final.pt")
-        logger.info(f"Done. Best val ppl: {self.best_val_ppl:.2f}")
         return self.history
 
     @torch.no_grad()
@@ -310,7 +357,7 @@ class DSALTTrainer:
             },
             path,
         )
-        logger.info(f"  ╰─ checkpoint → {path}")
+        logger.info(f"Checkpoint saved  →  {path}")
 
     def _load_checkpoint(self, path: str) -> None:
         try:
@@ -323,7 +370,7 @@ class DSALTTrainer:
             self.global_step  = ckpt["step"]
             self.best_val_ppl = ckpt.get("best_val_ppl", float("inf"))
             self.history      = ckpt.get("history", self.history)
-            logger.info(f"Resumed from {path} at step {self.global_step}")
+            logger.info(f"Resumed from {path}  →  step={self.global_step}  best_val_ppl={self.best_val_ppl:.2f}")
         except (FileNotFoundError, IOError, RuntimeError) as e:
-            logger.error(f"Failed to load checkpoint from {path}: {e}")
+            logger.error(f"Failed to load checkpoint: {e}")
             raise

@@ -28,31 +28,12 @@ def _gather_landmark_kv(
 
 if _TRITON_AVAILABLE:
 
-    @triton.autotune(
-        configs=[
-            # Small blocks: num_warps=8 per nascondere latenza landmark loading
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=8, num_stages=3),
-            # Medium blocks: balanced warps
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=8, num_stages=3),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=3),
-            # Large blocks: 8 warps
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=4),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=8, num_stages=3),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=4),
-        ],
-        key=["N", "D", "K"],
-    )
+    # ── NOTA: NO @triton.autotune ──────────────────────────────────────────
+    # autotune compila tutte le config al primo forward → freeze di 10-20 min
+    # su T4. Config fissa ottimale per T4 (compute cap 7.5, 16GB):
+    #   BLOCK_M=64, BLOCK_N=64, num_warps=4, num_stages=2
+    # Per ricalibrare su hardware diverso, usa DSALT_TUNE=1 env var (vedi sotto).
+
     @triton.jit
     def _dsalt_fwd_kernel(
         Q_ptr, K_ptr, V_ptr,
@@ -185,24 +166,6 @@ if _TRITON_AVAILABLE:
             mask=mask_m[:, None] & mask_d[None, :],
         )
 
-    @triton.autotune(
-        configs=[
-            # Backward dK/dV: iteriamo su N (query), per ogni K
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=8, num_stages=3),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
-        ],
-        key=["N", "D", "K"],
-    )
     @triton.jit
     def _dsalt_bwd_kernel_dkdv(
         Q_ptr, K_ptr, V_ptr,
@@ -370,24 +333,6 @@ if _TRITON_AVAILABLE:
             mask=valid_k[:, None] & mask_d[None, :],
         )
 
-    @triton.autotune(
-        configs=[
-            # Backward dQ: iteriamo su M (query), per ogni K landmark
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=8, num_stages=3),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
-        ],
-        key=["N", "D", "K"],
-    )
     @triton.jit
     def _dsalt_bwd_kernel_dq(
         Q_ptr, K_ptr, V_ptr,
@@ -500,6 +445,14 @@ if _TRITON_AVAILABLE:
         )
 
 
+# ── Config fisse per T4 (compute cap 7.5) ─────────────────────────────────
+# Se vuoi ottimizzare per altro hardware, cambia questi valori.
+_T4_BLOCK_M  = 64
+_T4_BLOCK_N  = 64
+_T4_WARPS    = 4
+_T4_STAGES   = 2
+
+
 class DSALTAttentionFunction(torch.autograd.Function):
 
     @staticmethod
@@ -513,8 +466,8 @@ class DSALTAttentionFunction(torch.autograd.Function):
         assert landmark_idx.shape == (B, H, K_lmk)
         assert D & (D - 1) == 0 and D >= 16
 
-        BLOCK_D = triton.next_power_of_2(D) if _TRITON_AVAILABLE else D
         scale   = 1.0 / math.sqrt(D)
+        BLOCK_D = triton.next_power_of_2(D) if _TRITON_AVAILABLE else D
 
         Out = torch.empty_like(Q)
         LSE = torch.empty(B, H, N, dtype=torch.float32, device=Q.device)
@@ -526,8 +479,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
             window_sizes = window_sizes.contiguous().to(torch.int32)
             landmark_idx = landmark_idx.contiguous().to(torch.int32)
 
-            BLOCK_D = triton.next_power_of_2(D)
-            grid = lambda meta: (triton.cdiv(N, meta["BLOCK_M"]), H, B)
+            grid = (triton.cdiv(N, _T4_BLOCK_M), H, B)
             _dsalt_fwd_kernel[grid](
                 Q, K, V,
                 landmark_idx,
@@ -539,7 +491,9 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 landmark_idx.stride(0), landmark_idx.stride(1), landmark_idx.stride(2),
                 Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
-                B=B, H=H, N=N, D=D, K=K_lmk, SCALE=scale, BLOCK_D=BLOCK_D,
+                B=B, H=H, N=N, D=D, K=K_lmk, SCALE=scale,
+                BLOCK_M=_T4_BLOCK_M, BLOCK_N=_T4_BLOCK_N, BLOCK_D=BLOCK_D,
+                num_warps=_T4_WARPS, num_stages=_T4_STAGES,
             )
         else:
             Out, LSE = _cpu_reference_forward(Q, K, V, window_sizes, landmark_idx, scale)
@@ -565,7 +519,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
         if Q.is_cuda and _TRITON_AVAILABLE:
             BD = ctx.BLOCK_D
 
-            grid_n = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), H, B)
+            grid_n = (triton.cdiv(N, _T4_BLOCK_N), H, B)
             _dsalt_bwd_kernel_dkdv[grid_n](
                 Q, K, V, dOut, LSE, dK, dV,
                 landmark_idx, dKL, dVL,
@@ -578,9 +532,11 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 dVL.stride(0), dVL.stride(1), dVL.stride(2), dVL.stride(3),
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
                 B=B, H=H, N=N, D=D, K=K_lmk, SCALE=ctx.scale, BLOCK_D=BD,
+                BLOCK_M=_T4_BLOCK_M, BLOCK_N=_T4_BLOCK_N,
+                num_warps=_T4_WARPS, num_stages=_T4_STAGES,
             )
 
-            grid_m = lambda meta: (triton.cdiv(N, meta["BLOCK_M"]), H, B)
+            grid_m = (triton.cdiv(N, _T4_BLOCK_M), H, B)
             _dsalt_bwd_kernel_dq[grid_m](
                 Q, K, V, dOut, LSE, dQ,
                 landmark_idx,
@@ -591,6 +547,8 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 landmark_idx.stride(0), landmark_idx.stride(1), landmark_idx.stride(2),
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
                 B=B, H=H, N=N, D=D, K=K_lmk, SCALE=ctx.scale, BLOCK_D=BD,
+                BLOCK_M=_T4_BLOCK_M, BLOCK_N=_T4_BLOCK_N,
+                num_warps=_T4_WARPS, num_stages=_T4_STAGES,
             )
 
             idx = landmark_idx.long().clamp(0, N - 1)
@@ -606,22 +564,30 @@ class DSALTAttentionFunction(torch.autograd.Function):
 
 
 def _build_sparse_mask(N, window_sizes, landmark_idx):
+    # NOTA: questa funzione è usata solo dal CPU fallback.
+    # Evita di allocare [B,H,N,N] su GPU — usala solo per debug/test su CPU.
     B, H, _ = window_sizes.shape
     K_lmk   = landmark_idx.shape[-1]
     device  = window_sizes.device
 
-    i_idx = torch.arange(N, device=device).view(1, 1, N, 1).expand(B, H, N, N)
-    j_idx = torch.arange(N, device=device).view(1, 1, 1, N).expand(B, H, N, N)
+    rows = torch.arange(N, device=device)
+    w    = window_sizes  # [B, H, N]
 
-    w      = window_sizes.unsqueeze(-1)
-    causal = j_idx <= i_idx
-    window = j_idx >= (i_idx - w)
-    mask   = causal & window
+    # Costruisce la mask riga per riga per evitare [B,H,N,N] completo
+    # (ancora O(N²) ma almeno non tiene tutto in VRAM contemporaneamente)
+    mask = torch.zeros(B, H, N, N, dtype=torch.bool, device=device)
+    for i in range(N):
+        wi = w[:, :, i]                             # [B, H]
+        j  = torch.arange(N, device=device)
+        causal = j <= i
+        window = j >= (i - wi.unsqueeze(-1))        # [B, H, N]
+        mask[:, :, i, :] = causal.unsqueeze(0).unsqueeze(0) & window
 
     lmk_mask = torch.zeros(B, H, N, N, dtype=torch.bool, device=device)
     lmk_flat = landmark_idx.unsqueeze(2).expand(B, H, N, K_lmk).clamp(0, N - 1).long()
     lmk_mask.scatter_(-1, lmk_flat, True)
-    lmk_mask = lmk_mask & causal
+    causal_mask = torch.tril(torch.ones(N, N, dtype=torch.bool, device=device))
+    lmk_mask = lmk_mask & causal_mask.unsqueeze(0).unsqueeze(0)
 
     return mask | lmk_mask
 
