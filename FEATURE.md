@@ -188,7 +188,7 @@ Key test modules include:
 
 ## 📄 License
 
-See here: <https://github.com/LeonardoCofone/dsalt-pytorch/blob/main/LICENSE>
+See here: <https://github.com/LeonardoCofone/dsalt-library/blob/main/LICENSE>
 
 ---
 

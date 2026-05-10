@@ -6,9 +6,9 @@
 DSALT is a high‑performance PyTorch library that implements **Dynamic Sparse Attention with Landmark Tokens** – a memory‑efficient attention mechanism for transformers. It relies on Triton kernels and supports distributed training.
 
 > **Install**: `pip install dsalt`  
-> **Source**: <https://github.com/LeonardoCofone/dsalt-pytorch>  
+> **Source**: <https://github.com/LeonardoCofone/dsalt-library>  
 > **Paper**: <https://zenodo.org/records/19312826>  
-> **Feature guide**: See `FEATURE.md` here: <https://github.com/LeonardoCofone/dsalt-pytorch/blob/main/FEATURE.md>
+> **Feature guide**: See `FEATURE.md` here: <https://github.com/LeonardoCofone/dsalt-library/blob/main/FEATURE.md>
 
 ## 🚀 Key Features
 
@@ -51,7 +51,7 @@ pip install dsalt
 
 ### From source
 ```bash
-git clone https://github.com/LeonardoCofone/dsalt-pytorch.git
+git clone https://github.com/LeonardoCofone/dsalt-library.git
 cd dsalt-pytorch
 pip install -e .
 ```
@@ -239,7 +239,7 @@ Key test modules:
 
 ## 📄 License
 
-See here: <https://github.com/LeonardoCofone/dsalt-pytorch/blob/main/LICENSE>
+See here: <https://github.com/LeonardoCofone/dsalt-library/blob/main/LICENSE>
 
 ---
 
@@ -256,8 +256,8 @@ Contributions are welcome! Please read `CONTRIBUTING.md` for guidelines. Areas w
 
 ## 📞 Support & Questions
 
-- **Issues**: <https://github.com/LeonardoCofone/dsalt-pytorch/issues>
-- **Discussions**: <https://github.com/LeonardoCofone/dsalt-pytorch/discussions>
+- **Issues**: <https://github.com/LeonardoCofone/dsalt-library/issues>
+- **Discussions**: <https://github.com/LeonardoCofone/dsalt-library/discussions>
 - **Paper**: <https://zenodo.org/records/19312826>
 
 ---

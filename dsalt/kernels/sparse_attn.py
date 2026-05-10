@@ -25,14 +25,25 @@ def _gather_landmark_kv(
     V_gathered = V.gather(2, idx_exp).contiguous()
     return K_gathered, V_gathered
 
+def _get_gpu_config(device: Optional[int] = None):
+    if not torch.cuda.is_available():
+        return 64, 64, 4, 2
+    if device is None:
+        device = torch.cuda.current_device()
+
+    cap = torch.cuda.get_device_capability(device)
+    sm = cap[0] * 10 + cap[1]
+    if sm >= 90:
+        return 128, 128, 8, 3
+    elif sm >= 80: 
+        return 128, 64, 8, 3
+    elif sm >= 75: 
+        return 64, 64, 4, 2
+    else: 
+        return 64, 64, 4, 1
 
 if _TRITON_AVAILABLE:
-
-    # ── NOTA: NO @triton.autotune ──────────────────────────────────────────
-    # autotune compila tutte le config al primo forward → freeze di 10-20 min
-    # su T4. Config fissa ottimale per T4 (compute cap 7.5, 16GB):
-    #   BLOCK_M=64, BLOCK_N=64, num_warps=4, num_stages=2
-    # Per ricalibrare su hardware diverso, usa DSALT_TUNE=1 env var (vedi sotto).
+    _BLOCK_M, _BLOCK_N, _WARPS, _STAGES = _get_gpu_config()
 
     @triton.jit
     def _dsalt_fwd_kernel(
@@ -85,6 +96,9 @@ if _TRITON_AVAILABLE:
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
         acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
+        # ── Local window pass ─────────────────────────────────────────────
+        # Range statico: dal blocco più lontano possibile fino alla query
+        # Nessun `if` dinamico dentro il loop → niente warp divergence
         k_win_start = tl.maximum(0, q_start - max_w)
         k_win_end   = q_start + BLOCK_M
         k_blk = (k_win_start // BLOCK_N) * BLOCK_N
@@ -118,6 +132,9 @@ if _TRITON_AVAILABLE:
             m_i = m_new
             k_blk += BLOCK_N
 
+        # ── Landmark pass ─────────────────────────────────────────────────
+        # FIX: usa tl.arange(0, BLOCK_N) ma maschera con valid_k = offs_k < K
+        # Il loop itera ceil(K/BLOCK_N) volte, non K volte
         lmk_blk = 0
         while lmk_blk < K:
             offs_k  = lmk_blk + tl.arange(0, BLOCK_N)
@@ -185,6 +202,7 @@ if _TRITON_AVAILABLE:
         D: tl.constexpr, K: tl.constexpr,
         SCALE: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+        MAX_WIN: tl.constexpr,
     ):
         pid_n = tl.program_id(0)
         pid_h = tl.program_id(1)
@@ -216,41 +234,42 @@ if _TRITON_AVAILABLE:
         dk = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
         dv = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
 
-        q_blk = k_start
-        while q_blk < N:
+        q_start_safe = tl.maximum(0, k_start - MAX_WIN)
+        q_blk = (q_start_safe // BLOCK_M) * BLOCK_M
+        q_end = tl.minimum(N, k_start + BLOCK_N + MAX_WIN)
+
+        while q_blk < q_end:
             offs_m = q_blk + tl.arange(0, BLOCK_M)
             mask_m = offs_m < N
             w_i    = tl.load(W_bh + offs_m * stride_wn, mask=mask_m, other=0)
-            max_w  = tl.max(w_i, axis=0)
 
-            if q_blk <= (k_start + BLOCK_N - 1 + max_w):
-                q_t  = tl.load(
-                    Q_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
-                    mask=mask_m[:, None] & mask_d[None, :], other=0.0,
-                )
-                do_t = tl.load(
-                    DO_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
-                    mask=mask_m[:, None] & mask_d[None, :], other=0.0,
-                )
-                lse_t = tl.load(
-                    LSE_ptr + pid_b * H * N + pid_h * N + offs_m,
-                    mask=mask_m, other=0.0,
-                )
+            q_t  = tl.load(
+                Q_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
+                mask=mask_m[:, None] & mask_d[None, :], other=0.0,
+            )
+            do_t = tl.load(
+                DO_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
+                mask=mask_m[:, None] & mask_d[None, :], other=0.0,
+            )
+            lse_t = tl.load(
+                LSE_ptr + pid_b * H * N + pid_h * N + offs_m,
+                mask=mask_m, other=0.0,
+            )
 
-                s      = tl.dot(q_t, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
-                causal = offs_n[None, :] <= offs_m[:, None]
-                window = offs_n[None, :] >= (offs_m[:, None] - w_i[:, None])
-                comb   = causal & window & mask_n[None, :] & mask_m[:, None]
-                s      = tl.where(comb, s, float("-inf"))
-                p      = tl.exp(s - lse_t[:, None])
-                p      = tl.where(comb, p, 0.0)
+            s      = tl.dot(q_t, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+            causal = offs_n[None, :] <= offs_m[:, None]
+            window = offs_n[None, :] >= (offs_m[:, None] - w_i[:, None])
+            comb   = causal & window & mask_n[None, :] & mask_m[:, None]
+            s      = tl.where(comb, s, float("-inf"))
+            p      = tl.exp(s - lse_t[:, None])
+            p      = tl.where(comb, p, 0.0)
 
-                dv    += tl.dot(tl.trans(p).to(do_t.dtype), do_t)
-                dp     = tl.dot(do_t, tl.trans(v_tile))
-                rowsum = tl.sum(p * dp, axis=1)
-                ds     = p * (dp - rowsum[:, None]) * SCALE
-                ds     = tl.where(comb, ds, 0.0)
-                dk    += tl.dot(tl.trans(ds).to(q_t.dtype), q_t)
+            dv    += tl.dot(tl.trans(p).to(do_t.dtype), do_t)
+            dp     = tl.dot(do_t, tl.trans(v_tile))
+            rowsum = tl.sum(p * dp, axis=1)
+            ds     = p * (dp - rowsum[:, None]) * SCALE
+            ds     = tl.where(comb, ds, 0.0)
+            dk    += tl.dot(tl.trans(ds).to(q_t.dtype), q_t)
 
             q_blk += BLOCK_M
 
@@ -265,73 +284,82 @@ if _TRITON_AVAILABLE:
             mask=mask_n[:, None] & mask_d[None, :],
         )
 
-        offs_k = tl.arange(0, BLOCK_N)
+        # ── Landmark backward (dKL, dVL) ──────────────────────────────────
+        # FIX: offs_k usa BLOCK_N come tile size ma maschera con valid_k < K
+        # Loop scorre tutti i Q token (0..N) — corretto, ogni Q può usare landmark
+        offs_k  = tl.arange(0, BLOCK_N)
         valid_k = offs_k < K
         LM_bh  = landmark_idx_ptr + pid_b * stride_lmb + pid_h * stride_lmh
         DKL_bh = DKL_ptr + pid_b * stride_dklb + pid_h * stride_dklh
         DVL_bh = DVL_ptr + pid_b * stride_dvlb + pid_h * stride_dvlh
 
-        idx_k = tl.load(
-            LM_bh + offs_k * stride_lmk,
-            mask=valid_k,
-            other=0,
-        ).to(tl.int32)
-        idx_k = tl.minimum(idx_k, N - 1)
+        # Solo il primo blocco landmark (pid_n == 0) scrive dKL/dVL
+        # Gli altri blocchi non hanno landmark da aggiornare (landmark_idx è [B,H,K])
+        # Per evitare race condition su scatter_add, calcoliamo dKL solo da pid_n==0
+        # e facciamo scatter_add in Python dopo. Qui mettiamo a zero se pid_n > 0.
+        if pid_n == 0:
+            idx_k = tl.load(
+                LM_bh + offs_k * stride_lmk,
+                mask=valid_k,
+                other=0,
+            ).to(tl.int32)
+            idx_k = tl.minimum(idx_k, N - 1)
 
-        kl_tile = tl.load(
-            K_bh + idx_k[:, None] * stride_kn + offs_d[None, :] * stride_kd,
-            mask=valid_k[:, None] & mask_d[None, :], other=0.0,
-        )
-        vl_tile = tl.load(
-            V_bh + idx_k[:, None] * stride_vn + offs_d[None, :] * stride_vd,
-            mask=valid_k[:, None] & mask_d[None, :], other=0.0,
-        )
-
-        dkl = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
-        dvl = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
-
-        q_blk = 0
-        while q_blk < N:
-            offs_m = q_blk + tl.arange(0, BLOCK_M)
-            mask_m = offs_m < N
-            q_t  = tl.load(
-                Q_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
-                mask=mask_m[:, None] & mask_d[None, :], other=0.0,
+            kl_tile = tl.load(
+                K_bh + idx_k[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                mask=valid_k[:, None] & mask_d[None, :], other=0.0,
             )
-            do_t = tl.load(
-                DO_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
-                mask=mask_m[:, None] & mask_d[None, :], other=0.0,
-            )
-            lse_t = tl.load(
-                LSE_ptr + pid_b * H * N + pid_h * N + offs_m,
-                mask=mask_m, other=0.0,
+            vl_tile = tl.load(
+                V_bh + idx_k[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+                mask=valid_k[:, None] & mask_d[None, :], other=0.0,
             )
 
-            s_lmk  = tl.dot(q_t, tl.trans(kl_tile), out_dtype=tl.float32) * SCALE
-            lmk_ok = valid_k[None, :] & mask_m[:, None]
-            s_lmk  = tl.where(lmk_ok, s_lmk, float("-inf"))
-            p_lmk  = tl.exp(s_lmk - lse_t[:, None])
-            p_lmk  = tl.where(lmk_ok, p_lmk, 0.0)
+            dkl = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+            dvl = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
 
-            dvl   += tl.dot(tl.trans(p_lmk).to(do_t.dtype), do_t)
-            dp_l   = tl.dot(do_t, tl.trans(vl_tile))
-            rs_l   = tl.sum(p_lmk * dp_l, axis=1)
-            ds_l   = p_lmk * (dp_l - rs_l[:, None]) * SCALE
-            ds_l   = tl.where(lmk_ok, ds_l, 0.0)
-            dkl   += tl.dot(tl.trans(ds_l).to(q_t.dtype), q_t)
+            # FIX: loop su tutti i Q token, range statico 0..N, nessun if interno
+            q_blk2 = 0
+            while q_blk2 < N:
+                offs_m2 = q_blk2 + tl.arange(0, BLOCK_M)
+                mask_m2 = offs_m2 < N
+                q_t2  = tl.load(
+                    Q_bh + offs_m2[:, None] * stride_qn + offs_d[None, :],
+                    mask=mask_m2[:, None] & mask_d[None, :], other=0.0,
+                )
+                do_t2 = tl.load(
+                    DO_bh + offs_m2[:, None] * stride_qn + offs_d[None, :],
+                    mask=mask_m2[:, None] & mask_d[None, :], other=0.0,
+                )
+                lse_t2 = tl.load(
+                    LSE_ptr + pid_b * H * N + pid_h * N + offs_m2,
+                    mask=mask_m2, other=0.0,
+                )
 
-            q_blk += BLOCK_M
+                s_lmk  = tl.dot(q_t2, tl.trans(kl_tile), out_dtype=tl.float32) * SCALE
+                lmk_ok = valid_k[None, :] & mask_m2[:, None]
+                s_lmk  = tl.where(lmk_ok, s_lmk, float("-inf"))
+                p_lmk  = tl.exp(s_lmk - lse_t2[:, None])
+                p_lmk  = tl.where(lmk_ok, p_lmk, 0.0)
 
-        tl.store(
-            DKL_bh + offs_k[:, None] * stride_dklk + offs_d[None, :],
-            dkl.to(K_ptr.dtype.element_ty),
-            mask=valid_k[:, None] & mask_d[None, :],
-        )
-        tl.store(
-            DVL_bh + offs_k[:, None] * stride_dvlk + offs_d[None, :],
-            dvl.to(V_ptr.dtype.element_ty),
-            mask=valid_k[:, None] & mask_d[None, :],
-        )
+                dvl   += tl.dot(tl.trans(p_lmk).to(do_t2.dtype), do_t2)
+                dp_l   = tl.dot(do_t2, tl.trans(vl_tile))
+                rs_l   = tl.sum(p_lmk * dp_l, axis=1)
+                ds_l   = p_lmk * (dp_l - rs_l[:, None]) * SCALE
+                ds_l   = tl.where(lmk_ok, ds_l, 0.0)
+                dkl   += tl.dot(tl.trans(ds_l).to(q_t2.dtype), q_t2)
+
+                q_blk2 += BLOCK_M
+
+            tl.store(
+                DKL_bh + offs_k[:, None] * stride_dklk + offs_d[None, :],
+                dkl.to(K_ptr.dtype.element_ty),
+                mask=valid_k[:, None] & mask_d[None, :],
+            )
+            tl.store(
+                DVL_bh + offs_k[:, None] * stride_dvlk + offs_d[None, :],
+                dvl.to(V_ptr.dtype.element_ty),
+                mask=valid_k[:, None] & mask_d[None, :],
+            )
 
     @triton.jit
     def _dsalt_bwd_kernel_dq(
@@ -380,6 +408,7 @@ if _TRITON_AVAILABLE:
         k_end = q_start + BLOCK_M
         k_blk = (tl.maximum(0, q_start - max_w) // BLOCK_N) * BLOCK_N
 
+        # ── dQ da finestra locale ──────────────────────────────────────────
         while k_blk < k_end:
             offs_n = k_blk + tl.arange(0, BLOCK_N)
             mask_n = offs_n < N
@@ -404,6 +433,7 @@ if _TRITON_AVAILABLE:
             dq    += tl.dot(ds.to(k_tile.dtype), k_tile)
             k_blk += BLOCK_N
 
+        # ── dQ da landmark ────────────────────────────────────────────────
         lmk_blk = 0
         while lmk_blk < K:
             offs_k  = lmk_blk + tl.arange(0, BLOCK_N)
@@ -445,12 +475,7 @@ if _TRITON_AVAILABLE:
         )
 
 
-# ── Config fisse per T4 (compute cap 7.5) ─────────────────────────────────
-# Se vuoi ottimizzare per altro hardware, cambia questi valori.
-_T4_BLOCK_M  = 64
-_T4_BLOCK_N  = 64
-_T4_WARPS    = 4
-_T4_STAGES   = 2
+_BLOCK_M, _BLOCK_N, _WARPS, _STAGES = _get_gpu_config()
 
 
 class DSALTAttentionFunction(torch.autograd.Function):
@@ -479,7 +504,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
             window_sizes = window_sizes.contiguous().to(torch.int32)
             landmark_idx = landmark_idx.contiguous().to(torch.int32)
 
-            grid = (triton.cdiv(N, _T4_BLOCK_M), H, B)
+            grid = (triton.cdiv(N, _BLOCK_M), H, B)
             _dsalt_fwd_kernel[grid](
                 Q, K, V,
                 landmark_idx,
@@ -492,15 +517,16 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
                 B=B, H=H, N=N, D=D, K=K_lmk, SCALE=scale,
-                BLOCK_M=_T4_BLOCK_M, BLOCK_N=_T4_BLOCK_N, BLOCK_D=BLOCK_D,
-                num_warps=_T4_WARPS, num_stages=_T4_STAGES,
+                BLOCK_M=_BLOCK_M, BLOCK_N=_BLOCK_N, BLOCK_D=BLOCK_D,
+                num_warps=_WARPS, num_stages=_STAGES,
             )
         else:
             Out, LSE = _cpu_reference_forward(Q, K, V, window_sizes, landmark_idx, scale)
 
         ctx.save_for_backward(Q, K, V, window_sizes, landmark_idx, LSE)
-        ctx.BLOCK_D = BLOCK_D
-        ctx.scale   = scale
+        ctx.BLOCK_D  = BLOCK_D
+        ctx.scale    = scale
+        ctx.max_win = int(window_sizes.max().item())
         return Out
 
     @staticmethod
@@ -517,9 +543,10 @@ class DSALTAttentionFunction(torch.autograd.Function):
         dVL  = torch.zeros(B, H, K_lmk, D, dtype=V.dtype, device=V.device)
 
         if Q.is_cuda and _TRITON_AVAILABLE:
-            BD = ctx.BLOCK_D
+            BD      = ctx.BLOCK_D
+            max_win = ctx.max_win
 
-            grid_n = (triton.cdiv(N, _T4_BLOCK_N), H, B)
+            grid_n = (triton.cdiv(N, _BLOCK_N), H, B)
             _dsalt_bwd_kernel_dkdv[grid_n](
                 Q, K, V, dOut, LSE, dK, dV,
                 landmark_idx, dKL, dVL,
@@ -528,15 +555,16 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 K.stride(0), K.stride(1), K.stride(2), K.stride(3),
                 V.stride(0), V.stride(1), V.stride(2), V.stride(3),
                 landmark_idx.stride(0), landmark_idx.stride(1), landmark_idx.stride(2),
+                window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
                 dKL.stride(0), dKL.stride(1), dKL.stride(2), dKL.stride(3),
                 dVL.stride(0), dVL.stride(1), dVL.stride(2), dVL.stride(3),
-                window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
                 B=B, H=H, N=N, D=D, K=K_lmk, SCALE=ctx.scale, BLOCK_D=BD,
-                BLOCK_M=_T4_BLOCK_M, BLOCK_N=_T4_BLOCK_N,
-                num_warps=_T4_WARPS, num_stages=_T4_STAGES,
+                BLOCK_M=_BLOCK_M, BLOCK_N=_BLOCK_N,
+                MAX_WIN=max_win,
+                num_warps=_WARPS, num_stages=_STAGES,
             )
 
-            grid_m = (triton.cdiv(N, _T4_BLOCK_M), H, B)
+            grid_m = (triton.cdiv(N, _BLOCK_M), H, B)
             _dsalt_bwd_kernel_dq[grid_m](
                 Q, K, V, dOut, LSE, dQ,
                 landmark_idx,
@@ -547,8 +575,8 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 landmark_idx.stride(0), landmark_idx.stride(1), landmark_idx.stride(2),
                 window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
                 B=B, H=H, N=N, D=D, K=K_lmk, SCALE=ctx.scale, BLOCK_D=BD,
-                BLOCK_M=_T4_BLOCK_M, BLOCK_N=_T4_BLOCK_N,
-                num_warps=_T4_WARPS, num_stages=_T4_STAGES,
+                BLOCK_M=_BLOCK_M, BLOCK_N=_BLOCK_N,
+                num_warps=_WARPS, num_stages=_STAGES,
             )
 
             idx = landmark_idx.long().clamp(0, N - 1)
@@ -564,23 +592,17 @@ class DSALTAttentionFunction(torch.autograd.Function):
 
 
 def _build_sparse_mask(N, window_sizes, landmark_idx):
-    # NOTA: questa funzione è usata solo dal CPU fallback.
-    # Evita di allocare [B,H,N,N] su GPU — usala solo per debug/test su CPU.
+    # Solo per CPU fallback/debug — evita di usare su GPU
     B, H, _ = window_sizes.shape
     K_lmk   = landmark_idx.shape[-1]
     device  = window_sizes.device
 
-    rows = torch.arange(N, device=device)
-    w    = window_sizes  # [B, H, N]
-
-    # Costruisce la mask riga per riga per evitare [B,H,N,N] completo
-    # (ancora O(N²) ma almeno non tiene tutto in VRAM contemporaneamente)
     mask = torch.zeros(B, H, N, N, dtype=torch.bool, device=device)
     for i in range(N):
-        wi = w[:, :, i]                             # [B, H]
+        wi = window_sizes[:, :, i]
         j  = torch.arange(N, device=device)
         causal = j <= i
-        window = j >= (i - wi.unsqueeze(-1))        # [B, H, N]
+        window = j >= (i - wi.unsqueeze(-1))
         mask[:, :, i, :] = causal.unsqueeze(0).unsqueeze(0) & window
 
     lmk_mask = torch.zeros(B, H, N, N, dtype=torch.bool, device=device)
