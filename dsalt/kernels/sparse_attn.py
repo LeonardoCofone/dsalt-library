@@ -52,7 +52,6 @@ def _log_gpu_config(device: int):
 
 
 if _TRITON_AVAILABLE:
-    _BLOCK_M, _BLOCK_N, _WARPS, _STAGES = _get_gpu_config()
 
     @triton.jit
     def _dsalt_fwd_kernel(
@@ -484,9 +483,6 @@ if _TRITON_AVAILABLE:
         )
 
 
-_BLOCK_M, _BLOCK_N, _WARPS, _STAGES = _get_gpu_config()
-
-
 class DSALTAttentionFunction(torch.autograd.Function):
 
     @staticmethod
@@ -508,13 +504,13 @@ class DSALTAttentionFunction(torch.autograd.Function):
 
         if Q.is_cuda and _TRITON_AVAILABLE:
             dev_id = Q.get_device()
-            _log_gpu_config(dev_id)
-            Q  = Q.contiguous()
-            K  = K.contiguous()
-            V  = V.contiguous()
+            _BLOCK_M, _BLOCK_N, _WARPS, _STAGES = _get_gpu_config(dev_id)
+            BLOCK_D = triton.next_power_of_2(D)
+            Q = Q.contiguous()
+            K = K.contiguous()
+            V = V.contiguous()
             window_sizes = window_sizes.contiguous().to(torch.int32)
             landmark_idx = landmark_idx.contiguous().to(torch.int32)
-
             grid = (triton.cdiv(N, _BLOCK_M), H, B)
             _dsalt_fwd_kernel[grid](
                 Q, K, V,
@@ -554,6 +550,8 @@ class DSALTAttentionFunction(torch.autograd.Function):
         dVL  = torch.zeros(B, H, K_lmk, D, dtype=V.dtype, device=V.device)
 
         if Q.is_cuda and _TRITON_AVAILABLE:
+            dev_id = Q.get_device()
+            _BLOCK_M, _BLOCK_N, _WARPS, _STAGES = _get_gpu_config(dev_id)
             BD      = ctx.BLOCK_D
             max_win = ctx.max_win
 
