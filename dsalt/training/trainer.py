@@ -236,9 +236,11 @@ class _TrainerCore:
     def run(self) -> Dict[str, list]:
         self.model.train()
         if self.is_main:
+            print("\n")
             logger.info("=" * 60)
             logger.info(f"Training starting from step {self.global_step}")
             logger.info("=" * 60)
+            print("\n")
 
         data_iter           = iter(self.train_loader)
         loss_accum          = 0.0

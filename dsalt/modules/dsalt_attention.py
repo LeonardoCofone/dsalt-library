@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt_utils
 
 from dsalt.kernels.sparse_attn import dsalt_attention
-from dsalt.kernels.hybrid_energy import compute_landmark_idx
+from dsalt.kernels.energy_topk_fused import compute_energy_and_topk
 from dsalt.kernels.window_utils import WindowSizePredictor
 
 try:
@@ -98,20 +98,17 @@ class DSALTAttention(nn.Module):
         qkv = qkv.view(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
         Q, K, V = qkv[0], qkv[1], qkv[2]
 
-        Wv = self._get_wv_weights().detach()
-
-        Wv_cov = torch.matmul(
-            Wv,
-            Wv.transpose(-1, -2)
-        ).contiguous()
+        Wv = self._get_wv_weights().detach() # [H, D, Dh]
 
         with torch.no_grad():
             alpha = torch.sigmoid(self.alpha_w)
 
-            landmark_idx = compute_landmark_idx(
+            # Pass window_end=None to select landmarks globally for the sequence
+            # This prevents (B,H,N,K) expansion and keeps it at (B,H,K)
+            landmark_idx = compute_energy_and_topk(
                 X=x_pred,
-                WV=Wv_cov,
-                window_sizes=window_sizes,
+                WV=Wv,
+                window_end=None,
                 k=self.k_lmk,
                 alpha=alpha,
             )

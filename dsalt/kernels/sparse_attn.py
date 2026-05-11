@@ -363,13 +363,14 @@ def _build_sparse_mask(
     causal = j <= i
 
     idx = landmark_idx.clamp(0, N - 1).long()
-
     lmk_mask = torch.zeros((B, H, N, N), dtype=torch.bool, device=device)
 
-    batch_idx = torch.arange(B, device=device)[:, None, None]
-    head_idx = torch.arange(H, device=device)[None, :, None]
-
-    lmk_mask[batch_idx, head_idx, torch.arange(N, device=device)[None, None, :], idx] = True
+    # Advanced indexing: batch/head/query indices must broadcast with landmark indices
+    b_idx = torch.arange(B, device=device).view(B, 1, 1, 1)
+    h_idx = torch.arange(H, device=device).view(1, H, 1, 1)
+    q_idx = torch.arange(N, device=device).view(1, 1, N, 1)
+    
+    lmk_mask[b_idx, h_idx, q_idx, idx.unsqueeze(-2)] = True
 
     lmk_mask = lmk_mask & causal
 
