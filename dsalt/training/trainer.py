@@ -1,6 +1,7 @@
 import math
 import time
 import logging
+import pickle
 import os
 from pathlib import Path
 from typing import Optional, Callable, Dict
@@ -510,6 +511,19 @@ class DSALTTrainer:
 
         manager     = mp.Manager()
         return_dict = manager.dict()
+
+        if self._core_kwargs.get("compute_metrics_fn") is not None:
+            try:
+                fn = self._core_kwargs["compute_metrics_fn"]
+                pickle.dumps(fn)
+                if getattr(fn, "__module__", None) == "__main__":
+                    raise AttributeError("Functions defined in __main__ (Notebooks) are not picklable for spawn workers.")
+            except (AttributeError, pickle.PicklingError):
+                logger.warning(
+                    "compute_metrics_fn is not serializable by child processes (common in Jupyter). "
+                    "Extra metrics will be disabled to avoid a training crash."
+                )
+                self._core_kwargs["compute_metrics_fn"] = None
 
         worker_kwargs = dict(**self._core_kwargs)
         worker_kwargs["_train_dataset"] = train_dataset

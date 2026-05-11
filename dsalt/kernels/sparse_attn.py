@@ -104,9 +104,6 @@ if _TRITON_AVAILABLE:
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
         acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
-        # ── Local window pass ─────────────────────────────────────────────
-        # Range statico: dal blocco più lontano possibile fino alla query
-        # Nessun `if` dinamico dentro il loop → niente warp divergence
         k_win_start = tl.maximum(0, q_start - max_w)
         k_win_end   = q_start + BLOCK_M
         k_blk = (k_win_start // BLOCK_N) * BLOCK_N
@@ -140,9 +137,6 @@ if _TRITON_AVAILABLE:
             m_i = m_new
             k_blk += BLOCK_N
 
-        # ── Landmark pass ─────────────────────────────────────────────────
-        # FIX: usa tl.arange(0, BLOCK_N) ma maschera con valid_k = offs_k < K
-        # Il loop itera ceil(K/BLOCK_N) volte, non K volte
         lmk_blk = 0
         while lmk_blk < K:
             offs_k  = lmk_blk + tl.arange(0, BLOCK_N)
@@ -281,30 +275,16 @@ if _TRITON_AVAILABLE:
 
             q_blk += BLOCK_M
 
-        tl.store(
-            DK_bh + offs_n[:, None] * stride_kn + offs_d[None, :],
-            dk.to(K_ptr.dtype.element_ty),
-            mask=mask_n[:, None] & mask_d[None, :],
-        )
-        tl.store(
-            DV_bh + offs_n[:, None] * stride_vn + offs_d[None, :],
-            dv.to(V_ptr.dtype.element_ty),
-            mask=mask_n[:, None] & mask_d[None, :],
-        )
+        tl.store(DK_bh + offs_n[:, None] * stride_kn + offs_d[None, :], dk.to(K_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
 
-        # ── Landmark backward (dKL, dVL) ──────────────────────────────────
-        # FIX: offs_k usa BLOCK_N come tile size ma maschera con valid_k < K
-        # Loop scorre tutti i Q token (0..N) — corretto, ogni Q può usare landmark
+        tl.store(DV_bh + offs_n[:, None] * stride_vn + offs_d[None, :], dv.to(V_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+
         offs_k  = tl.arange(0, BLOCK_N)
         valid_k = offs_k < K
         LM_bh  = landmark_idx_ptr + pid_b * stride_lmb + pid_h * stride_lmh
         DKL_bh = DKL_ptr + pid_b * stride_dklb + pid_h * stride_dklh
         DVL_bh = DVL_ptr + pid_b * stride_dvlb + pid_h * stride_dvlh
 
-        # Solo il primo blocco landmark (pid_n == 0) scrive dKL/dVL
-        # Gli altri blocchi non hanno landmark da aggiornare (landmark_idx è [B,H,K])
-        # Per evitare race condition su scatter_add, calcoliamo dKL solo da pid_n==0
-        # e facciamo scatter_add in Python dopo. Qui mettiamo a zero se pid_n > 0.
         if pid_n == 0:
             idx_k = tl.load(
                 LM_bh + offs_k * stride_lmk,
@@ -325,7 +305,6 @@ if _TRITON_AVAILABLE:
             dkl = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
             dvl = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
 
-            # FIX: loop su tutti i Q token, range statico 0..N, nessun if interno
             q_blk2 = 0
             while q_blk2 < N:
                 offs_m2 = q_blk2 + tl.arange(0, BLOCK_M)
@@ -358,16 +337,9 @@ if _TRITON_AVAILABLE:
 
                 q_blk2 += BLOCK_M
 
-            tl.store(
-                DKL_bh + offs_k[:, None] * stride_dklk + offs_d[None, :],
-                dkl.to(K_ptr.dtype.element_ty),
-                mask=valid_k[:, None] & mask_d[None, :],
-            )
-            tl.store(
-                DVL_bh + offs_k[:, None] * stride_dvlk + offs_d[None, :],
-                dvl.to(V_ptr.dtype.element_ty),
-                mask=valid_k[:, None] & mask_d[None, :],
-            )
+            tl.store(DKL_bh + offs_k[:, None] * stride_dklk + offs_d[None, :], dkl.to(K_ptr.dtype.element_ty), mask=valid_k[:, None] & mask_d[None, :])
+
+            tl.store(DVL_bh + offs_k[:, None] * stride_dvlk + offs_d[None, :], dvl.to(V_ptr.dtype.element_ty), mask=valid_k[:, None] & mask_d[None, :])
 
     @triton.jit
     def _dsalt_bwd_kernel_dq(
@@ -416,7 +388,6 @@ if _TRITON_AVAILABLE:
         k_end = q_start + BLOCK_M
         k_blk = (tl.maximum(0, q_start - max_w) // BLOCK_N) * BLOCK_N
 
-        # ── dQ da finestra locale ──────────────────────────────────────────
         while k_blk < k_end:
             offs_n = k_blk + tl.arange(0, BLOCK_N)
             mask_n = offs_n < N
@@ -441,7 +412,6 @@ if _TRITON_AVAILABLE:
             dq    += tl.dot(ds.to(k_tile.dtype), k_tile)
             k_blk += BLOCK_N
 
-        # ── dQ da landmark ────────────────────────────────────────────────
         lmk_blk = 0
         while lmk_blk < K:
             offs_k  = lmk_blk + tl.arange(0, BLOCK_N)
@@ -476,11 +446,7 @@ if _TRITON_AVAILABLE:
             dq    += tl.dot(ds_l.to(kl_tile.dtype), kl_tile)
             lmk_blk += BLOCK_N
 
-        tl.store(
-            DQ_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
-            dq.to(Q_ptr.dtype.element_ty),
-            mask=mask_m[:, None] & mask_d[None, :],
-        )
+        tl.store(DQ_bh + offs_m[:, None] * stride_qn + offs_d[None, :], dq.to(Q_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
 
 class DSALTAttentionFunction(torch.autograd.Function):
