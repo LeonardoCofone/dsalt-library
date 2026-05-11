@@ -515,12 +515,14 @@ class DSALTTrainer:
         for name, ds in [("train_dataset", train_dataset), ("val_dataset", val_dataset)]:
             if ds is not None:
                 try:
-                    torch.multiprocessing.reductions.ForkingPickler.dumps(ds)
-                except (AttributeError, pickle.PicklingError):
+                    # `pickle.dumps` funziona per qualunque oggetto
+                    # definito in un modulo importabile (non __main__).
+                    pickle.dumps(ds)
+                except (AttributeError, pickle.PicklingError, TypeError) as exc:
                     raise RuntimeError(
                         f"{name} class must be defined in a separate .py file and imported. "
                         "Spawned processes cannot access classes defined in the __main__ module of a notebook."
-                    )
+                    ) from exc
 
         self._model.share_memory()
 
