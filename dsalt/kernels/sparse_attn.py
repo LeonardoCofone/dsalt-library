@@ -470,7 +470,6 @@ class DSALTAttentionFunction(torch.autograd.Function):
         LSE = torch.empty(B, H, N, dtype=torch.float32, device=Q.device)
 
         if Q.is_cuda and _TRITON_AVAILABLE:
-            print(f"[KERNEL] launching Triton kernel", flush=True)
             dev_id = Q.get_device()
             _BLOCK_M, _BLOCK_N, _WARPS, _STAGES = _get_gpu_config(dev_id)
             BLOCK_D = triton.next_power_of_2(D)
@@ -495,16 +494,13 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 BLOCK_M=_BLOCK_M, BLOCK_N=_BLOCK_N, BLOCK_D=BLOCK_D,
                 num_warps=_WARPS, num_stages=_STAGES,
             )
-            print(f"[KERNEL] Triton kernel done", flush=True)
         else:
-            print(f"[KERNEL] using CPU reference", flush=True)
             Out, LSE = _cpu_reference_forward(Q, K, V, window_sizes, landmark_idx, scale)
 
         ctx.save_for_backward(Q, K, V, window_sizes, landmark_idx, LSE)
         ctx.BLOCK_D  = BLOCK_D
         ctx.scale    = scale
         ctx.max_win = int(window_sizes.max().item())
-        print(f"[KERNEL] forward done", flush=True)
         return Out
 
     @staticmethod

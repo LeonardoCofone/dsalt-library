@@ -20,7 +20,7 @@ from dsalt.training.logging_config import setup_logging
 logger = logging.getLogger(__name__)
 
 DSALT_PARAM_KEYWORDS = ("window_pred", "alpha_w")
-NO_DECAY_KEYWORDS    = ("norm", "bias", "emb", "tok_emb", "pos_emb")
+NO_DECAY_KEYWORDS = ("norm", "bias", "emb", "tok_emb", "pos_emb")
 
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
@@ -47,7 +47,7 @@ def _ddp_worker(
     device = torch.device(f"cuda:{rank}")
 
     model = model.to(device)
-    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
+    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
 
     train_dataset = trainer_kwargs.pop("_train_dataset")
     val_dataset   = trainer_kwargs.pop("_val_dataset", None)
@@ -194,6 +194,11 @@ class _TrainerCore:
                 ignore_index=-100,
             )
             win_reg = self._zero_tensor.clone()
+            
+            if torch.isnan(ce):
+                logger.error(f"Rank {self.rank}: NaN detected in loss")
+                return ce, ce.detach(), win_reg.detach()
+
             if self.window_reg_coef > 0 and cont_windows is not None:
                 if isinstance(cont_windows, torch.Tensor):
                     cont_windows = [cont_windows]
@@ -506,6 +511,16 @@ class DSALTTrainer:
         val_dataset   = self._val_loader.dataset if self._val_loader is not None else None
         batch_size    = self._train_loader.batch_size
         num_workers   = self._train_loader.num_workers
+
+        for name, ds in [("train_dataset", train_dataset), ("val_dataset", val_dataset)]:
+            if ds is not None:
+                try:
+                    torch.multiprocessing.reductions.ForkingPickler.dumps(ds)
+                except (AttributeError, pickle.PicklingError):
+                    raise RuntimeError(
+                        f"{name} class must be defined in a separate .py file and imported. "
+                        "Spawned processes cannot access classes defined in the __main__ module of a notebook."
+                    )
 
         self._model.share_memory()
 

@@ -158,7 +158,7 @@ def energy_topk_fused(X, WV, window_sizes, k, alpha_w):
     
     BLOCK_N = 128
     BLOCK_D = 64
-    BLOCK_Dh = 64
+    BLOCK_Dh = triton.next_power_of_2(D_head)
     
     grid = (triton.cdiv(N, BLOCK_N), H, B)
     
