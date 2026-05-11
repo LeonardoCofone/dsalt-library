@@ -75,17 +75,29 @@ class DSALTTrainer:
         logger.info("Model on device  ✓")
 
         if self.use_dp:
+            print(f"[DEBUG] Moving model to cpu for DataParallel", flush=True)
+            model = model.cpu()
+            print(f"[DEBUG] Model on cpu", flush=True)
             model = nn.DataParallel(model, device_ids=self.gpu_ids)
+            print(f"[DEBUG] Wrapped in DataParallel", flush=True)
             logger.info(f"Wrapped in DataParallel  →  GPUs {self.gpu_ids}")
         elif len(self.gpu_ids) > 0:
             logger.info(f"Single GPU mode  →  {self.primary_device}")
         else:
             logger.info("CPU mode")
 
+        # For DataParallel, the model is on cpu, but we set device to primary for autocast
+        if not self.use_dp:
+            logger.info(f"Moving model to {self.primary_device}")
+            model = model.to(self.primary_device)
+            logger.info("Model on device  ✓")
+
         self.model       = model
         self._model_base = model.module if self.use_dp else model
+        print(f"[DEBUG] _model_base type: {type(self._model_base)}", flush=True)
         self.device      = self.primary_device
 
+        print(f"[DEBUG] Before named_parameters", flush=True)
         decay, no_decay, dsalt_params = [], [], []
         for name, p in self._model_base.named_parameters():
             if not p.requires_grad:
@@ -96,6 +108,7 @@ class DSALTTrainer:
                 no_decay.append(p)
             else:
                 decay.append(p)
+        print(f"[DEBUG] After param grouping", flush=True)
 
         total_params = sum(p.numel() for p in self._model_base.parameters())
         trainable    = sum(p.numel() for p in self._model_base.parameters() if p.requires_grad)
@@ -152,6 +165,7 @@ class DSALTTrainer:
         logger.info("=" * 60)
         logger.info(f"Trainer ready  →  steps={total_steps}  log_every={log_every}  val_every={val_every}  save_every={save_every}  grad_accum={grad_accum}")
         logger.info("=" * 60)
+        print("[DEBUG] __init__ completed", flush=True)
 
     @staticmethod
     def _enable_gradient_checkpointing(model: nn.Module) -> bool:
