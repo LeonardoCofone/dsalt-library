@@ -29,6 +29,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+release.ps1
 
 # PyInstaller
 *.manifest
@@ -148,6 +149,7 @@ logs/
 *.pth
 wandb/
 
+release.ps1
 last_version_6.pdf
 .claude/
 # Claude AI

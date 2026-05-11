@@ -75,24 +75,14 @@ class DSALTTrainer:
         logger.info("Model on device  ✓")
 
         if self.use_dp:
-            print(f"[DEBUG] Moving model to cpu for DataParallel", flush=True)
-            model = model.cpu()
-            print(f"[DEBUG] Model on cpu", flush=True)
+            print(f"[DEBUG] Wrapping model in DataParallel on {self.gpu_ids}", flush=True)
             model = nn.DataParallel(model, device_ids=self.gpu_ids)
-            print(f"[DEBUG] Wrapped in DataParallel", flush=True)
+            print(f"[DEBUG] Model wrapped in DataParallel", flush=True)
             logger.info(f"Wrapped in DataParallel  →  GPUs {self.gpu_ids}")
-            # DataParallel requires model on device_ids[0]
-            model = model.to(self.primary_device)
-            print(f"[DEBUG] Moved wrapped model to {self.primary_device}", flush=True)
         elif len(self.gpu_ids) > 0:
             logger.info(f"Single GPU mode  →  {self.primary_device}")
         else:
             logger.info("CPU mode")
-
-        if not self.use_dp:
-            logger.info(f"Moving model to {self.primary_device}")
-            model = model.to(self.primary_device)
-            logger.info("Model on device  ✓")
 
         self.model       = model
         self._model_base = model.module if self.use_dp else model
@@ -167,6 +157,7 @@ class DSALTTrainer:
         logger.info("=" * 60)
         logger.info(f"Trainer ready  →  steps={total_steps}  log_every={log_every}  val_every={val_every}  save_every={save_every}  grad_accum={grad_accum}")
         logger.info("=" * 60)
+        logger.info("Trainer initialized. Call trainer.train() to start training.")
         print("[DEBUG] __init__ completed", flush=True)
 
     @staticmethod
