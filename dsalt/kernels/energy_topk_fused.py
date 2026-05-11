@@ -73,7 +73,6 @@ def compute_energy(X, WV, alpha):
     out = torch.empty((B, H, N), device=X.device, dtype=torch.float32)
 
     BLOCK_N = 128
-    BLOCK_D = 64
 
     grid = (triton.cdiv(N, BLOCK_N), H, B)
 
@@ -83,7 +82,6 @@ def compute_energy(X, WV, alpha):
         D=D,
         D_HEAD=D_HEAD,
         BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D,
         stride_xb=X.stride(0),
         stride_xn=X.stride(1),
         stride_xd=X.stride(2),
