@@ -92,7 +92,7 @@ class DSALTAttention(nn.Module):
 
         x_pred = x_prev if x_prev is not None else x
 
-        window_sizes, cont_w = self.window_pred(x_pred, training=self.training)
+        window_sizes, cont_w = self.window_pred(x_pred)
 
         qkv = self.qkv_proj(x)
         qkv = qkv.view(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)

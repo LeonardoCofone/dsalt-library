@@ -450,7 +450,8 @@ class DSALTTrainer:
         master_port: str                       = "29500",
     ):
         setup_logging(level=logging.INFO, log_file=log_file)
-        logger.info("\n=" * 60)
+        print("\n")
+        logger.info("=" * 60)
         logger.info("DSALT Trainer init starting")
         logger.info("=" * 60)
 
