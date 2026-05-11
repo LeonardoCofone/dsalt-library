@@ -13,7 +13,7 @@ except ImportError:
 if _TRITON_AVAILABLE:
     @triton.jit
     def _energy_topk_kernel(
-        X_ptr, WV_ptr, alpha_ptr, window_sizes_ptr,
+        X_ptr, WV_ptr, alpha_ptr,
         landmark_idx_ptr,
         N: tl.constexpr,
         D: tl.constexpr,
@@ -24,7 +24,6 @@ if _TRITON_AVAILABLE:
         BLOCK_Dh: tl.constexpr,
         stride_xb, stride_xn,
         stride_wh, stride_wd,
-        stride_wsb, stride_wsh, stride_wsn,
         stride_out_b, stride_out_h, stride_out_k,
     ):
         pid_n = tl.program_id(0)
@@ -37,7 +36,6 @@ if _TRITON_AVAILABLE:
 
         X_base = X_ptr + pid_b * stride_xb
         WV_base = WV_ptr + pid_h * stride_wh
-        WS_base = window_sizes_ptr + pid_b * stride_wsb + pid_h * stride_wsh
         OUT_base = landmark_idx_ptr + pid_b * stride_out_b + pid_h * stride_out_h
 
         alpha_w = tl.load(alpha_ptr + pid_h)
@@ -105,7 +103,6 @@ if _TRITON_AVAILABLE:
 def _cpu_energy_topk(
     X: torch.Tensor,             # [B, N, D]
     WV: torch.Tensor,            # [H, D, D_head]
-    window_sizes: torch.Tensor,  # [B, H, N]  int32
     k: int,
     alpha_w: torch.Tensor,       # [H] già sigmoidizzato
 ) -> torch.Tensor:
@@ -132,10 +129,6 @@ def _cpu_energy_topk(
     alpha = alpha_w.view(1, -1, 1)
     scores = alpha * xv_norm_zn + (1.0 - alpha) * x_norm_zn
 
-    max_w = int(window_sizes[..., -1].max().item())
-    if max_w > 0 and N > max_w:
-        scores[..., N - max_w:] = float("-inf")
-
     k_safe = min(k, N)
     _, top_idx = torch.topk(scores, k=k_safe, dim=-1, sorted=True)
     top_idx = top_idx.sort(dim=-1)[0]
@@ -147,29 +140,26 @@ def _cpu_energy_topk(
     return top_idx.to(torch.int32)
 
 
-def energy_topk_fused(X, WV, window_sizes, k, alpha_w):
+def energy_topk_fused(X, WV, k, alpha_w):
     if not _TRITON_AVAILABLE or not X.is_cuda:
-        return _cpu_energy_topk(X, WV, window_sizes, k, alpha_w)
+        return _cpu_energy_topk(X, WV, k, alpha_w)
 
     B, N, D = X.shape
     H, _, D_head = WV.shape
-    
     landmark_idx = torch.empty((B, H, k), dtype=torch.int32, device=X.device)
     
     BLOCK_N = 128
     BLOCK_D = 64
     BLOCK_Dh = triton.next_power_of_2(D_head)
-    
     grid = (triton.cdiv(N, BLOCK_N), H, B)
     
     _energy_topk_kernel[grid](
-        X, WV, alpha_w, window_sizes,
+        X, WV, alpha_w,
         landmark_idx,
         N=N, D=D, D_head=D_head, K=k,
         BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Dh=BLOCK_Dh,
         stride_xb=X.stride(0), stride_xn=X.stride(1),
         stride_wh=WV.stride(0), stride_wd=WV.stride(1),
-        stride_wsb=window_sizes.stride(0), stride_wsh=window_sizes.stride(1), stride_wsn=window_sizes.stride(2),
         stride_out_b=landmark_idx.stride(0), stride_out_h=landmark_idx.stride(1), stride_out_k=landmark_idx.stride(2),
     )
     

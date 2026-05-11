@@ -453,19 +453,15 @@ class DSALTAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, Q, K, V, window_sizes, landmark_idx):
-        #print(f"[KERNEL] DSALTAttentionFunction.forward start Q.shape={Q.shape} device={Q.device}", flush=True)
         B, H, N, D = Q.shape
         K_lmk = landmark_idx.shape[-1]
-
         assert landmark_idx.ndim == 3
         assert Q.shape == K.shape == V.shape
         assert window_sizes.shape == (B, H, N)
         assert landmark_idx.shape == (B, H, K_lmk)
         assert D & (D - 1) == 0 and D >= 16
-
         scale   = 1.0 / math.sqrt(D)
         BLOCK_D = triton.next_power_of_2(D) if _TRITON_AVAILABLE else D
-
         Out = torch.empty_like(Q)
         LSE = torch.empty(B, H, N, dtype=torch.float32, device=Q.device)
 

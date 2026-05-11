@@ -12,10 +12,7 @@ class DSALTLMHeadModel(nn.Module):
                  n_max=256, k_lmk=16, alpha=0.6, d_ff=None,
                  max_seq_len=2048, dropout=0.0, use_fa2=True, tie_weights=True):
         super().__init__()
-        assert d_model % n_heads == 0
         head_dim = d_model // n_heads
-        assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0, \
-            "Head dim must be power of 2 and >= 16"
         self.transformer = DSALTTransformer(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers,
             n_heads=n_heads, n_min=n_min, n_max=n_max, k_lmk=k_lmk,
@@ -66,7 +63,6 @@ class DSALTLMHeadModel(nn.Module):
             probs = torch.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             ids = torch.cat([ids, next_id], dim=1)
-
         self.train()
 
         if tokenizer is not None:

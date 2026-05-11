@@ -1,18 +1,3 @@
-"""
-dsalt/kernels/hybrid_energy.py
--------------------------------
-Hybrid Energy scoring per landmark selection.
-
-Cambiamenti rispetto alla versione precedente:
-  - X ha shape [B, N, D] invece di [B, H, N, D]: elimina la replica per head
-    che causava x4-x8 uso di memoria inutile nel forward.
-  - compute_landmark_idx NON espande a [B, H, N, K]: il kernel sparse_attn
-    usa landmark_idx con shape [B, H, K] leggendo gli stessi indici per ogni
-    query token nello stesso head — coerente con la semantica "landmark globali".
-  - Il Triton kernel ora itera su B (batch) e H (heads) con X condiviso per head,
-    riducendo la memoria da O(B*H*N*D) a O(B*N*D).
-"""
-
 import torch
 import torch.nn.functional as F
 from typing import Tuple
@@ -23,15 +8,6 @@ try:
     _TRITON_AVAILABLE = True
 except ImportError:
     _TRITON_AVAILABLE = False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Triton kernel: calcola ‖x_j‖₂ e ‖x_j W_V^(h)‖₂ per ogni token j, head h
-#
-# X:   [B, N, D]      — hidden states (non replicati per head)
-# WV:  [H, D, D_head] — value projections per head
-# out: [B, H, N]      — scores per token
-# ─────────────────────────────────────────────────────────────────────────────
 
 if _TRITON_AVAILABLE:
     @triton.jit
@@ -56,11 +32,6 @@ if _TRITON_AVAILABLE:
         stride_ob,
         stride_oh,
     ):
-        """
-        Grid: (cdiv(N, BLOCK_N), H, B)
-        Ogni program: BLOCK_N token consecutivi, un head, un batch.
-        X è condiviso tra tutti gli head → nessuna replica.
-        """
         pid_n = tl.program_id(0)
         pid_h = tl.program_id(1)
         pid_b = tl.program_id(2)
@@ -69,43 +40,33 @@ if _TRITON_AVAILABLE:
         offs_n = start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
 
-        # Base pointers
         X_base  = X_ptr  + pid_b * stride_xb
         WV_base = WV_ptr + pid_h * stride_wh
         O_base_x  = XNorm_ptr  + pid_b * stride_ob + pid_h * stride_oh
         O_base_xv = XVNorm_ptr + pid_b * stride_ob + pid_h * stride_oh
 
         acc_x_sq  = tl.zeros([BLOCK_N], dtype=tl.float32)
-        # xV accumulator: [BLOCK_N, BLOCK_Dh]
         acc_xv    = tl.zeros([BLOCK_N, BLOCK_Dh], dtype=tl.float32)
 
-        # Scorre D in blocchi di BLOCK_D
         for d_start in range(0, D, BLOCK_D):
             offs_d = d_start + tl.arange(0, BLOCK_D)
             mask_d = offs_d < D
 
-            # Carica x_chunk: [BLOCK_N, BLOCK_D]
             x_chunk = tl.load(
                 X_base + offs_n[:, None] * stride_xn + offs_d[None, :],
                 mask=mask_n[:, None] & mask_d[None, :],
                 other=0.0,
             ).to(tl.float32)
 
-            # ‖x‖² parziale
             acc_x_sq += tl.sum(x_chunk * x_chunk, axis=1)
 
-            # Carica WV chunk: [BLOCK_D, BLOCK_Dh]
             offs_dh = tl.arange(0, BLOCK_Dh)
             wv_chunk = tl.load(
                 WV_base + offs_d[:, None] * stride_wd + offs_dh[None, :],
                 mask=mask_d[:, None] & (offs_dh[None, :] < D_head),
                 other=0.0,
             ).to(tl.float32)
-
-            # x @ WV parziale: [BLOCK_N, BLOCK_Dh]
             acc_xv = acc_xv + tl.dot(x_chunk, wv_chunk)
-
-        # ‖xWv‖² = sum(acc_xv²)
         xv_norm_sq = tl.sum(acc_xv * acc_xv, axis=1)
 
         tl.store(
@@ -120,40 +81,41 @@ def _cpu_compute_norms(
     X: torch.Tensor,   # [B, N, D]
     WV: torch.Tensor,  # [H, D, D_head]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Referenza CPU.
-    Ritorna x_norm [B, H, N] e xv_norm [B, H, N].
-    X NON viene replicato: lo proiettiamo per ogni head separatamente.
-    """
     B, N, D = X.shape
     H = WV.shape[0]
-    X_f = X.float()                        # [B, N, D]
-    x_norm_bh = X_f.norm(dim=-1)           # [B, N]
-    x_norm = x_norm_bh.unsqueeze(1).expand(B, H, N)  # broadcast, no alloc
-
-    # xV: [B, H, N, D_head]  — calcolato head per head per risparmiare memoria
+    X_f = X.float()
+    x_norm_bh = X_f.norm(dim=-1)
+    x_norm = x_norm_bh.unsqueeze(1).expand(B, H, N)
     xv_list = []
     for h in range(H):
-        xv_h = (X_f @ WV[h].float()).norm(dim=-1)  # [B, N]
+        xv_h = (X_f @ WV[h].float()).norm(dim=-1)
         xv_list.append(xv_h)
-    xv_norm = torch.stack(xv_list, dim=1)  # [B, H, N]
-
+    xv_norm = torch.stack(xv_list, dim=1)
     return x_norm.contiguous(), xv_norm.contiguous()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# API pubblica
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_hybrid_energy_scores(X: torch.Tensor, WV: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+def compute_hybrid_energy_scores(X, WV, alpha):
     B, N, D = X.shape
     H, _, D_head = WV.shape
-
-    x_norms, xv_norms = _cpu_compute_norms(X, WV)
-
+    if _TRITON_AVAILABLE and X.is_cuda:
+        x_norms = torch.empty((B, H, N), device=X.device, dtype=torch.float32)
+        xv_norms = torch.empty((B, H, N), device=X.device, dtype=torch.float32)
+        BLOCK_N, BLOCK_D = 128, 64
+        BLOCK_Dh = triton.next_power_of_2(D_head)
+        grid = (triton.cdiv(N, BLOCK_N), H, B)
+        _hybrid_energy_kernel[grid](
+            X, WV, x_norms, xv_norms,
+            N=N, D=D, D_head=D_head, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_Dh=BLOCK_Dh,
+            stride_xb=X.stride(0), stride_xn=X.stride(1),
+            stride_wh=WV.stride(0), stride_wd=WV.stride(1),
+            stride_ob=x_norms.stride(0), stride_oh=x_norms.stride(1)
+        )
+    else:
+        x_norms, xv_norms = _cpu_compute_norms(X, WV)
+        
     def _znorm(t: torch.Tensor) -> torch.Tensor:
         mu = t.mean(dim=-1, keepdim=True)
-        std = t.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        std = t.std(dim=-1, keepdim=True).clamp(min=1e-5)
         return (t - mu) / std
 
     if isinstance(alpha, (float, int)):
@@ -170,34 +132,21 @@ def select_landmarks(
     window_sizes: torch.Tensor,  # [B, H, N]  int32 — esclude la finestra locale
     exclude_last: int = 0,
 ) -> torch.Tensor:
-    """
-    Seleziona i top-k token per ogni (batch, head) escludendo la finestra locale.
-
-    Ritorna landmark_idx: [B, H, K]  int32
-    NON espanso a [B, H, N, K] — risparmia N× memoria.
-    Il kernel sparse_attn usa direttamente [B, H, K].
-    """
     B, H, N = scores.shape
     cand_scores = scores.clone()
-
-    # Escludi la finestra locale dell'ultimo token (posizione N-1)
-    # window_sizes[:, :, -1] = dimensione finestra dell'ultimo token
     max_w = int(window_sizes[..., -1].max().item())
     if max_w > 0 and N > max_w:
         cand_scores[..., N - max_w:] = float("-inf")
     if exclude_last > 0:
         cand_scores[..., N - exclude_last:] = float("-inf")
-
     k_safe = min(k, N)
     _, top_idx = torch.topk(cand_scores, k=k_safe, dim=-1, sorted=True)
-    top_idx, _ = top_idx.sort(dim=-1)   # ordina per posizione, aiuta la coerenza cache
+    top_idx, _ = top_idx.sort(dim=-1)
     top_idx = top_idx.to(torch.int32)
-
     if k_safe < k:
         pad = torch.zeros(B, H, k - k_safe, dtype=torch.int32, device=scores.device)
         top_idx = torch.cat([top_idx, pad], dim=-1)
-
-    return top_idx   # [B, H, K]  — NON espanso
+    return top_idx
 
 
 def compute_landmark_idx(
@@ -207,12 +156,6 @@ def compute_landmark_idx(
     k: int,
     alpha: torch.Tensor,         # [H] sigmoid già applicato
 ) -> torch.Tensor:
-    """
-    Calcola gli indici landmark.
-
-    Ritorna: [B, H, K]  int32
-    (non più [B, H, N, K] — eliminata l'espansione costosa)
-    """
-    scores = compute_hybrid_energy_scores(X, WV, alpha)  # [B, H, N]
-    result = select_landmarks(scores, k, window_sizes)      # [B, H, K]
+    scores = compute_hybrid_energy_scores(X, WV, alpha)
+    result = select_landmarks(scores, k, window_sizes)
     return result

@@ -154,7 +154,8 @@ class _TrainerCore:
         )
         self.scheduler     = get_cosine_schedule_with_warmup(self.optimizer, warmup_steps, total_steps)
         self.dtype         = dtype
-        self.use_amp       = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
+        self.use_amp       = device.type == "cuda" and dtype == torch.float16
+        self.allow_fallback_fp32 = True
         self.scaler        = (
             torch.amp.GradScaler("cuda")
             if self.use_amp and dtype == torch.float16
@@ -187,6 +188,9 @@ class _TrainerCore:
     def _forward(self, x: torch.Tensor, y: torch.Tensor):
         with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=self.use_amp):
             logits, cont_windows = self.model(x, return_window=self.window_reg_coef > 0)
+            # Clamp logits to evitare inf/nan
+            if not torch.isfinite(logits).all():
+                logits = torch.where(torch.isfinite(logits), logits, torch.full_like(logits, -1e6))
             B, N, V = logits.shape
             ce = nn.functional.cross_entropy(
                 logits.view(B * N, V),
@@ -197,6 +201,20 @@ class _TrainerCore:
             
             if torch.isnan(ce):
                 logger.error(f"Rank {self.rank}: NaN detected in loss")
+                # Fallback to FP32 if enabled
+                if getattr(self, "allow_fallback_fp32", False) and self.use_amp:
+                    logger.info("Re‑executing batch in FP32 fallback mode")
+                    with torch.autocast(device_type=self.device.type, dtype=torch.float32, enabled=False):
+                        logits_fp, cont_windows_fp = self.model(x, return_window=self.window_reg_coef > 0)
+                        if not torch.isfinite(logits_fp).all():
+                            logits_fp = torch.where(torch.isfinite(logits_fp), logits_fp, torch.full_like(logits_fp, -1e6))
+                        B_fp, N_fp, V_fp = logits_fp.shape
+                        ce_fp = nn.functional.cross_entropy(
+                            logits_fp.view(B_fp * N_fp, V_fp),
+                            y.contiguous().view(B_fp * N_fp),
+                            ignore_index=-100,
+                        )
+                    return ce_fp, ce_fp.detach(), self._zero_tensor.clone()
                 return ce, ce.detach(), win_reg.detach()
 
             if self.window_reg_coef > 0 and cont_windows is not None:
@@ -258,11 +276,11 @@ class _TrainerCore:
 
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
                 self.optimizer.step()
 
             self.scheduler.step()
@@ -515,10 +533,8 @@ class DSALTTrainer:
         for name, ds in [("train_dataset", train_dataset), ("val_dataset", val_dataset)]:
             if ds is not None:
                 try:
-                    # `pickle.dumps` funziona per qualunque oggetto
-                    # definito in un modulo importabile (non __main__).
                     pickle.dumps(ds)
-                except (AttributeError, pickle.PicklingError, TypeError) as exc:
+                except Exception as exc:
                     raise RuntimeError(
                         f"{name} class must be defined in a separate .py file and imported. "
                         "Spawned processes cannot access classes defined in the __main__ module of a notebook."
