@@ -171,8 +171,11 @@ class DSALTTrainer:
             return False
 
     def _forward(self, x: torch.Tensor, y: torch.Tensor):
+        print(f"[TRAINER] _forward start x.shape={x.shape} y.shape={y.shape} device={x.device}", flush=True)
         with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=self.use_amp):
+            print(f"[TRAINER] calling model", flush=True)
             logits, cont_windows = self.model(x, return_window=self.window_reg_coef > 0)
+            print(f"[TRAINER] model done logits.shape={logits.shape}", flush=True)
             B, N, V = logits.shape
             ce = nn.functional.cross_entropy(
                 logits.view(B * N, V),
@@ -186,6 +189,7 @@ class DSALTTrainer:
                 for cw in cont_windows:
                     win_reg = win_reg - cw.float().var(dim=-1).mean()
                 win_reg = win_reg / max(len(cont_windows), 1)
+        print(f"[TRAINER] _forward done ce={ce.item():.4f}", flush=True)
         return ce + self.window_reg_coef * win_reg, ce.detach(), win_reg.detach()
 
     def train(self) -> Dict[str, list]:

@@ -213,5 +213,9 @@ def compute_landmark_idx(
     Ritorna: [B, H, K]  int32
     (non più [B, H, N, K] — eliminata l'espansione costosa)
     """
+    print(f"[HYBRID] compute_landmark_idx start X.shape={X.shape} WV.shape={WV.shape} device={X.device}", flush=True)
     scores = compute_hybrid_energy_scores(X, WV, alpha)  # [B, H, N]
-    return select_landmarks(scores, k, window_sizes)      # [B, H, K]
+    print(f"[HYBRID] scores computed", flush=True)
+    result = select_landmarks(scores, k, window_sizes)      # [B, H, K]
+    print(f"[HYBRID] landmarks selected", flush=True)
+    return result

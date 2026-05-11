@@ -46,11 +46,14 @@ class DSALTBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x, x_prev=None, return_window=False):
+        print(f"[BLOCK] forward start x.shape={x.shape} device={x.device}", flush=True)
         residual = x
         attn_out, cont_w = self.attn(self.attn_norm(x), x_prev=x_prev,
                                       return_window=return_window)
+        print(f"[BLOCK] attn done attn_out.shape={attn_out.shape}", flush=True)
         x = residual + self.drop(attn_out)
         x = x + self.drop(self.ffn(self.ffn_norm(x)))
+        print(f"[BLOCK] ffn done", flush=True)
         return x, cont_w
 
 
@@ -83,17 +86,22 @@ class DSALTTransformer(nn.Module):
     def forward(self, input_ids, return_window=False):
         B, N = input_ids.shape
         assert N <= self.max_seq_len
+        print(f"[TRANS] forward start B={B} N={N} device={input_ids.device}", flush=True)
         pos = torch.arange(N, device=input_ids.device).unsqueeze(0)
         x   = self.emb_drop(self.tok_emb(input_ids) + self.pos_emb(pos))
+        print(f"[TRANS] embeddings done x.shape={x.shape}", flush=True)
         cont_windows = [] if return_window else None
         x_prev = None
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            print(f"[TRANS] block {i} start", flush=True)
             x, cont_w = block(x, x_prev=x_prev, return_window=return_window)
             x_prev    = x
             if return_window and cont_w is not None:
                 cont_windows.append(cont_w)
+            print(f"[TRANS] block {i} done", flush=True)
         x      = self.final_norm(x)
         logits = self.lm_head(x)
+        print(f"[TRANS] final done logits.shape={logits.shape}", flush=True)
         return logits, cont_windows
 
     def count_parameters(self):

@@ -33,14 +33,17 @@ class DSALTLMHeadModel(nn.Module):
         self.transformer.lm_head.weight = self.transformer.tok_emb.weight
 
     def forward(self, input_ids, labels=None, return_window=False):
+        print(f"[LM] forward start input_ids.shape={input_ids.shape} device={input_ids.device}", flush=True)
         logits, windows = self.transformer(
             input_ids, return_window=return_window or labels is not None,
         )
+        print(f"[LM] transformer done logits.shape={logits.shape}", flush=True)
         if labels is not None:
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1), ignore_index=-100,
             )
+            print(f"[LM] loss computed {loss.item():.4f}", flush=True)
             return logits, windows, loss
         return logits, windows
 

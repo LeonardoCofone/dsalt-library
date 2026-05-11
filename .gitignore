@@ -148,6 +148,7 @@ logs/
 *.pth
 wandb/
 
+last_version_6.pdf
 .claude/
 # Claude AI
 .claude/
