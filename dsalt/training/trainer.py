@@ -89,6 +89,13 @@ class DSALTTrainer:
         print(f"[DEBUG] _model_base type: {type(self._model_base)}", flush=True)
         self.device      = self.primary_device
 
+        if self.use_dp:
+            first_param_device = next(self._model_base.parameters()).device
+            if first_param_device != self.primary_device:
+                raise RuntimeError(
+                    f"DataParallel model parameters must be on {self.primary_device}, but were on {first_param_device}"
+                )
+
         print(f"[DEBUG] Before named_parameters", flush=True)
         decay, no_decay, dsalt_params = [], [], []
         for name, p in self._model_base.named_parameters():
