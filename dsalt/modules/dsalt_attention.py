@@ -100,11 +100,20 @@ class DSALTAttention(nn.Module):
 
         Wv = self._get_wv_weights().detach()
 
+        Wv_cov = torch.matmul(
+            Wv,
+            Wv.transpose(-1, -2)
+        ).contiguous()
+
         with torch.no_grad():
-            alpha        = torch.sigmoid(self.alpha_w)
+            alpha = torch.sigmoid(self.alpha_w)
+
             landmark_idx = compute_landmark_idx(
-                X=x_pred, WV=Wv, window_sizes=window_sizes,
-                k=self.k_lmk, alpha=alpha,
+                X=x_pred,
+                WV_cov=Wv_cov,
+                window_sizes=window_sizes,
+                k=self.k_lmk,
+                alpha=alpha,
             )
 
         out = self._attn_fn(Q, K, V, window_sizes, landmark_idx)

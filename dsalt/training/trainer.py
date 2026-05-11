@@ -188,9 +188,10 @@ class _TrainerCore:
     def _forward(self, x: torch.Tensor, y: torch.Tensor):
         with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=self.use_amp):
             logits, cont_windows = self.model(x, return_window=self.window_reg_coef > 0)
-            # Clamp logits to evitare inf/nan
+            
             if not torch.isfinite(logits).all():
-                logits = torch.where(torch.isfinite(logits), logits, torch.full_like(logits, -1e6))
+                logits = torch.nan_to_num(logits, nan=-1e6, posinf=1e6, neginf=-1e6)
+
             B, N, V = logits.shape
             ce = nn.functional.cross_entropy(
                 logits.view(B * N, V),
@@ -201,20 +202,27 @@ class _TrainerCore:
             
             if torch.isnan(ce):
                 logger.error(f"Rank {self.rank}: NaN detected in loss")
-                # Fallback to FP32 if enabled
                 if getattr(self, "allow_fallback_fp32", False) and self.use_amp:
-                    logger.info("Re‑executing batch in FP32 fallback mode")
+                    logger.info(f"Rank {self.rank}: Re‑executing batch in FP32 fallback mode")
                     with torch.autocast(device_type=self.device.type, dtype=torch.float32, enabled=False):
                         logits_fp, cont_windows_fp = self.model(x, return_window=self.window_reg_coef > 0)
-                        if not torch.isfinite(logits_fp).all():
-                            logits_fp = torch.where(torch.isfinite(logits_fp), logits_fp, torch.full_like(logits_fp, -1e6))
+                        logits_fp = torch.nan_to_num(logits_fp, nan=-1e6, posinf=1e6, neginf=-1e6)
+                        
                         B_fp, N_fp, V_fp = logits_fp.shape
                         ce_fp = nn.functional.cross_entropy(
                             logits_fp.view(B_fp * N_fp, V_fp),
                             y.contiguous().view(B_fp * N_fp),
                             ignore_index=-100,
                         )
-                    return ce_fp, ce_fp.detach(), self._zero_tensor.clone()
+                        
+                        win_reg_fp = self._zero_tensor.clone()
+                        if self.window_reg_coef > 0 and cont_windows_fp is not None:
+                            cw_list = [cont_windows_fp] if isinstance(cont_windows_fp, torch.Tensor) else cont_windows_fp
+                            for cw in cw_list:
+                                win_reg_fp = win_reg_fp - cw.float().var(dim=-1).mean()
+                            win_reg_fp = win_reg_fp / max(len(cw_list), 1)
+                            
+                    return ce_fp + self.window_reg_coef * win_reg_fp, ce_fp.detach(), win_reg_fp.detach()
                 return ce, ce.detach(), win_reg.detach()
 
             if self.window_reg_coef > 0 and cont_windows is not None:
@@ -276,11 +284,11 @@ class _TrainerCore:
 
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
             self.scheduler.step()
@@ -442,7 +450,7 @@ class DSALTTrainer:
         master_port: str                       = "29500",
     ):
         setup_logging(level=logging.INFO, log_file=log_file)
-        logger.info("=" * 60)
+        logger.info("\n=" * 60)
         logger.info("DSALT Trainer init starting")
         logger.info("=" * 60)
 
