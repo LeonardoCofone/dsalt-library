@@ -110,7 +110,7 @@ class DSALTAttention(nn.Module):
 
             landmark_idx = compute_landmark_idx(
                 X=x_pred,
-                WV_cov=Wv_cov,
+                WV=Wv_cov,
                 window_sizes=window_sizes,
                 k=self.k_lmk,
                 alpha=alpha,
