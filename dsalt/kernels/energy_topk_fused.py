@@ -56,15 +56,17 @@ if _TRITON_AVAILABLE:
             x_ptrs = x_base + offs_n[:, None] * stride_xn + offs_d[None, :] * stride_xd
             wv_ptrs = wv_base + offs_d[:, None] * stride_wd + offs_dh[None, :] * stride_wdh
 
-            x_tile = tl.load(x_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
-            wv_tile = tl.load(wv_ptrs, mask=mask_d[:, None], other=0.0)
+            x_tile = tl.load(x_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float16)
+            wv_tile = tl.load(wv_ptrs, mask=mask_d[:, None], other=0.0).to(tl.float16)
 
-            acc_xv += tl.dot(x_tile, wv_tile)
-            acc_x += tl.sum(x_tile * x_tile, axis=1)
+            acc_xv = tl.dot(x_tile, wv_tile, acc=acc_xv)
+            acc_x += tl.sum(x_tile.to(tl.float32) * x_tile.to(tl.float32), axis=1)
 
         alpha = tl.load(alpha_ptr + pid_h).to(tl.float32)
 
-        energy = alpha * tl.sum(acc_xv * acc_xv, axis=1) + (1.0 - alpha) * acc_x
+        acc_xv_norm = tl.sum(acc_xv * acc_xv, axis=1)
+
+        energy = alpha * acc_xv_norm + (1.0 - alpha) * acc_x
 
         out_ptrs = out_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_n
         tl.store(out_ptrs, energy, mask=mask_n)
@@ -76,14 +78,14 @@ def compute_energy(X, WV, alpha):
     B, N, D = X.shape
     H, _, D_HEAD = WV.shape
 
-    X = X.contiguous()
-    WV = WV.contiguous()
+    X = X.contiguous() if not X.is_contiguous() else X
+    WV = WV.contiguous() if not WV.is_contiguous() else WV
     alpha = torch.sigmoid(alpha).float().contiguous()
 
     out = torch.empty((B, H, N), device=X.device, dtype=torch.float32)
 
-    BLOCK_N = 128
-    BLOCK_D = 64
+    BLOCK_N = 64
+    BLOCK_D = 32
 
     grid = (triton.cdiv(N, BLOCK_N), H, B)
 
@@ -108,7 +110,9 @@ def compute_energy(X, WV, alpha):
 
 
 def compute_energy_and_topk(X, WV, alpha, k, window_end=None):
-    scores = compute_energy(X, WV, alpha)
+    # Fondamentale: i landmark non sono differenziabili, stacchiamo tutto per salvare VRAM
+    with torch.no_grad():
+        scores = compute_energy(X, WV, alpha)
 
     B, H, N = scores.shape
 
@@ -118,7 +122,8 @@ def compute_energy_and_topk(X, WV, alpha, k, window_end=None):
 
     k_safe = min(k, N)
 
-    idx = torch.topk(scores, k=k_safe, dim=-1, sorted=False).indices
+    # Castiamo a half per il topk, risparmia memoria e su GPU è più veloce
+    idx = torch.topk(scores.half(), k=k_safe, dim=-1, sorted=False).indices
     idx = idx.sort(dim=-1).values.to(torch.int32)
 
     if k_safe < k:
