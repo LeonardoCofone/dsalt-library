@@ -21,6 +21,7 @@ if _TRITON_AVAILABLE:
         N: tl.constexpr,
         D: tl.constexpr,
         D_HEAD: tl.constexpr,
+        BLOCK_D: tl.constexpr,
         BLOCK_N: tl.constexpr,
         stride_xb,
         stride_xn,
@@ -31,6 +32,7 @@ if _TRITON_AVAILABLE:
         stride_ob,
         stride_oh,
     ):
+
         pid_n = tl.program_id(0)
         pid_h = tl.program_id(1)
         pid_b = tl.program_id(2)
@@ -38,26 +40,34 @@ if _TRITON_AVAILABLE:
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
 
-        offs_d = tl.arange(0, D)
+        offs_dh = tl.arange(0, D_HEAD)
 
-        x_ptrs = X_ptr + pid_b * stride_xb + offs_n[:, None] * stride_xn + offs_d[None, :] * stride_xd
-        x = tl.load(x_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
+        acc_x = tl.zeros([BLOCK_N], dtype=tl.float32)
+        acc_xv = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
 
-        wv_ptrs = WV_ptr + pid_h * stride_wh + offs_d[:, None] * stride_wd + tl.arange(0, D_HEAD)[None, :] * stride_wdh
-        wv = tl.load(wv_ptrs).to(tl.float32)
+        x_base = X_ptr + pid_b * stride_xb
+        wv_base = WV_ptr + pid_h * stride_wh
 
-        xv = tl.dot(x, wv)
+        for d_start in range(0, D, BLOCK_D):
 
-        acc_x = tl.sum(x * x, axis=1)
-        acc_xv = tl.sum(xv * xv, axis=1)
+            offs_d = d_start + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D
+
+            x_ptrs = x_base + offs_n[:, None] * stride_xn + offs_d[None, :] * stride_xd
+            wv_ptrs = wv_base + offs_d[:, None] * stride_wd + offs_dh[None, :] * stride_wdh
+
+            x_tile = tl.load(x_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            wv_tile = tl.load(wv_ptrs, mask=mask_d[:, None], other=0.0)
+
+            acc_xv += tl.dot(x_tile, wv_tile)
+            acc_x += tl.sum(x_tile * x_tile, axis=1)
 
         alpha = tl.load(alpha_ptr + pid_h).to(tl.float32)
 
-        energy = alpha * acc_xv + (1.0 - alpha) * acc_x
+        energy = alpha * tl.sum(acc_xv * acc_xv, axis=1) + (1.0 - alpha) * acc_x
 
         out_ptrs = out_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_n
         tl.store(out_ptrs, energy, mask=mask_n)
-
 
 def compute_energy(X, WV, alpha):
     assert _TRITON_AVAILABLE
@@ -73,6 +83,7 @@ def compute_energy(X, WV, alpha):
     out = torch.empty((B, H, N), device=X.device, dtype=torch.float32)
 
     BLOCK_N = 128
+    BLOCK_D = 64
 
     grid = (triton.cdiv(N, BLOCK_N), H, B)
 
@@ -81,6 +92,7 @@ def compute_energy(X, WV, alpha):
         N=N,
         D=D,
         D_HEAD=D_HEAD,
+        BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,
         stride_xb=X.stride(0),
         stride_xn=X.stride(1),
