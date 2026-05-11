@@ -81,12 +81,14 @@ class DSALTTrainer:
             model = nn.DataParallel(model, device_ids=self.gpu_ids)
             print(f"[DEBUG] Wrapped in DataParallel", flush=True)
             logger.info(f"Wrapped in DataParallel  →  GPUs {self.gpu_ids}")
+            # DataParallel requires model on device_ids[0]
+            model = model.to(self.primary_device)
+            print(f"[DEBUG] Moved wrapped model to {self.primary_device}", flush=True)
         elif len(self.gpu_ids) > 0:
             logger.info(f"Single GPU mode  →  {self.primary_device}")
         else:
             logger.info("CPU mode")
 
-        # For DataParallel, the model is on cpu, but we set device to primary for autocast
         if not self.use_dp:
             logger.info(f"Moving model to {self.primary_device}")
             model = model.to(self.primary_device)
