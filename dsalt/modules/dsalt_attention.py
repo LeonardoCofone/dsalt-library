@@ -32,7 +32,7 @@ class DSALTAttention(nn.Module):
         compile_attention: bool = False,
     ):
         super().__init__()
-        assert d_model % n_heads == 0, "d_model deve essere divisibile per n_heads"
+        assert d_model % n_heads == 0
         self.d_model  = d_model
         self.n_heads  = n_heads
         self.d_head   = d_model // n_heads
@@ -62,19 +62,19 @@ class DSALTAttention(nn.Module):
         D  = self.d_model
         H  = self.n_heads
         Dh = self.d_head
-        Wv = self.qkv_proj.weight[2 * D : 3 * D, :]  
-        Wv_h = Wv.view(H, Dh, D)     
-        return Wv_h.permute(0, 2, 1).contiguous() 
+        Wv   = self.qkv_proj.weight[2 * D : 3 * D, :]
+        Wv_h = Wv.view(H, Dh, D)
+        return Wv_h.permute(0, 2, 1).contiguous()
 
     def _compute_attention(
         self,
-        Q: torch.Tensor,         
+        Q: torch.Tensor,
         K: torch.Tensor,
         V: torch.Tensor,
-        window_sizes: torch.Tensor,  
-        landmark_idx: torch.Tensor,  
+        window_sizes: torch.Tensor,
+        landmark_idx: torch.Tensor,
     ) -> torch.Tensor:
-        N = Q.shape[2]
+        N     = Q.shape[2]
         max_w = int(window_sizes.max().item())
 
         if self.use_fa2 and N <= max_w:
@@ -88,41 +88,28 @@ class DSALTAttention(nn.Module):
 
     def forward(self, x, x_prev=None, return_window=False):
         B, N, D = x.shape
-        H, Dh = self.n_heads, self.d_head
-        dev = x.device
+        H, Dh   = self.n_heads, self.d_head
 
-        print(f"[ATT] forward start dev={dev} B={B} N={N}", flush=True)
-        
         x_pred = x_prev if x_prev is not None else x
 
-        print(f"[ATT] window_pred start dev={dev}", flush=True)
         window_sizes, cont_w = self.window_pred(x_pred, training=self.training)
-        print(f"[ATT] window_pred done dev={dev}", flush=True)
 
         qkv = self.qkv_proj(x)
         qkv = qkv.view(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
         Q, K, V = qkv[0], qkv[1], qkv[2]
-        print(f"[ATT] qkv done dev={dev}", flush=True)
 
         Wv = self._get_wv_weights().detach()
-        print(f"[ATT] wv done dev={dev}", flush=True)
 
         with torch.no_grad():
-            alpha = torch.sigmoid(self.alpha_w)
-            print(f"[ATT] landmark start dev={dev}", flush=True)
+            alpha        = torch.sigmoid(self.alpha_w)
             landmark_idx = compute_landmark_idx(
                 X=x_pred, WV=Wv, window_sizes=window_sizes,
                 k=self.k_lmk, alpha=alpha,
             )
-        print(f"[ATT] landmark done dev={dev}", flush=True)
 
-        print(f"[ATT] attn_fn start dev={dev}", flush=True)
         out = self._attn_fn(Q, K, V, window_sizes, landmark_idx)
-        print(f"[ATT] attn_fn done dev={dev}", flush=True)
-
         out = out.permute(0, 2, 1, 3).contiguous().view(B, N, D)
         out = self.out_proj(out)
-        print(f"[ATT] out_proj done dev={dev}", flush=True)
 
         if return_window:
             return out, cont_w

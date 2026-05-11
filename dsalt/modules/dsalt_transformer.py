@@ -46,14 +46,11 @@ class DSALTBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x, x_prev=None, return_window=False):
-        print(f"[BLOCK] forward start x.shape={x.shape} device={x.device}", flush=True)
-        residual = x
+        residual        = x
         attn_out, cont_w = self.attn(self.attn_norm(x), x_prev=x_prev,
                                       return_window=return_window)
-        print(f"[BLOCK] attn done attn_out.shape={attn_out.shape}", flush=True)
         x = residual + self.drop(attn_out)
         x = x + self.drop(self.ffn(self.ffn_norm(x)))
-        print(f"[BLOCK] ffn done", flush=True)
         return x, cont_w
 
 
@@ -68,7 +65,7 @@ class DSALTTransformer(nn.Module):
         self.tok_emb  = nn.Embedding(vocab_size, d_model)
         self.pos_emb  = nn.Embedding(max_seq_len, d_model)
         self.emb_drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([
+        self.blocks   = nn.ModuleList([
             DSALTBlock(d_model, n_heads, n_min, n_max, k_lmk, alpha,
                        d_ff, dropout, use_fa2)
             for _ in range(n_layers)
@@ -86,27 +83,24 @@ class DSALTTransformer(nn.Module):
     def forward(self, input_ids, return_window=False):
         B, N = input_ids.shape
         assert N <= self.max_seq_len
-        print(f"[TRANS] forward start B={B} N={N} device={input_ids.device}", flush=True)
-        pos = torch.arange(N, device=input_ids.device).unsqueeze(0)
-        x   = self.emb_drop(self.tok_emb(input_ids) + self.pos_emb(pos))
-        print(f"[TRANS] embeddings done x.shape={x.shape}", flush=True)
+        pos  = torch.arange(N, device=input_ids.device).unsqueeze(0)
+        x    = self.emb_drop(self.tok_emb(input_ids) + self.pos_emb(pos))
         cont_windows = [] if return_window else None
         x_prev = None
-        for i, block in enumerate(self.blocks):
-            print(f"[TRANS] block {i} start", flush=True)
+        for block in self.blocks:
             x, cont_w = block(x, x_prev=x_prev, return_window=return_window)
             x_prev    = x
             if return_window and cont_w is not None:
                 cont_windows.append(cont_w)
-            print(f"[TRANS] block {i} done", flush=True)
         x      = self.final_norm(x)
         logits = self.lm_head(x)
-        print(f"[TRANS] final done logits.shape={logits.shape}", flush=True)
         return logits, cont_windows
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def extra_repr(self):
-        return (f"d_model={self.d_model}, n_layers={self.n_layers}, "
-                f"params={self.count_parameters() / 1e6:.1f}M")
+        return (
+            f"d_model={self.d_model}, n_layers={self.n_layers}, "
+            f"params={self.count_parameters() / 1e6:.1f}M"
+        )
