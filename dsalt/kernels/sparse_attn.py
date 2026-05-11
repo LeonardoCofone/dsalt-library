@@ -453,7 +453,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, Q, K, V, window_sizes, landmark_idx):
-        print(f"[KERNEL] DSALTAttentionFunction.forward start Q.shape={Q.shape} device={Q.device}", flush=True)
+        #print(f"[KERNEL] DSALTAttentionFunction.forward start Q.shape={Q.shape} device={Q.device}", flush=True)
         B, H, N, D = Q.shape
         K_lmk = landmark_idx.shape[-1]
 
@@ -621,5 +621,5 @@ def _cpu_reference_backward(Q, K, V, dOut, window_sizes, landmark_idx, LSE, scal
 
 
 def dsalt_attention(Q, K, V, window_sizes, landmark_idx):
-    print(f"[KERNEL] dsalt_attention called Q.shape={Q.shape} device={Q.device}", flush=True)
+    #print(f"[KERNEL] dsalt_attention called Q.shape={Q.shape} device={Q.device}", flush=True)
     return DSALTAttentionFunction.apply(Q, K, V, window_sizes, landmark_idx)

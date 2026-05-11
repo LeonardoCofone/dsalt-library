@@ -287,7 +287,7 @@ class _TrainerCore:
                     f"  ppl={ppl:.2f}"
                     f"  lr={lr_now:.2e}"
                     f"  win_reg={win_reg.item():.4f}"
-                    f"  mem={mem_gb:.2f}/{mem_reserved:.2f}GB"
+                    f"  mem={mem_gb:.2f}GB"
                     f"  {it_per_sec:.2f}it/s"
                 )
 
