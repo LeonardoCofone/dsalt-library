@@ -105,7 +105,7 @@ if _TRITON_AVAILABLE:
                 V_bh + offs_n[:, None] * stride_vn + offs_d[None, :],
                 mask=mask_n[:, None] & mask_d[None, :], other=0.0,
             ).to(tl.float32)
-            acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v_tile.to(tl.float16)).to(tl.float32)
+            acc = acc * alpha[:, None] + tl.dot(p, v_tile)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
             k_blk += BLOCK_N
@@ -134,7 +134,7 @@ if _TRITON_AVAILABLE:
             V_bh + idx_k[:, None] * stride_vn + offs_d[None, :],
             mask=(lmk_offs[:, None] < K_LMK) & mask_d[None, :], other=0.0,
         ).to(tl.float32)
-        acc = acc * alpha[:, None] + tl.dot(p_lmk.to(tl.float16), vl.to(tl.float16)).to(tl.float32)
+        acc = acc * alpha[:, None] + tl.dot(p_lmk, vl)
         l_i = l_i * alpha + tl.sum(p_lmk, axis=1)
         m_i = m_new
 
@@ -221,7 +221,7 @@ if _TRITON_AVAILABLE:
             dp     = tl.dot(do, tl.trans(v_tile))
             rowsum = tl.sum(p * dp, axis=1)
             ds     = tl.where(valid, p * (dp - rowsum[:, None]) * SCALE, 0.0)
-            dq    += tl.dot(ds.to(tl.float16), k_tile.to(tl.float16)).to(tl.float32)
+            dq    += tl.dot(ds, k_tile)
             k_blk += BLOCK_N
 
         lmk_offs = tl.arange(0, K_LMK)
@@ -242,7 +242,7 @@ if _TRITON_AVAILABLE:
         dp_l  = tl.dot(do, tl.trans(vl))
         rs_l  = tl.sum(p_lmk * dp_l, axis=1)
         ds_l  = tl.where(lmk_ok, p_lmk * (dp_l - rs_l[:, None]) * SCALE, 0.0)
-        dq   += tl.dot(ds_l.to(tl.float16), kl.to(tl.float16)).to(tl.float32)
+        dq   += tl.dot(ds_l, kl)
 
         tl.store(DQ_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
                  dq.to(Q_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
@@ -330,11 +330,11 @@ if _TRITON_AVAILABLE:
             s      = tl.where(valid, s, float("-inf"))
             p      = tl.where(valid, tl.exp(s - lse_t[:, None]), 0.0)
 
-            dv    += tl.dot(tl.trans(p).to(tl.float16), do_t.to(tl.float16)).to(tl.float32)
+            dv    += tl.dot(tl.trans(p), do_t)
             dp     = tl.dot(do_t, tl.trans(v_tile))
             rs     = tl.sum(p * dp, axis=1)
             ds     = tl.where(valid, p * (dp - rs[:, None]) * SCALE, 0.0)
-            dk    += tl.dot(tl.trans(ds).to(tl.float16), q_t.to(tl.float16)).to(tl.float32)
+            dk    += tl.dot(tl.trans(ds), q_t)
             q_blk += BLOCK_M
 
         q_blk2 = 0
@@ -359,11 +359,11 @@ if _TRITON_AVAILABLE:
             s2 = tl.where(valid2, s2, float("-inf"))
             p2 = tl.where(valid2, tl.exp(s2 - lse_t2[:, None]), 0.0)
 
-            dv    += tl.dot(tl.trans(p2).to(tl.float16), do_t2.to(tl.float16)).to(tl.float32)
+            dv    += tl.dot(tl.trans(p2), do_t2)
             dp2    = tl.dot(do_t2, tl.trans(v_tile))
             rs2    = tl.sum(p2 * dp2, axis=1)
             ds2    = tl.where(valid2, p2 * (dp2 - rs2[:, None]) * SCALE, 0.0)
-            dk    += tl.dot(tl.trans(ds2).to(tl.float16), q_t2.to(tl.float16)).to(tl.float32)
+            dk    += tl.dot(tl.trans(ds2), q_t2)
             q_blk2 += BLOCK_M
 
         tl.store(DK_bh + offs_n[:, None] * stride_kn + offs_d[None, :],

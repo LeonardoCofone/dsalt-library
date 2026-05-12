@@ -319,8 +319,8 @@ class _TrainerCore:
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
-            self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
+            self.scheduler.step()
             self.global_step += 1
 
             if self.is_main and self.global_step == 1:
@@ -329,7 +329,7 @@ class _TrainerCore:
             if self.is_main and self.global_step % self.log_every == 0:
                 elapsed      = time.time() - t0
                 avg_loss     = loss_accum / n_steps_accumulated
-                ppl          = math.exp(min(avg_loss, 1000))
+                ppl          = math.exp(min(avg_loss, 20))
                 lr_now       = self.scheduler.get_last_lr()[0]
                 it_per_sec   = self.log_every / elapsed if elapsed > 0 else float("inf")
                 mem_gb       = torch.cuda.memory_allocated(self.device) / 1e9 if self.device.type == "cuda" else 0.0
