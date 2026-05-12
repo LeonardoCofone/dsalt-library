@@ -108,7 +108,6 @@ class DSALTAttention(nn.Module):
         landmark_idx = compute_energy_and_topk(
             X=x_pred,
             WV=Wv,
-            window_end=window_sizes,
             k=self.k_lmk,
             alpha=alpha,
         )  
