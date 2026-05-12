@@ -154,7 +154,7 @@ class _TrainerCore:
         )
         self.scheduler     = get_cosine_schedule_with_warmup(self.optimizer, warmup_steps, total_steps)
         self.dtype         = dtype
-        self.use_amp       = device.type == "cuda" and dtype == torch.float16
+        self.use_amp       = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
         self.allow_fallback_fp32 = True
         self.scaler        = (
             torch.amp.GradScaler("cuda")
@@ -185,52 +185,75 @@ class _TrainerCore:
         if resume_from:
             self._load_checkpoint(resume_from)
 
+    def _compute_loss(
+        self,
+        logits: torch.Tensor,
+        y: torch.Tensor,
+        cont_windows,
+    ):
+        """Calcola ce + win_reg dati i logits già computati. Separato per poter essere
+        chiamato sia nel path normale che nel fallback senza rifar il forward."""
+        logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+        B, N, V = logits.shape
+        ce = nn.functional.cross_entropy(
+            logits.view(B * N, V),
+            y.contiguous().view(B * N),
+            ignore_index=-100,
+        )
+        win_reg = self._zero_tensor.clone()
+        if self.window_reg_coef > 0 and cont_windows is not None:
+            cw_list = [cont_windows] if isinstance(cont_windows, torch.Tensor) else cont_windows
+            for cw in cw_list:
+                win_reg = win_reg - cw.float().var(dim=-1).mean()
+            win_reg = win_reg / max(len(cw_list), 1)
+        return ce, win_reg
+
     def _forward(self, x: torch.Tensor, y: torch.Tensor):
+        # --- path normale (AMP se abilitato) ---
         with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=self.use_amp):
             logits, cont_windows = self.model(x, return_window=self.window_reg_coef > 0)
-            
-            if not torch.isfinite(logits).all():
-                logits = torch.nan_to_num(logits, nan=-1e6, posinf=1e6, neginf=-1e6)
 
-            B, N, V = logits.shape
-            ce = nn.functional.cross_entropy(
-                logits.view(B * N, V),
-                y.contiguous().view(B * N),
-                ignore_index=-100,
-            )
-            win_reg = self._zero_tensor.clone()
-            
-            if torch.isnan(ce):
-                logger.error(f"Rank {self.rank}: NaN detected in loss")
-                if getattr(self, "allow_fallback_fp32", False) and self.use_amp:
-                    logger.info(f"Rank {self.rank}: Re‑executing batch in FP32 fallback mode")
-                    with torch.autocast(device_type=self.device.type, dtype=torch.float32, enabled=False):
-                        logits_fp, cont_windows_fp = self.model(x, return_window=self.window_reg_coef > 0)
-                        logits_fp = torch.nan_to_num(logits_fp, nan=-1e6, posinf=1e6, neginf=-1e6)
-                        
-                        B_fp, N_fp, V_fp = logits_fp.shape
-                        ce_fp = nn.functional.cross_entropy(
-                            logits_fp.view(B_fp * N_fp, V_fp),
-                            y.contiguous().view(B_fp * N_fp),
-                            ignore_index=-100,
-                        )
-                        
-                        win_reg_fp = self._zero_tensor.clone()
-                        if self.window_reg_coef > 0 and cont_windows_fp is not None:
-                            cw_list = [cont_windows_fp] if isinstance(cont_windows_fp, torch.Tensor) else cont_windows_fp
-                            for cw in cw_list:
-                                win_reg_fp = win_reg_fp - cw.float().var(dim=-1).mean()
-                            win_reg_fp = win_reg_fp / max(len(cw_list), 1)
-                            
-                    return ce_fp + self.window_reg_coef * win_reg_fp, ce_fp.detach(), win_reg_fp.detach()
-                return ce, ce.detach(), win_reg.detach()
+        # NaN check FUORI da autocast: cast a fp32 per il check e per la loss
+        nan_in_logits = not torch.isfinite(logits).all()
+        ce, win_reg = self._compute_loss(logits, y, cont_windows)
+        nan_in_loss = not torch.isfinite(ce)
 
-            if self.window_reg_coef > 0 and cont_windows is not None:
-                if isinstance(cont_windows, torch.Tensor):
-                    cont_windows = [cont_windows]
-                for cw in cont_windows:
-                    win_reg = win_reg - cw.float().var(dim=-1).mean()
-                win_reg = win_reg / max(len(cont_windows), 1)
+        if nan_in_logits or nan_in_loss:
+            logger.error(f"Rank {self.rank}: NaN detected in {'logits' if nan_in_logits else 'loss'}")
+
+            if self.allow_fallback_fp32 and self.use_amp:
+                logger.info(f"Rank {self.rank}: Re-executing batch in FP32 fallback mode")
+
+                # Libera TUTTA la memoria del forward precedente prima di riprovare
+                del logits, cont_windows, ce, win_reg
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+                # Secondo forward in FP32 puro — autocast disabilitato
+                with torch.autocast(device_type=self.device.type, enabled=False):
+                    logits_fp, cont_windows_fp = self.model(
+                        x.to(torch.float32) if x.is_floating_point() else x,
+                        return_window=self.window_reg_coef > 0,
+                    )
+                ce_fp, win_reg_fp = self._compute_loss(logits_fp, y, cont_windows_fp)
+
+                if not torch.isfinite(ce_fp):
+                    logger.error(f"Rank {self.rank}: NaN persists in FP32 fallback — skipping batch")
+                    # Ritorna una loss zero che non inquina i gradienti
+                    dummy = self._zero_tensor.clone().requires_grad_(True)
+                    return dummy, dummy.detach(), self._zero_tensor.clone().detach()
+
+                return (
+                    ce_fp + self.window_reg_coef * win_reg_fp,
+                    ce_fp.detach(),
+                    win_reg_fp.detach(),
+                )
+
+            # use_amp=False e NaN: skip batch
+            logger.error(f"Rank {self.rank}: NaN in loss (no AMP fallback available) — skipping batch")
+            dummy = self._zero_tensor.clone().requires_grad_(True)
+            return dummy, dummy.detach(), self._zero_tensor.clone().detach()
+
         return ce + self.window_reg_coef * win_reg, ce.detach(), win_reg.detach()
 
     def run(self) -> Dict[str, list]:

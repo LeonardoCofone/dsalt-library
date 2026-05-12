@@ -1,3 +1,6 @@
+"""
+Questo modulo fornisce utility per la risoluzione automatica del device (CPU/GPU) e per la stampa delle informazioni della GPU.
+"""
 import logging
 import torch
 import torch.nn as nn

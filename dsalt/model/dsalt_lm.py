@@ -1,3 +1,8 @@
+"""
+Questo modulo definisce il modello di linguaggio DSALTLM, integrando la classe
+DSALTTransformer e fornendo l'head per il language modeling, con configurazioni
+di dimensioni, numero di layer, teste di attenzione e altri iper‑parametri.
+"""
 from typing import Optional, Dict, Any
 
 import torch

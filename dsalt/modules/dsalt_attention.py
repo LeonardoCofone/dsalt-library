@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as ckpt_utils
 
 from dsalt.kernels.sparse_attn import dsalt_attention
 from dsalt.kernels.energy_topk_fused import compute_energy_and_topk
@@ -22,36 +21,43 @@ class DSALTAttention(nn.Module):
         self,
         d_model: int,
         n_heads: int,
-        n_min: int   = 32,
-        n_max: int   = 256,
-        k_lmk: int   = 16,
-        alpha: float = 0.6,
+        n_min: int    = 32,
+        n_max: int    = 256,
+        k_lmk: int    = 16,
+        alpha: float  = 0.6,
         dropout: float = 0.0,
         use_fa2: bool  = True,
         gradient_checkpointing: bool = False,
         compile_attention: bool = False,
     ):
         super().__init__()
-        assert d_model % n_heads == 0
-        self.d_model  = d_model
-        self.n_heads  = n_heads
-        self.d_head   = d_model // n_heads
-        self.k_lmk    = k_lmk
-        self.alpha_init = alpha
-        self.dropout  = dropout
-        self.use_fa2  = use_fa2 and _FLASH_AVAILABLE
-        self.gradient_checkpointing = gradient_checkpointing
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
 
-        self.qkv_proj  = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out_proj  = nn.Linear(d_model, d_model,     bias=False)
-        self.alpha_w   = nn.Parameter(torch.full((n_heads,), alpha))
+        self.d_model   = d_model
+        self.n_heads   = n_heads
+        self.d_head    = d_model // n_heads
+        self.k_lmk     = k_lmk
+        self.alpha_init = alpha
+        self.dropout   = dropout
+        self.use_fa2   = use_fa2 and _FLASH_AVAILABLE
+        self.gradient_checkpointing = gradient_checkpointing
+        self.scale     = 1.0 / math.sqrt(self.d_head)
+
+        self.qkv_proj    = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj    = nn.Linear(d_model, d_model,     bias=False)
+
+        # alpha_w: per-head balancing scalar, optimized via AdamW as per the paper.
+        # Initialized to sigmoid^{-1}(alpha) so that sigmoid(alpha_w) = alpha at step 0.
+        alpha_init_logit = math.log(alpha / (1.0 - alpha))
+        self.alpha_w     = nn.Parameter(torch.full((n_heads,), alpha_init_logit))
+
         self.window_pred = WindowSizePredictor(d_model, n_heads, n_min, n_max)
-        self.scale = 1.0 / math.sqrt(self.d_head)
+
         self._init_weights()
 
         self._attn_fn = (
-            torch.compile(self._compute_attention, mode="reduce-overhead")
-            if compile_attention else self._compute_attention
+            torch.compile(self._sparse_attn_forward, mode="reduce-overhead")
+            if compile_attention else self._sparse_attn_forward
         )
 
     def _init_weights(self):
@@ -59,61 +65,86 @@ class DSALTAttention(nn.Module):
         nn.init.xavier_uniform_(self.out_proj.weight)
 
     def _get_wv_weights(self) -> torch.Tensor:
+        """
+        Extract per-head value projection weights from the fused QKV matrix.
+        qkv_proj.weight shape: [3*D, D]  (nn.Linear stores [out, in])
+        Wv slice:               [D, D]
+        Reshaped to:            [H, Dh, D]  then permuted to [H, D, Dh]
+        so that  x @ Wv_h  with x:[..., D] gives [..., Dh].
+        Using .reshape() instead of .view() to handle non-contiguous slices safely.
+        """
         D  = self.d_model
         H  = self.n_heads
         Dh = self.d_head
-        Wv   = self.qkv_proj.weight[2 * D : 3 * D, :]
-        Wv_h = Wv.view(H, Dh, D)
-        return Wv_h.permute(0, 2, 1).contiguous()
+        Wv   = self.qkv_proj.weight[2 * D : 3 * D, :]   # [D, D]
+        Wv_h = Wv.reshape(H, Dh, D)                      # [H, Dh, D]
+        return Wv_h.permute(0, 2, 1).contiguous()         # [H, D, Dh]
 
-    def _compute_attention(
+    def _sparse_attn_forward(
         self,
-        Q: torch.Tensor,
+        Q: torch.Tensor,            # [B, H, N, Dh]
         K: torch.Tensor,
         V: torch.Tensor,
-        window_sizes: torch.Tensor,
-        landmark_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        N     = Q.shape[2]
-        max_w = int(window_sizes.max().item())
+        window_sizes: torch.Tensor, # [B, H, N]  or [B, N]
+        landmark_idx: torch.Tensor, # [B, H, K]
+    ) -> torch.Tensor:              # [B, H, N, Dh]
+        return dsalt_attention(Q, K, V, window_sizes, landmark_idx)
 
-        if self.use_fa2 and N <= max_w:
-            return flash_attn_func(
-                Q.transpose(1, 2), K.transpose(1, 2), V.transpose(1, 2),
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=True,
-            ).transpose(1, 2)
-        else:
-            return dsalt_attention(Q, K, V, window_sizes, landmark_idx)
+    def forward(
+        self,
+        x: torch.Tensor,                        # [B, N, D]
+        x_prev: Optional[torch.Tensor] = None,  # [B, N, D], previous-layer hidden state
+        return_window: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
-    def forward(self, x, x_prev=None, return_window=False):
         B, N, D = x.shape
         H, Dh   = self.n_heads, self.d_head
 
+        # x_pred is the representation used for window/landmark scoring.
+        # At layer 0 this is the input embedding; at layer l it is x^{(l-1)}.
+        # Using x_prev avoids circular dependency on the current layer output.
         x_pred = x_prev if x_prev is not None else x
 
-        window_sizes, cont_w = self.window_pred(x_pred)
+        # Continuous window size for gradient flow; discrete window_sizes for masking.
+        window_sizes, cont_w = self.window_pred(x_pred)  # [B, N], [B, N]
 
+        # QKV projection and reshape to [B, H, N, Dh]
         qkv = self.qkv_proj(x)
         qkv = qkv.view(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
-        Q, K, V = qkv[0], qkv[1], qkv[2]
+        Q, K, V = qkv[0], qkv[1], qkv[2]   # each [B, H, N, Dh]
 
-        Wv = self._get_wv_weights().detach() # [H, D, Dh]
+        # Value projection weights for hybrid energy scoring.
+        # Detach: landmark selection is not in the main computational graph,
+        # but alpha_w IS optimized — its gradient flows through the energy scores
+        # of selected tokens, not through the top-k argmax (which is non-differentiable).
+        Wv = self._get_wv_weights().detach()  # [H, D, Dh]
 
-        with torch.no_grad():
-            alpha = torch.sigmoid(self.alpha_w)
+        # alpha: per-head balancing parameter in (0,1), learnable.
+        # Gradient flows into alpha_w through the energy scores of the selected landmarks.
+        # We must NOT wrap this in torch.no_grad(), otherwise alpha_w never trains.
+        alpha = torch.sigmoid(self.alpha_w)   # [H]
 
-            # Pass window_end=None to select landmarks globally for the sequence
-            # This prevents (B,H,N,K) expansion and keeps it at (B,H,K)
-            landmark_idx = compute_energy_and_topk(
-                X=x_pred,
-                WV=Wv,
-                window_end=None,
-                k=self.k_lmk,
-                alpha=alpha,
+        # Landmark selection: top-k tokens by hybrid energy score, outside the local window.
+        # window_sizes here acts as window_end per token so causality is respected:
+        # only tokens j < window_start(i) are candidates, ensuring no future tokens
+        # are selected as landmarks for token i.
+        landmark_idx = compute_energy_and_topk(
+            X=x_pred,
+            WV=Wv,
+            window_end=window_sizes,
+            k=self.k_lmk,
+            alpha=alpha,
+        )   # [B, H, K]
+
+        if self.gradient_checkpointing and self.training:
+            out = torch.utils.checkpoint.checkpoint(
+                self._attn_fn, Q, K, V, window_sizes, landmark_idx,
+                use_reentrant=False,
             )
+        else:
+            out = self._attn_fn(Q, K, V, window_sizes, landmark_idx)
+        # out: [B, H, N, Dh]
 
-        out = self._attn_fn(Q, K, V, window_sizes, landmark_idx)
         out = out.permute(0, 2, 1, 3).contiguous().view(B, N, D)
         out = self.out_proj(out)
 
