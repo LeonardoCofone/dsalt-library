@@ -112,15 +112,11 @@ def compute_energy(X, WV, alpha):
     return out
 
 
-def compute_energy_and_topk(X, WV, alpha, k, window_end=None):
+def compute_energy_and_topk(X, WV, alpha, k):
     with torch.no_grad():
         scores = compute_energy(X, WV, alpha)
 
     B, H, N = scores.shape
-
-    if window_end is not None:
-        pos = torch.arange(N, device=scores.device).view(1, 1, N)
-        scores = scores.masked_fill(pos >= window_end.unsqueeze(-1), float("-inf"))
 
     k_safe = min(k, N)
 

@@ -1,3 +1,6 @@
+"""
+Questo modulo implementa il trainer DSALT, gestendo il ciclo di addestramento, validazione, checkpoint e logging.
+"""
 import math
 import time
 import logging

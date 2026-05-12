@@ -1,3 +1,6 @@
+"""
+Questo modulo definisce l'attenzione DSALT, basata su implementazioni sparse e ottimizzazioni Triton/FlashAttention.
+"""
 import math
 from typing import Optional, Tuple
 
@@ -46,8 +49,6 @@ class DSALTAttention(nn.Module):
         self.qkv_proj    = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj    = nn.Linear(d_model, d_model,     bias=False)
 
-        # alpha_w: per-head balancing scalar, optimized via AdamW as per the paper.
-        # Initialized to sigmoid^{-1}(alpha) so that sigmoid(alpha_w) = alpha at step 0.
         alpha_init_logit = math.log(alpha / (1.0 - alpha))
         self.alpha_w     = nn.Parameter(torch.full((n_heads,), alpha_init_logit))
 
@@ -65,76 +66,52 @@ class DSALTAttention(nn.Module):
         nn.init.xavier_uniform_(self.out_proj.weight)
 
     def _get_wv_weights(self) -> torch.Tensor:
-        """
-        Extract per-head value projection weights from the fused QKV matrix.
-        qkv_proj.weight shape: [3*D, D]  (nn.Linear stores [out, in])
-        Wv slice:               [D, D]
-        Reshaped to:            [H, Dh, D]  then permuted to [H, D, Dh]
-        so that  x @ Wv_h  with x:[..., D] gives [..., Dh].
-        Using .reshape() instead of .view() to handle non-contiguous slices safely.
-        """
         D  = self.d_model
         H  = self.n_heads
         Dh = self.d_head
-        Wv   = self.qkv_proj.weight[2 * D : 3 * D, :]   # [D, D]
-        Wv_h = Wv.reshape(H, Dh, D)                      # [H, Dh, D]
-        return Wv_h.permute(0, 2, 1).contiguous()         # [H, D, Dh]
+        Wv   = self.qkv_proj.weight[2 * D : 3 * D, :]   
+        Wv_h = Wv.reshape(H, Dh, D)                      
+        return Wv_h.permute(0, 2, 1).contiguous()         
 
     def _sparse_attn_forward(
         self,
-        Q: torch.Tensor,            # [B, H, N, Dh]
+        Q: torch.Tensor,        
         K: torch.Tensor,
         V: torch.Tensor,
-        window_sizes: torch.Tensor, # [B, H, N]  or [B, N]
-        landmark_idx: torch.Tensor, # [B, H, K]
-    ) -> torch.Tensor:              # [B, H, N, Dh]
+        window_sizes: torch.Tensor, 
+        landmark_idx: torch.Tensor, 
+    ) -> torch.Tensor:       
         return dsalt_attention(Q, K, V, window_sizes, landmark_idx)
 
     def forward(
         self,
-        x: torch.Tensor,                        # [B, N, D]
-        x_prev: Optional[torch.Tensor] = None,  # [B, N, D], previous-layer hidden state
+        x: torch.Tensor,                  
+        x_prev: Optional[torch.Tensor] = None,  
         return_window: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         B, N, D = x.shape
         H, Dh   = self.n_heads, self.d_head
 
-        # x_pred is the representation used for window/landmark scoring.
-        # At layer 0 this is the input embedding; at layer l it is x^{(l-1)}.
-        # Using x_prev avoids circular dependency on the current layer output.
         x_pred = x_prev if x_prev is not None else x
 
-        # Continuous window size for gradient flow; discrete window_sizes for masking.
-        window_sizes, cont_w = self.window_pred(x_pred)  # [B, N], [B, N]
+        window_sizes, cont_w = self.window_pred(x_pred) 
 
-        # QKV projection and reshape to [B, H, N, Dh]
         qkv = self.qkv_proj(x)
         qkv = qkv.view(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
-        Q, K, V = qkv[0], qkv[1], qkv[2]   # each [B, H, N, Dh]
+        Q, K, V = qkv[0], qkv[1], qkv[2]  
 
-        # Value projection weights for hybrid energy scoring.
-        # Detach: landmark selection is not in the main computational graph,
-        # but alpha_w IS optimized — its gradient flows through the energy scores
-        # of selected tokens, not through the top-k argmax (which is non-differentiable).
-        Wv = self._get_wv_weights().detach()  # [H, D, Dh]
+        Wv = self._get_wv_weights().detach() 
 
-        # alpha: per-head balancing parameter in (0,1), learnable.
-        # Gradient flows into alpha_w through the energy scores of the selected landmarks.
-        # We must NOT wrap this in torch.no_grad(), otherwise alpha_w never trains.
-        alpha = torch.sigmoid(self.alpha_w)   # [H]
+        alpha = torch.sigmoid(self.alpha_w)   
 
-        # Landmark selection: top-k tokens by hybrid energy score, outside the local window.
-        # window_sizes here acts as window_end per token so causality is respected:
-        # only tokens j < window_start(i) are candidates, ensuring no future tokens
-        # are selected as landmarks for token i.
         landmark_idx = compute_energy_and_topk(
             X=x_pred,
             WV=Wv,
             window_end=window_sizes,
             k=self.k_lmk,
             alpha=alpha,
-        )   # [B, H, K]
+        )  
 
         if self.gradient_checkpointing and self.training:
             out = torch.utils.checkpoint.checkpoint(
@@ -143,7 +120,7 @@ class DSALTAttention(nn.Module):
             )
         else:
             out = self._attn_fn(Q, K, V, window_sizes, landmark_idx)
-        # out: [B, H, N, Dh]
+
 
         out = out.permute(0, 2, 1, 3).contiguous().view(B, N, D)
         out = self.out_proj(out)

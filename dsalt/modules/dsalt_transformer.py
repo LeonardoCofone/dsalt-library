@@ -1,3 +1,6 @@
+"""
+Questo modulo implementa il trasformatore DSALT, includendo la normale RMS, il blocco di attenzione e il feed‑forward SwiGLU.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

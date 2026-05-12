@@ -1,3 +1,6 @@
+"""
+Questo modulo definisce la configurazione del logging con supporto a colori per i messaggi.
+"""
 import logging
 import sys
 

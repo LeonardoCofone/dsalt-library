@@ -150,6 +150,7 @@ logs/
 wandb/
 
 release.ps1
+COSE_CAMBIATE_DALLA_TEORIA.md
 last_version_6.pdf
 .claude/
 # Claude AI

@@ -1,3 +1,11 @@
+"""
+Questo pacchetto aggrega i componenti principali di DSALT, includendo:
+- moduli per l'attenzione e il trasformatore,
+- il modello di linguaggio DSALTLM,
+- kernel per calcoli energetici e predizione della dimensione della finestra,
+- il trainer per l'addestramento.
+"""
+
 from dsalt.modules.dsalt_attention import DSALTAttention
 from dsalt.modules.dsalt_transformer import DSALTTransformer, DSALTBlock, RMSNorm, SwiGLUFFN
 from dsalt.model.dsalt_lm import DSALTLMHeadModel
