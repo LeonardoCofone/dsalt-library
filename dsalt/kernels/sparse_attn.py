@@ -40,11 +40,12 @@ if _TRITON_AVAILABLE:
         stride_kb, stride_kh, stride_kn, stride_kd,
         stride_vb, stride_vh, stride_vn, stride_vd,
         stride_lmb, stride_lmh, stride_lmk,
-        stride_ob, stride_oh, stride_on, stride_od,
+        stride_ob, stride_oh, stride_on,
         stride_wb, stride_wh, stride_wn,
         stride_lseb, stride_lseh,
         N: tl.constexpr,
         D: tl.constexpr,
+        D_REAL: tl.constexpr,
         K_LMK: tl.constexpr,
         SCALE: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -57,6 +58,7 @@ if _TRITON_AVAILABLE:
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_d = tl.arange(0, D)
         mask_m = offs_m < N
+        mask_d = offs_d < D_REAL
 
         Q_bh  = Q_ptr  + pid_b * stride_qb + pid_h * stride_qh
         K_bh  = K_ptr  + pid_b * stride_kb + pid_h * stride_kh
@@ -65,9 +67,9 @@ if _TRITON_AVAILABLE:
         O_bh  = Out_ptr + pid_b * stride_ob + pid_h * stride_oh
         W_bh  = Win_ptr + pid_b * stride_wb + pid_h * stride_wh
 
-        q   = tl.load(
+        q = tl.load(
             Q_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
-            mask=mask_m[:, None], other=0.0,
+            mask=mask_m[:, None] & mask_d[None, :], other=0.0,
         ).to(tl.float32)
         w_i = tl.load(W_bh + offs_m * stride_wn, mask=mask_m, other=0)
 
@@ -86,7 +88,7 @@ if _TRITON_AVAILABLE:
 
             k_tile = tl.load(
                 K_bh + offs_n[None, :] * stride_kn + offs_d[:, None],
-                mask=mask_n[None, :], other=0.0,
+                mask=mask_n[None, :] & mask_d[:, None], other=0.0,
             ).to(tl.float32)
             s = tl.dot(q, k_tile) * SCALE
 
@@ -101,7 +103,7 @@ if _TRITON_AVAILABLE:
 
             v_tile = tl.load(
                 V_bh + offs_n[:, None] * stride_vn + offs_d[None, :],
-                mask=mask_n[:, None], other=0.0,
+                mask=mask_n[:, None] & mask_d[None, :], other=0.0,
             ).to(tl.float32)
             acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v_tile.to(tl.float16)).to(tl.float32)
             l_i = l_i * alpha + tl.sum(p, axis=1)
@@ -109,7 +111,7 @@ if _TRITON_AVAILABLE:
             k_blk += BLOCK_N
 
         lmk_offs = tl.arange(0, K_LMK)
-        idx_k    = tl.load(
+        idx_k = tl.load(
             LM_bh + lmk_offs * stride_lmk,
             mask=lmk_offs < K_LMK, other=0,
         ).to(tl.int32)
@@ -117,7 +119,7 @@ if _TRITON_AVAILABLE:
 
         kl = tl.load(
             K_bh + idx_k[:, None] * stride_kn + offs_d[None, :],
-            mask=(lmk_offs[:, None] < K_LMK), other=0.0,
+            mask=(lmk_offs[:, None] < K_LMK) & mask_d[None, :], other=0.0,
         ).to(tl.float32)
         s_lmk = tl.dot(q, tl.trans(kl)) * SCALE
 
@@ -130,7 +132,7 @@ if _TRITON_AVAILABLE:
 
         vl = tl.load(
             V_bh + idx_k[:, None] * stride_vn + offs_d[None, :],
-            mask=(lmk_offs[:, None] < K_LMK), other=0.0,
+            mask=(lmk_offs[:, None] < K_LMK) & mask_d[None, :], other=0.0,
         ).to(tl.float32)
         acc = acc * alpha[:, None] + tl.dot(p_lmk.to(tl.float16), vl.to(tl.float16)).to(tl.float32)
         l_i = l_i * alpha + tl.sum(p_lmk, axis=1)
@@ -145,9 +147,9 @@ if _TRITON_AVAILABLE:
             lse, mask=mask_m,
         )
         tl.store(
-            O_bh + offs_m[:, None] * stride_on + offs_d[None, :] * stride_od,
+            O_bh + offs_m[:, None] * stride_on + offs_d[None, :],
             out_f.to(Q_ptr.dtype.element_ty),
-            mask=mask_m[:, None],
+            mask=mask_m[:, None] & mask_d[None, :],
         )
 
     @triton.jit
@@ -163,6 +165,7 @@ if _TRITON_AVAILABLE:
         stride_lseb, stride_lseh,
         N: tl.constexpr,
         D: tl.constexpr,
+        D_REAL: tl.constexpr,
         K_LMK: tl.constexpr,
         SCALE: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -175,6 +178,7 @@ if _TRITON_AVAILABLE:
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_d = tl.arange(0, D)
         mask_m = offs_m < N
+        mask_d = offs_d < D_REAL
 
         Q_bh  = Q_ptr  + pid_b * stride_qb + pid_h * stride_qh
         K_bh  = K_ptr  + pid_b * stride_kb + pid_h * stride_kh
@@ -185,9 +189,9 @@ if _TRITON_AVAILABLE:
         W_bh  = Win_ptr + pid_b * stride_wb + pid_h * stride_wh
 
         q   = tl.load(Q_bh  + offs_m[:, None] * stride_qn + offs_d[None, :],
-                      mask=mask_m[:, None], other=0.0).to(tl.float32)
+                      mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
         do  = tl.load(DO_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
-                      mask=mask_m[:, None], other=0.0).to(tl.float32)
+                      mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
         lse = tl.load(LSE_ptr + pid_b * stride_lseb + pid_h * stride_lseh + offs_m,
                       mask=mask_m, other=0.0)
         w_i = tl.load(W_bh + offs_m * stride_wn, mask=mask_m, other=0)
@@ -203,9 +207,9 @@ if _TRITON_AVAILABLE:
             mask_n = offs_n < N
 
             k_tile = tl.load(K_bh + offs_n[:, None] * stride_kn + offs_d[None, :],
-                             mask=mask_n[:, None], other=0.0).to(tl.float32)
+                             mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
             v_tile = tl.load(V_bh + offs_n[:, None] * stride_vn + offs_d[None, :],
-                             mask=mask_n[:, None], other=0.0).to(tl.float32)
+                             mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
 
             s      = tl.dot(q, tl.trans(k_tile)) * SCALE
             causal = offs_n[None, :] <= offs_m[:, None]
@@ -226,9 +230,9 @@ if _TRITON_AVAILABLE:
         idx_k    = tl.minimum(tl.maximum(idx_k, 0), N - 1)
 
         kl = tl.load(K_bh + idx_k[:, None] * stride_kn + offs_d[None, :],
-                     mask=(lmk_offs[:, None] < K_LMK), other=0.0).to(tl.float32)
+                     mask=(lmk_offs[:, None] < K_LMK) & mask_d[None, :], other=0.0).to(tl.float32)
         vl = tl.load(V_bh + idx_k[:, None] * stride_vn + offs_d[None, :],
-                     mask=(lmk_offs[:, None] < K_LMK), other=0.0).to(tl.float32)
+                     mask=(lmk_offs[:, None] < K_LMK) & mask_d[None, :], other=0.0).to(tl.float32)
 
         s_lmk  = tl.dot(q, tl.trans(kl)) * SCALE
         lmk_ok = (lmk_offs[None, :] < K_LMK) & mask_m[:, None]
@@ -241,7 +245,7 @@ if _TRITON_AVAILABLE:
         dq   += tl.dot(ds_l.to(tl.float16), kl.to(tl.float16)).to(tl.float32)
 
         tl.store(DQ_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
-                 dq.to(Q_ptr.dtype.element_ty), mask=mask_m[:, None])
+                 dq.to(Q_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
     @triton.jit
     def _dsalt_bwd_dkdv_kernel(
@@ -258,6 +262,7 @@ if _TRITON_AVAILABLE:
         stride_lmb, stride_lmh, stride_lmk,
         N: tl.constexpr,
         D: tl.constexpr,
+        D_REAL: tl.constexpr,
         K_LMK: tl.constexpr,
         SCALE: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -271,6 +276,7 @@ if _TRITON_AVAILABLE:
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_d = tl.arange(0, D)
         mask_n = offs_n < N
+        mask_d = offs_d < D_REAL
 
         Q_bh  = Q_ptr  + pid_b * stride_qb + pid_h * stride_qh
         K_bh  = K_ptr  + pid_b * stride_kb + pid_h * stride_kh
@@ -282,17 +288,15 @@ if _TRITON_AVAILABLE:
         LM_bh = LM_ptr + pid_b * stride_lmb + pid_h * stride_lmh
 
         k_tile = tl.load(K_bh + offs_n[:, None] * stride_kn + offs_d[None, :],
-                         mask=mask_n[:, None], other=0.0).to(tl.float32)
+                         mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
         v_tile = tl.load(V_bh + offs_n[:, None] * stride_vn + offs_d[None, :],
-                         mask=mask_n[:, None], other=0.0).to(tl.float32)
+                         mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
 
         lmk_offs = tl.arange(0, K_LMK)
         lm_idx = tl.load(LM_bh + lmk_offs * stride_lmk,
-                 mask=lmk_offs < K_LMK, other=0).to(tl.int32)
-
+                         mask=lmk_offs < K_LMK, other=0).to(tl.int32)
         lm_idx = tl.where(lm_idx < 0, 0, lm_idx)
         lm_idx = tl.where(lm_idx >= N, 0, lm_idx)
-
         valid_lmk = (lmk_offs < K_LMK)
         lm_idx    = tl.where(valid_lmk, lm_idx, 0)
 
@@ -313,9 +317,9 @@ if _TRITON_AVAILABLE:
             w_i    = tl.load(W_bh + offs_m * stride_wn, mask=mask_m, other=0)
 
             q_t   = tl.load(Q_bh  + offs_m[:, None] * stride_qn + offs_d[None, :],
-                            mask=mask_m[:, None], other=0.0).to(tl.float32)
+                            mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
             do_t  = tl.load(DO_bh + offs_m[:, None] * stride_qn + offs_d[None, :],
-                            mask=mask_m[:, None], other=0.0).to(tl.float32)
+                            mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
             lse_t = tl.load(LSE_ptr + pid_b * stride_lseb + pid_h * stride_lseh + offs_m,
                             mask=mask_m, other=0.0)
 
@@ -340,9 +344,9 @@ if _TRITON_AVAILABLE:
             w_i2    = tl.load(W_bh + offs_m2 * stride_wn, mask=mask_m2, other=0)
 
             q_t2   = tl.load(Q_bh  + offs_m2[:, None] * stride_qn + offs_d[None, :],
-                             mask=mask_m2[:, None], other=0.0).to(tl.float32)
+                             mask=mask_m2[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
             do_t2  = tl.load(DO_bh + offs_m2[:, None] * stride_qn + offs_d[None, :],
-                             mask=mask_m2[:, None], other=0.0).to(tl.float32)
+                             mask=mask_m2[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
             lse_t2 = tl.load(LSE_ptr + pid_b * stride_lseb + pid_h * stride_lseh + offs_m2,
                              mask=mask_m2, other=0.0)
 
@@ -363,9 +367,9 @@ if _TRITON_AVAILABLE:
             q_blk2 += BLOCK_M
 
         tl.store(DK_bh + offs_n[:, None] * stride_kn + offs_d[None, :],
-                 dk.to(K_ptr.dtype.element_ty), mask=mask_n[:, None])
+                 dk.to(K_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
         tl.store(DV_bh + offs_n[:, None] * stride_vn + offs_d[None, :],
-                 dv.to(V_ptr.dtype.element_ty), mask=mask_n[:, None])
+                 dv.to(V_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
 
 
 def _cpu_ref_fwd(
@@ -481,10 +485,10 @@ class DSALTAttentionFunction(torch.autograd.Function):
                 K_c.stride(0), K_c.stride(1), K_c.stride(2), K_c.stride(3),
                 V_c.stride(0), V_c.stride(1), V_c.stride(2), V_c.stride(3),
                 lm.stride(0), lm.stride(1), lm.stride(2),
-                Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
+                Out.stride(0), Out.stride(1), Out.stride(2),
                 ws.stride(0), ws.stride(1), ws.stride(2),
                 LSE.stride(0), LSE.stride(1),
-                N=N, D=BD, K_LMK=K_lmk, SCALE=scale,
+                N=N, D=BD, D_REAL=D, K_LMK=K_lmk, SCALE=scale,
                 BLOCK_M=BM, BLOCK_N=BN,
                 num_warps=WARPS, num_stages=STAGES,
             )
@@ -494,14 +498,15 @@ class DSALTAttentionFunction(torch.autograd.Function):
             BD = D
 
         ctx.save_for_backward(Q, K, V, window_sizes, landmark_idx, LSE)
-        ctx.scale    = scale
-        ctx.max_win  = int(window_sizes.max().item())
+        ctx.scale      = scale
+        ctx.max_win    = int(window_sizes.max().item())
         ctx.use_triton = use_triton
-        ctx.BM       = BM
-        ctx.BN       = BN
-        ctx.BD       = BD
-        ctx.WARPS    = WARPS
-        ctx.STAGES   = STAGES
+        ctx.BM         = BM
+        ctx.BN         = BN
+        ctx.BD         = BD
+        ctx.D_REAL     = D
+        ctx.WARPS      = WARPS
+        ctx.STAGES     = STAGES
         return Out
 
     @staticmethod
@@ -515,39 +520,49 @@ class DSALTAttentionFunction(torch.autograd.Function):
             BM      = ctx.BM
             BN      = ctx.BN
             BD      = ctx.BD
+            D_REAL  = ctx.D_REAL
             WARPS   = ctx.WARPS
             STAGES  = ctx.STAGES
             scale   = ctx.scale
             max_win = ctx.max_win
 
-            dQ = torch.zeros_like(Q)
-            dK = torch.zeros_like(K)
-            dV = torch.zeros_like(V)
+            Q_c  = Q.contiguous()
+            K_c  = K.contiguous()
+            V_c  = V.contiguous()
+            ws   = window_sizes.contiguous().to(torch.int32)
+            lm   = landmark_idx.contiguous().to(torch.int32)
+            LSE_c = LSE.contiguous()
+
+            dQ = torch.zeros_like(Q_c)
+            dK = torch.zeros_like(K_c)
+            dV = torch.zeros_like(V_c)
 
             grid_dkdv = (triton.cdiv(N, BN), H, B)
             _dsalt_bwd_dkdv_kernel[grid_dkdv](
-                Q, K, V, dOut, LSE, dK, dV, window_sizes, landmark_idx,
-                Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-                K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-                V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-                window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
-                LSE.stride(0), LSE.stride(1),
-                landmark_idx.stride(0), landmark_idx.stride(1), landmark_idx.stride(2),
-                N=N, D=BD, K_LMK=K_lmk, SCALE=scale,
+                Q_c, K_c, V_c, dOut, LSE_c, dK, dV,
+                ws, lm,
+                Q_c.stride(0), Q_c.stride(1), Q_c.stride(2), Q_c.stride(3),
+                K_c.stride(0), K_c.stride(1), K_c.stride(2), K_c.stride(3),
+                V_c.stride(0), V_c.stride(1), V_c.stride(2), V_c.stride(3),
+                ws.stride(0), ws.stride(1), ws.stride(2),
+                LSE_c.stride(0), LSE_c.stride(1),
+                lm.stride(0), lm.stride(1), lm.stride(2),
+                N=N, D=BD, D_REAL=D_REAL, K_LMK=K_lmk, SCALE=scale,
                 BLOCK_M=BM, BLOCK_N=BN, MAX_WIN=max_win,
                 num_warps=WARPS, num_stages=STAGES,
             )
 
             grid_dq = (triton.cdiv(N, BM), H, B)
             _dsalt_bwd_dq_kernel[grid_dq](
-                Q, K, V, dOut, LSE, dQ, landmark_idx, window_sizes,
-                Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-                K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-                V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-                landmark_idx.stride(0), landmark_idx.stride(1), landmark_idx.stride(2),
-                window_sizes.stride(0), window_sizes.stride(1), window_sizes.stride(2),
-                LSE.stride(0), LSE.stride(1),
-                N=N, D=BD, K_LMK=K_lmk, SCALE=scale,
+                Q_c, K_c, V_c, dOut, LSE_c, dQ,
+                lm, ws,
+                Q_c.stride(0), Q_c.stride(1), Q_c.stride(2), Q_c.stride(3),
+                K_c.stride(0), K_c.stride(1), K_c.stride(2), K_c.stride(3),
+                V_c.stride(0), V_c.stride(1), V_c.stride(2), V_c.stride(3),
+                lm.stride(0), lm.stride(1), lm.stride(2),
+                ws.stride(0), ws.stride(1), ws.stride(2),
+                LSE_c.stride(0), LSE_c.stride(1),
+                N=N, D=BD, D_REAL=D_REAL, K_LMK=K_lmk, SCALE=scale,
                 BLOCK_M=BM, BLOCK_N=BN,
                 num_warps=WARPS, num_stages=STAGES,
             )
