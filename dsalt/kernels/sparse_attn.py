@@ -287,11 +287,17 @@ if _TRITON_AVAILABLE:
                          mask=mask_n[:, None], other=0.0).to(tl.float32)
 
         lmk_offs = tl.arange(0, K_LMK)
-        lm_idx   = tl.load(LM_bh + lmk_offs * stride_lmk,
-                           mask=lmk_offs < K_LMK, other=-1).to(tl.int32)
+        lm_idx = tl.load(LM_bh + lmk_offs * stride_lmk,
+                 mask=lmk_offs < K_LMK, other=0).to(tl.int32)
 
-        matches = (lm_idx[:, None] == offs_n[None, :])
-        is_lmk_n = tl.sum(matches, axis=0) > 0
+        lm_idx = tl.where(lm_idx < 0, 0, lm_idx)
+        lm_idx = tl.where(lm_idx >= N, 0, lm_idx)
+
+        valid_lmk = (lmk_offs < K_LMK)
+        lm_idx    = tl.where(valid_lmk, lm_idx, 0)
+
+        is_lmk_n = tl.sum((lm_idx[:, None] == offs_n[None, :]), axis=0)
+        is_lmk_n = is_lmk_n > 0
 
         dk = tl.zeros([BLOCK_N, D], dtype=tl.float32)
         dv = tl.zeros([BLOCK_N, D], dtype=tl.float32)
