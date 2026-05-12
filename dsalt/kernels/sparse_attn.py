@@ -290,9 +290,7 @@ if _TRITON_AVAILABLE:
         lm_idx   = tl.load(LM_bh + lmk_offs * stride_lmk,
                            mask=lmk_offs < K_LMK, other=-1).to(tl.int32)
 
-        is_lmk_n = tl.zeros([BLOCK_N], dtype=tl.int1)
-        for ki in tl.static_range(K_LMK):
-            is_lmk_n = is_lmk_n | (lm_idx[ki] == offs_n)
+        is_lmk_n = tl.any(lm_idx[:, None] == offs_n[None, :], axis=0)
 
         dk = tl.zeros([BLOCK_N, D], dtype=tl.float32)
         dv = tl.zeros([BLOCK_N, D], dtype=tl.float32)
