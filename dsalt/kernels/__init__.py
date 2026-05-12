@@ -1,3 +1,6 @@
+"""
+Questo modulo aggrega le funzioni kernel di DSALT, includendo meccanismi di attenzione, calcoli energetici e utilità per la previsione della dimensione della finestra.
+"""
 from dsalt.kernels.sparse_attn import dsalt_attention, DSALTAttentionFunction
 from dsalt.kernels.hybrid_energy import (
     compute_hybrid_energy_scores,

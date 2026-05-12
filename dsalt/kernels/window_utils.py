@@ -1,3 +1,8 @@
+"""
+Questo modulo implementa il predittore della dimensione della finestra, fornendo la classe
+WindowSizePredictor per calcolare la larghezza della finestra in base al modello e al numero
+di teste di attenzione.
+"""
 import logging
 import torch
 import torch.nn as nn

@@ -1,3 +1,6 @@
+"""
+Questo file implementa kernel per il calcolo dell'energia top-k fuso, utilizzando Triton quando disponibile.
+"""
 import logging
 import torch
 
@@ -110,7 +113,6 @@ def compute_energy(X, WV, alpha):
 
 
 def compute_energy_and_topk(X, WV, alpha, k, window_end=None):
-    # Fondamentale: i landmark non sono differenziabili, stacchiamo tutto per salvare VRAM
     with torch.no_grad():
         scores = compute_energy(X, WV, alpha)
 
@@ -122,7 +124,6 @@ def compute_energy_and_topk(X, WV, alpha, k, window_end=None):
 
     k_safe = min(k, N)
 
-    # Castiamo a half per il topk, risparmia memoria e su GPU è più veloce
     idx = torch.topk(scores.half(), k=k_safe, dim=-1, sorted=False).indices
     idx = idx.sort(dim=-1).values.to(torch.int32)
 
