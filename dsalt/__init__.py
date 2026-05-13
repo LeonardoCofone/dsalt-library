@@ -7,25 +7,26 @@ Questo pacchetto aggrega i componenti principali di DSALT, includendo:
 """
 
 from dsalt.modules.dsalt_attention import DSALTAttention
-from dsalt.modules.dsalt_transformer import DSALTTransformer, DSALTBlock, RMSNorm, SwiGLUFFN
+from dsalt.modules.dsalt_transformer import DSALTTransformerBlock, SwiGLUFFN
 from dsalt.model.dsalt_lm import DSALTLMHeadModel
-from dsalt.kernels.sparse_attn import dsalt_attention
-from dsalt.kernels.RMSENorm import compute_hybrid_energy_scores, select_landmarks, compute_landmark_idx
-from dsalt.kernels.window_utils import WindowSizePredictor
-from dsalt.training.trainer import DSALTTrainer, get_cosine_schedule_with_warmup
+from dsalt.kernels.RMSENorm import TritonRMSNorm
+from dsalt.kernels.window_utils import compute_window_sizes_triton, build_window_mask_triton
+from dsalt.kernels.landmark_tokens_ker import compute_hybrid_energy_triton, apply_yarn_rope_triton, select_landmarks
+from dsalt.kernels.sparse_attn import sparse_attention_triton, sparse_attention_pytorch_fallback
+from dsalt.training.trainer import DSALTTrainer
 
 __all__ = [
     "DSALTAttention",
-    "DSALTTransformer",
-    "DSALTBlock",
-    "RMSNorm",
+    "DSALTTransformerBlock",
     "SwiGLUFFN",
     "DSALTLMHeadModel",
-    "dsalt_attention",
-    "compute_hybrid_energy_scores",
-    "select_landmarks",
-    "compute_landmark_idx",
-    "WindowSizePredictor",
+    "TritonRMSNorm",
+    "compute_window_sizes_triton",
+    "build_window_mask_triton",
+    "compute_hybrid_energy_triton",
+    "apply_yarn_rope_triton",
+    "select_landmarks", 
+    "sparse_attention_triton",
+    "sparse_attention_pytorch_fallback",
     "DSALTTrainer",
-    "get_cosine_schedule_with_warmup",
 ]
