@@ -1,39 +1,42 @@
-"""
-Questo modulo fornisce utility per la risoluzione automatica del device (CPU/GPU) e per la stampa delle informazioni della GPU.
-"""
-import logging
+import os
 import torch
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
-logger = logging.getLogger(__name__)
+
+def setup_ddp(rank: int, world_size: int, backend: str = "nccl"):
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "12355")
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 
-def resolve_device(device: str = "cpu", num_gpus: int = 1) -> tuple[torch.device, list[int]]:
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def wrap_model_ddp(model: nn.Module, rank: int) -> DDP:
+    return DDP(model.to(rank), device_ids=[rank], output_device=rank, find_unused_parameters=False)
+
+
+def get_device(device: str, num_gpus: int) -> torch.device:
     if device == "cpu":
-        return torch.device("cpu"), []
-
+        return torch.device("cpu")
     if not torch.cuda.is_available():
-        logger.warning("CUDA not available, using CPU.")
-        return torch.device("cpu"), []
-
-    available = torch.cuda.device_count()
-    n = min(num_gpus, available)
-
-    if n <= 0:
-        return torch.device("cpu"), []
-
-    gpu_ids = list(range(n))
-    primary = torch.device(f"cuda:{gpu_ids[0]}")
-    return primary, gpu_ids
+        return torch.device("cpu")
+    if num_gpus == 1:
+        return torch.device("cuda:0")
+    return torch.device("cuda")
 
 
-def print_gpu_info() -> str:
-    if not torch.cuda.is_available():
-        return "CUDA not available."
+def model_to_device(model: nn.Module, device: torch.device, num_gpus: int) -> nn.Module:
+    model = model.to(device)
+    if device.type == "cuda" and num_gpus > 1:
+        model = nn.DataParallel(model, device_ids=list(range(num_gpus)))
+    return model
 
-    lines = [f"\n{'='*60}"]
-    for i in range(torch.cuda.device_count()):
-        p = torch.cuda.get_device_properties(i)
-        lines.append(f"GPU {i}: {p.name}  {p.total_memory/1e9:.1f}GB")
-    lines.append(f"{'='*60}\n")
-    return "\n".join(lines)
+
+def count_gpus() -> int:
+    return torch.cuda.device_count()

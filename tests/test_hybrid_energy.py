@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from dsalt.kernels.hybrid_energy import compute_hybrid_energy_scores, select_landmarks
+from dsalt.kernels.RMSENorm import compute_hybrid_energy_scores, select_landmarks
 
 
 def _random_inputs(batch=2, heads=4, seq_len=128, dim=64, device="cpu"):

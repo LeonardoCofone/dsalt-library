@@ -31,7 +31,7 @@ from dsalt.kernels.sparse_attn import (
     _cpu_reference_backward,
     dsalt_attention,
 )
-from dsalt.kernels.hybrid_energy import (
+from dsalt.kernels.RMSENorm import (
     compute_hybrid_energy_scores,
     select_landmarks,
     compute_landmark_idx,

@@ -1,13 +1,27 @@
 import math
-from typing import Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dsalt.kernels.sparse_attn import dsalt_attention
-from dsalt.kernels.energy_topk_fused import compute_energy_and_topk
-from dsalt.kernels.window_utils import WindowSizePredictor
+from ..kernels import (
+    TritonRMSNorm,
+    compute_window_sizes_triton,
+    build_window_mask_triton,
+    compute_hybrid_energy_triton,
+    apply_yarn_rope_triton,
+    select_landmarks,
+    sparse_attention_triton,
+    sparse_attention_pytorch_fallback,
+)
+
+
+def _yarn_freqs(d_head: int, max_seq_len: int, base: float = 10000.0, scale: float = 1.0):
+    inv_freq = 1.0 / (base ** (torch.arange(0, d_head, 2).float() / d_head))
+    t = torch.arange(max_seq_len).float()
+    freqs = torch.outer(t / scale, inv_freq)
+    cos = freqs.cos()
+    sin = freqs.sin()
+    return cos, sin
 
 
 class DSALTAttention(nn.Module):
@@ -15,109 +29,141 @@ class DSALTAttention(nn.Module):
         self,
         d_model: int,
         n_heads: int,
-        n_min: int     = 32,
-        n_max: int     = 256,
-        k_lmk: int     = 16,
-        alpha: float   = 0.6,
+        n_min: int,
+        n_max: int,
+        k_lmk: int,
+        max_seq_len: int,
         dropout: float = 0.0,
-        use_fa2: bool  = True,
-        gradient_checkpointing: bool = False,
-        compile_attention: bool = False,
+        yarn_scale: float = 1.0,
+        layer_idx: int = 0,
     ):
         super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.n_min = n_min
+        self.n_max = n_max
+        self.k_lmk = k_lmk
+        self.max_seq_len = max_seq_len
+        self.dropout_p = dropout
+        self.layer_idx = layer_idx
 
-        self.d_model    = d_model
-        self.n_heads    = n_heads
-        self.d_head     = d_model // n_heads
-        self.k_lmk      = k_lmk
-        self.alpha_init = alpha
-        self.dropout    = dropout
-        self.scale      = 1.0 / math.sqrt(self.d_head)
-        self.gradient_checkpointing = gradient_checkpointing
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model,     bias=False)
+        self.window_proj = nn.Linear(d_model, 1, bias=True)
 
-        alpha_init_logit = math.log(alpha / (1.0 - alpha))
-        self.alpha_w     = nn.Parameter(torch.full((n_heads,), alpha_init_logit))
-
-        self.window_pred = WindowSizePredictor(d_model, n_heads, n_min, n_max)
-
-        self._init_weights()
-
-        self._attn_fn = (
-            torch.compile(self._sparse_attn_forward, mode="reduce-overhead")
-            if compile_attention else self._sparse_attn_forward
+        self.alpha_raw = nn.Parameter(
+            torch.full((n_heads,), math.log(0.6 / 0.4))
         )
 
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.qkv_proj.weight)
-        nn.init.xavier_uniform_(self.out_proj.weight)
+        self.norm = TritonRMSNorm(d_model)
 
-    def _get_wv_weights(self) -> torch.Tensor:
-        D  = self.d_model
-        H  = self.n_heads
-        Dh = self.d_head
-        Wv = self.qkv_proj.weight[2 * D : 3 * D, :].contiguous()
-        Wv_h = Wv.reshape(H, Dh, D)
-        return Wv_h.permute(0, 2, 1).contiguous()
+        yarn_cos, yarn_sin = _yarn_freqs(self.d_head, max_seq_len, scale=yarn_scale)
+        self.register_buffer("yarn_cos", yarn_cos)
+        self.register_buffer("yarn_sin", yarn_sin)
 
-    def _sparse_attn_forward(
+    def _get_alpha(self):
+        return torch.sigmoid(self.alpha_raw)
+
+    def _apply_local_rope(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+        B, H, N, D = x.shape
+        cos = self.yarn_cos[:N, :D // 2].to(x.device)
+        sin = self.yarn_sin[:N, :D // 2].to(x.device)
+        x1 = x[..., :D // 2]
+        x2 = x[..., D // 2:]
+        x_rot = torch.cat([-x2, x1], dim=-1)
+        cos_e = cos.unsqueeze(0).unsqueeze(0)
+        sin_e = sin.unsqueeze(0).unsqueeze(0)
+        return x * cos_e + x_rot * sin_e
+
+    def _apply_yarn_to_landmarks(
         self,
-        Q: torch.Tensor,
-        K: torch.Tensor,
-        V: torch.Tensor,
-        window_sizes: torch.Tensor,
-        landmark_idx: torch.Tensor,
+        k: torch.Tensor,
+        lmk_indices: torch.Tensor,
+        seq_len: int,
     ) -> torch.Tensor:
-        return dsalt_attention(Q, K, V, window_sizes, landmark_idx)
+        B, H, N, D = k.shape
+        k_lmk_count = lmk_indices.shape[-1]
+        k_out = k.clone()
+        for b in range(B):
+            for h in range(H):
+                for ki in range(k_lmk_count):
+                    pos = lmk_indices[b, h, ki].item()
+                    if pos < 0 or pos >= N:
+                        continue
+                    tok = k[b, h, pos]
+                    cos_pos = self.yarn_cos[pos].to(k.device)
+                    sin_pos = self.yarn_sin[pos].to(k.device)
+                    rotated = apply_yarn_rope_triton(
+                        tok.unsqueeze(0),
+                        cos_pos.unsqueeze(0),
+                        sin_pos.unsqueeze(0),
+                    )
+                    k_out[b, h, pos] = rotated.squeeze(0)
+        return k_out
 
     def forward(
         self,
         x: torch.Tensor,
-        x_prev: Optional[torch.Tensor] = None,
-        return_window: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        use_triton: bool = True,
+    ) -> torch.Tensor:
+        B, N, C = x.shape
+        dtype_in = x.dtype
 
-        B, N, D = x.shape
+        x_norm = self.norm(x)
 
-        x_pred = x_prev if x_prev is not None else x
+        q = self.q_proj(x_norm).view(B, N, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(x_norm).view(B, N, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(x_norm).view(B, N, self.n_heads, self.d_head).transpose(1, 2)
 
-        window_sizes, cont_w = self.window_pred(x_pred)
+        q = self._apply_local_rope(q, N)
+        k = self._apply_local_rope(k, N)
 
-        qkv = self.qkv_proj(x)
-        qkv = qkv.view(B, N, 3, self.n_heads, self.d_head).permute(2, 0, 3, 1, 4)
-        Q, K, V = qkv[0], qkv[1], qkv[2]
+        w_logits = self.window_proj(x_norm.detach()).squeeze(-1)
+        w_cont = compute_window_sizes_triton(w_logits, self.n_min, self.n_max)
+        w_int = w_cont.round().long().clamp(self.n_min, self.n_max)
 
-        Wv    = self._get_wv_weights().detach()
-        alpha = self.alpha_w.detach()
+        window_mask_list = []
+        for b in range(B):
+            wm = build_window_mask_triton(w_int[b], N)
+            window_mask_list.append(wm)
+        window_mask = torch.stack(window_mask_list, dim=0)
 
-        landmark_idx = compute_energy_and_topk(
-            X=x_pred,
-            WV=Wv,
-            k=self.k_lmk,
-            alpha=alpha,
-        )
+        alpha_vals = self._get_alpha()
 
-        if self.gradient_checkpointing and self.training:
-            out = torch.utils.checkpoint.checkpoint(
-                self._attn_fn, Q, K, V, window_sizes, landmark_idx,
-                use_reentrant=False,
-            )
+        lmk_indices_list = []
+        for b in range(B):
+            head_lmks = []
+            xv_b = (x_norm[b] @ self.v_proj.weight.T).float()
+            x_b = x_norm[b].float()
+            for h in range(self.n_heads):
+                alpha_h = alpha_vals[h].item()
+                scores = compute_hybrid_energy_triton(x_b, xv_b, alpha_h)
+                wm_b = window_mask[b]
+                causal_wm = wm_b.any(dim=0)
+                lmk_idx = select_landmarks(scores, self.k_lmk, causal_wm)
+                pad = self.k_lmk - lmk_idx.shape[0]
+                if pad > 0:
+                    lmk_idx = F.pad(lmk_idx, (0, pad), value=0)
+                head_lmks.append(lmk_idx)
+            lmk_indices_list.append(torch.stack(head_lmks, dim=0))
+        lmk_indices = torch.stack(lmk_indices_list, dim=0)
+
+        k = self._apply_yarn_to_landmarks(k, lmk_indices, N)
+
+        if use_triton and x.is_cuda:
+            attn_out = sparse_attention_triton(q, k, v, window_mask, lmk_indices)
         else:
-            out = self._attn_fn(Q, K, V, window_sizes, landmark_idx)
+            attn_out = sparse_attention_pytorch_fallback(q, k, v, window_mask, lmk_indices)
 
-        out = out.permute(0, 2, 1, 3).contiguous().view(B, N, D)
-        out = self.out_proj(out)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, N, C)
 
-        if return_window:
-            return out, cont_w
-        return out, None
+        if self.dropout_p > 0.0 and self.training:
+            attn_out = F.dropout(attn_out, p=self.dropout_p)
 
-    def extra_repr(self) -> str:
-        return (
-            f"d_model={self.d_model}, n_heads={self.n_heads}, "
-            f"d_head={self.d_head}, k_lmk={self.k_lmk}, "
-            f"alpha_init={self.alpha_init:.2f}"
-        )
+        out = self.out_proj(attn_out.to(dtype_in))
+        return out

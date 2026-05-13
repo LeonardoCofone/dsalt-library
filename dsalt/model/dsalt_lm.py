@@ -1,76 +1,96 @@
-"""
-Questo modulo definisce il modello di linguaggio DSALTLM, integrando la classe
-DSALTTransformer e fornendo l'head per il language modeling, con configurazioni
-di dimensioni, numero di layer, teste di attenzione e altri iper‑parametri.
-"""
-from typing import Optional, Dict, Any
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from dsalt.modules.dsalt_transformer import DSALTTransformer
+from ..kernels import TritonRMSNorm
+from ..modules import DSALTTransformerBlock
 
 
 class DSALTLMHeadModel(nn.Module):
-    def __init__(self, vocab_size, d_model, n_layers, n_heads, n_min=32,
-                 n_max=256, k_lmk=16, alpha=0.6, d_ff=None,
-                 max_seq_len=2048, dropout=0.0, use_fa2=True, tie_weights=True):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        n_min: int,
+        n_max: int,
+        k_lmk: int,
+        max_seq_len: int,
+        d_ff: int | None = None,
+        dropout: float = 0.0,
+        yarn_scale: float = 1.0,
+        tie_weights: bool = True,
+    ):
         super().__init__()
-        head_dim = d_model // n_heads
-        self.transformer = DSALTTransformer(
-            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers,
-            n_heads=n_heads, n_min=n_min, n_max=n_max, k_lmk=k_lmk,
-            alpha=alpha, d_ff=d_ff, max_seq_len=max_seq_len,
-            dropout=dropout, use_fa2=use_fa2, tie_weights=tie_weights,
-        )
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.vocab_size = vocab_size
 
-    def get_input_embeddings(self):
-        return self.transformer.tok_emb
+        d_ff = d_ff if d_ff is not None else 4 * d_model
 
-    def get_output_embeddings(self):
-        return self.transformer.lm_head
+        self.embed_tokens = nn.Embedding(vocab_size, d_model)
+        self.embed_dropout = nn.Dropout(dropout)
 
-    def tie_weights(self):
-        self.transformer.lm_head.weight = self.transformer.tok_emb.weight
-
-    def forward(self, input_ids, labels=None, return_window=False):
-        logits, windows = self.transformer(
-            input_ids, return_window=return_window or labels is not None,
-        )
-        if labels is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1), ignore_index=-100,
-                reduction="mean"
+        self.layers = nn.ModuleList([
+            DSALTTransformerBlock(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_min=n_min,
+                n_max=n_max,
+                k_lmk=k_lmk,
+                max_seq_len=max_seq_len,
+                d_ff=d_ff,
+                dropout=dropout,
+                yarn_scale=yarn_scale,
+                layer_idx=i,
             )
-            return logits, windows, loss
-        return logits, windows
+            for i in range(n_layers)
+        ])
 
-    @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens=200, temperature=1.0, top_k=50,
-                 device=None, tokenizer=None):
-        if device is None:
-            device = next(self.parameters()).device
+        self.final_norm = TritonRMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-        self.eval()
-        max_seq_len = self.transformer.pos_emb.weight.shape[0]
-        ids = input_ids.to(device)
+        if tie_weights:
+            self.lm_head.weight = self.embed_tokens.weight
 
-        for _ in range(max_new_tokens):
-            ids_cond = ids[:, -max_seq_len:]
-            logits, _ = self(ids_cond)
-            logits = logits[:, -1, :] / (temperature + 1e-9)
+        self._init_weights()
 
-            if top_k > 0:
-                vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < vals[:, -1:]] = float('-inf')
+    def _init_weights(self):
+        nn.init.normal_(self.embed_tokens.weight, std=0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
-            probs = torch.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-            ids = torch.cat([ids, next_id], dim=1)
-        self.train()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        use_triton: bool = True,
+        gradient_checkpointing: bool = False,
+    ) -> dict:
+        x = self.embed_dropout(self.embed_tokens(input_ids).float())
 
-        if tokenizer is not None:
-            return tokenizer.decode(ids[0].tolist(), skip_special_tokens=True)
-        return ids
+        for layer in self.layers:
+            x = layer(x, use_triton=use_triton, gradient_checkpointing=gradient_checkpointing)
+
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, self.vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        return {"loss": loss, "logits": logits}
+
+    def num_parameters(self, trainable_only: bool = True) -> int:
+        if trainable_only:
+            return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return sum(p.numel() for p in self.parameters())
