@@ -55,24 +55,21 @@ class DSALTTrainer:
             grad_accum=grad_accum,
         )
 
+        self.device = self.accelerator.device
+
         self.model = model
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
 
         self.model, self.optimizer, self.train_loader, self.val_loader = prepare_model_training(
             self.accelerator,
-            self.model,
+            model,
             self.optimizer,
             self.train_loader,
             self.val_loader,
         )
 
-        self.use_triton = True
-
-        self.use_triton = self.device.type == "cuda"
-
-        self.optimizer = self._build_optimizer()
-        self.scheduler = self._build_scheduler()
+        self.use_triton = self.accelerator.device.type == "cuda"
 
         self.global_step = 0
         self.best_val_ppl = float("inf")
@@ -111,7 +108,8 @@ class DSALTTrainer:
 
     def _forward_step(self, batch) -> torch.Tensor:
         if isinstance(batch, (list, tuple)):
-            input_ids, labels = batch[0], batch[1]
+            input_ids = input_ids.to(self.device)
+            labels = labels.to(self.device)
         elif isinstance(batch, dict):
             input_ids = batch["input_ids"]
             labels = batch.get("labels", input_ids)
@@ -152,9 +150,9 @@ class DSALTTrainer:
                 use_triton=self.use_triton,
                 gradient_checkpointing=False,
             )
-            n_tokens = (labels[:, 1:] != -100).sum().item()
+            n_tokens = (labels[:, 1:] != -100).sum()
             total_loss += out["loss"].item() * n_tokens
-            total_tokens += n_tokens
+            total_tokens += n_tokens.item()
 
         avg_loss = total_loss / max(1, total_tokens)
         ppl = math.exp(min(avg_loss, 20.0))
