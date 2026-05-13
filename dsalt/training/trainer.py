@@ -52,7 +52,6 @@ class DSALTTrainer:
         save_every: int = 1000,
         save_dir: str = "./checkpoints_dsalt",
         mixed_precision: str = "bf16",
-        window_reg_coef: float = 0.01,
         gradient_checkpointing: bool = False,
         compile_model: bool = False,
         ddp_backend: str = "nccl",
@@ -73,7 +72,6 @@ class DSALTTrainer:
         self.val_every             = val_every
         self.save_every            = save_every
         self.save_dir              = Path(save_dir)
-        self.window_reg_coef       = window_reg_coef
         self.gradient_checkpointing = gradient_checkpointing
         self.compile_model         = compile_model
         self.ddp_backend           = ddp_backend
@@ -175,11 +173,7 @@ class DSALTTrainer:
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    def _window_reg_loss(self) -> torch.Tensor:
-        reg = torch.tensor(0.0, device=self.device)
-        for layer in self._unwrap().layers:
-            reg = reg + layer.attn.window_proj.weight.pow(2).mean()
-        return self.window_reg_coef * reg
+
 
     def _extract_batch(self, batch):
         if isinstance(batch, (list, tuple)):
@@ -203,11 +197,11 @@ class DSALTTrainer:
             with torch.autocast(device_type=self.device.type, dtype=self._amp_dtype):
                 out  = self.model(ids, labels=labels, use_triton=self.use_triton,
                                   gradient_checkpointing=self.gradient_checkpointing)
-                loss = out["loss"] + self._window_reg_loss()
+                loss = out["loss"]
         else:
             out  = self.model(ids, labels=labels, use_triton=self.use_triton,
                               gradient_checkpointing=self.gradient_checkpointing)
-            loss = out["loss"] + self._window_reg_loss()
+            loss = out["loss"]
 
         return loss
 
