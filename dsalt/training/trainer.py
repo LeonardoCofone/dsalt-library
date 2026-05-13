@@ -58,16 +58,16 @@ class DSALTTrainer:
         self.device = self.accelerator.device
 
         self.model = model
-        self.scheduler = self._build_scheduler()
         self.optimizer = self._build_optimizer()
 
-        self.model, self.optimizer, self.train_loader, self.val_loader = prepare_model_training(
-            self.accelerator,
-            model,
+        self.model, self.optimizer, self.train_loader, self.val_loader = self.accelerator.prepare(
+            self.model,
             self.optimizer,
             self.train_loader,
             self.val_loader,
         )
+
+        self.scheduler = self._build_scheduler(self.optimizer)
 
         self.use_triton = self.device.type == "cuda"
 
@@ -90,13 +90,14 @@ class DSALTTrainer:
         ]
         return torch.optim.AdamW(groups, lr=self.lr, betas=(0.9, 0.95), eps=1e-8)
 
-    def _build_scheduler(self):
+    def _build_scheduler(self, optimizer):
         def lr_lambda(step: int) -> float:
             if step < self.warmup_steps:
                 return float(step) / max(1, self.warmup_steps)
             progress = float(step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
             return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
-        return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     def _window_regularization_loss(self) -> torch.Tensor:
         device = next(self.model.parameters()).device
