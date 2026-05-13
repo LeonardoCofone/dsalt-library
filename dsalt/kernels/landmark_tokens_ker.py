@@ -21,19 +21,19 @@ def _hybrid_energy_kernel(
     x_base = x_ptr + pid * D
     xv_base = xv_ptr + pid * D
 
-    acc_x = tl.zeros([BLOCK_D], dtype=tl.float32)
-    acc_v = tl.zeros([BLOCK_D], dtype=tl.float32)
+    acc_x = 0.0
+    acc_v = 0.0
 
     for off in range(0, D, BLOCK_D):
         cols = off + tl.arange(0, BLOCK_D)
         mask = cols < D
         xval = tl.load(x_base + cols, mask=mask, other=0.0).to(tl.float32)
         vval = tl.load(xv_base + cols, mask=mask, other=0.0).to(tl.float32)
-        acc_x += xval * xval
-        acc_v += vval * vval
+        acc_x += tl.sum(xval * xval)
+        acc_v += tl.sum(vval * vval)
 
-    norm_x = tl.sqrt(tl.sum(acc_x))
-    norm_v = tl.sqrt(tl.sum(acc_v))
+    norm_x = tl.sqrt(acc_x)
+    norm_v = tl.sqrt(acc_v)
 
     z_x = (norm_x - mu_x) / (sigma_x + 1e-8)
     z_v = (norm_v - mu_v) / (sigma_v + 1e-8)
@@ -108,6 +108,7 @@ def apply_yarn_rope_triton(
     sin: torch.Tensor,
 ) -> torch.Tensor:
     N, D = x.shape
+    assert D % 2 == 0
     out = torch.empty_like(x, dtype=torch.float32)
     BLOCK_D = min(128, triton.next_power_of_2(D // 2))
     _yarn_rope_kernel[(N,)](
@@ -121,13 +122,9 @@ def apply_yarn_rope_triton(
     return out.to(x.dtype)
 
 
-def select_landmarks(
-    scores: torch.Tensor,
-    k: int,
-    window_mask: torch.Tensor,
-) -> torch.Tensor:
+def select_landmarks(scores, k, window_mask):
     outside = ~window_mask
-    masked_scores = scores.clone()
-    masked_scores[~outside] = -float("inf")
-    _, indices = torch.topk(masked_scores, k=min(k, (outside).sum().item()))
+    scores = torch.where(outside, scores, torch.tensor(float("-inf"), device=scores.device))
+    k = min(k, int(outside.sum().detach().cpu()))
+    _, indices = torch.topk(scores, k)
     return indices

@@ -16,7 +16,6 @@ def count_gpus():
 def init_accelerator(
     mixed_precision: str = "fp16",
     grad_accum: int = 1,
-    num_processes: int = None,
 ):
     accelerator = Accelerator(
         mixed_precision=mixed_precision,
@@ -24,7 +23,6 @@ def init_accelerator(
         device_placement=True,
         split_batches=True,
         step_scheduler_with_optimizer=False,
-        num_processes=num_processes,
     )
     return accelerator
 
