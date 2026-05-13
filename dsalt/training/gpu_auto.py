@@ -1,17 +1,12 @@
 import os
 import torch
-from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed
+import torch.distributed as dist
 
 
-def get_device() -> torch.device:
+def get_device(rank: int = 0) -> torch.device:
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        return torch.device(f"cuda:{rank}")
     return torch.device("cpu")
-
-
-def count_gpus() -> int:
-    return torch.cuda.device_count()
 
 
 def get_gpu_memory_stats(device: torch.device | None = None) -> dict[str, float]:
@@ -29,37 +24,22 @@ def get_gpu_memory_stats(device: torch.device | None = None) -> dict[str, float]
     }
 
 
-def init_accelerator(
-    mixed_precision: str = "bf16",
-    grad_accum: int = 1,
-    log_dir: str = "./logs",
-    seed: int = 42,
-) -> Accelerator:
-    set_seed(seed)
-
-    project_cfg = ProjectConfiguration(project_dir=log_dir, logging_dir=log_dir)
-
-    accelerator = Accelerator(
-        mixed_precision=mixed_precision,
-        gradient_accumulation_steps=grad_accum,
-        device_placement=True,
-        split_batches=False,
-        step_scheduler_with_optimizer=False,
-        project_config=project_cfg,
-        dynamo_backend="no",
-    )
-
-    if accelerator.is_main_process:
-        n = count_gpus()
-        print(
-            f"[accelerate] processes={accelerator.num_processes} | "
-            f"gpus_visible={n} | "
-            f"mixed_precision={mixed_precision} | "
-            f"grad_accum={grad_accum}"
-        )
-
-    return accelerator
+def setup_ddp(rank: int, world_size: int, backend: str = "nccl") -> None:
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", str(10000 + (os.getpid() % 50000)))
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 
-def prepare_model_training(accelerator, model, optimizer, train_loader, val_loader, scheduler):
-    return accelerator.prepare(model, optimizer, train_loader, val_loader, scheduler)
+def cleanup_ddp() -> None:
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank: int = 0) -> bool:
+    return rank == 0
+
+
+def barrier(rank: int, world_size: int) -> None:
+    if world_size > 1 and dist.is_initialized():
+        dist.barrier()
