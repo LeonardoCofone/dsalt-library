@@ -38,10 +38,13 @@ class DSALTAttention(nn.Module):
         layer_idx: int = 0,
     ):
         super().__init__()
+
         assert d_model % n_heads == 0
+
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+
         self.n_min = n_min
         self.n_max = n_max
         self.k_lmk = k_lmk
@@ -62,23 +65,34 @@ class DSALTAttention(nn.Module):
 
         self.norm = TritonRMSNorm(d_model)
 
-        yarn_cos, yarn_sin = _yarn_freqs(self.d_head, max_seq_len, scale=yarn_scale)
-        self.register_buffer("yarn_cos", yarn_cos)
-        self.register_buffer("yarn_sin", yarn_sin)
+        cos, sin = _yarn_freqs(self.d_head, max_seq_len, scale=yarn_scale)
+
+        self.register_buffer("yarn_cos", cos)
+        self.register_buffer("yarn_sin", sin)
+
+        self.yarn_scale = yarn_scale
+
+        self.dropout = nn.Dropout(dropout)
 
     def _get_alpha(self):
         return torch.sigmoid(self.alpha_raw)
 
     def _apply_local_rope(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
         B, H, N, D = x.shape
-        cos = self.yarn_cos[:N, :D // 2].to(x.device)
-        sin = self.yarn_sin[:N, :D // 2].to(x.device)
-        x1 = x[..., :D // 2]
-        x2 = x[..., D // 2:]
-        x_rot = torch.cat([-x2, x1], dim=-1)
-        cos_e = cos.unsqueeze(0).unsqueeze(0)
-        sin_e = sin.unsqueeze(0).unsqueeze(0)
-        return x * cos_e + x_rot * sin_e
+
+        cos = self.yarn_cos[:N, : D // 2].to(x.device)
+        sin = self.yarn_sin[:N, : D // 2].to(x.device)
+
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+
+        x1 = x[..., : D // 2]
+        x2 = x[..., D // 2 :]
+
+        return torch.cat([
+            x1 * cos - x2 * sin,
+            x2 * cos + x1 * sin
+        ], dim=-1)
 
     def _apply_yarn_to_landmarks(
         self,
