@@ -22,14 +22,14 @@ class DSALTLMHeadModel(nn.Module):
         tie_weights: bool = True,
     ):
         super().__init__()
-        self.d_model = d_model
-        self.n_layers = n_layers
+        self.d_model    = d_model
+        self.n_layers   = n_layers
         self.vocab_size = vocab_size
 
         d_ff = d_ff if d_ff is not None else 4 * d_model
 
-        self.embed_tokens = nn.Embedding(vocab_size, d_model)
-        self.embed_dropout = nn.Dropout(dropout)
+        self.embed_tokens   = nn.Embedding(vocab_size, d_model)
+        self.embed_dropout  = nn.Dropout(dropout)
 
         self.layers = nn.ModuleList([
             DSALTTransformerBlock(
@@ -48,7 +48,7 @@ class DSALTLMHeadModel(nn.Module):
         ])
 
         self.final_norm = TritonRMSNorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head    = nn.Linear(d_model, vocab_size, bias=False)
 
         if tie_weights:
             self.lm_head.weight = self.embed_tokens.weight
@@ -70,21 +70,19 @@ class DSALTLMHeadModel(nn.Module):
         use_triton: bool = True,
         gradient_checkpointing: bool = False,
     ) -> dict:
-        x = self.embed_dropout(self.embed_tokens(input_ids).float())
+        x = self.embed_dropout(self.embed_tokens(input_ids))
 
         for layer in self.layers:
             x = layer(x, use_triton=use_triton, gradient_checkpointing=gradient_checkpointing)
 
-        x = self.final_norm(x)
+        x      = self.final_norm(x)
         logits = self.lm_head(x)
 
         loss = None
         if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
             loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, self.vocab_size),
-                shift_labels.view(-1),
+                logits[:, :-1, :].contiguous().view(-1, self.vocab_size),
+                labels[:, 1:].contiguous().view(-1),
                 ignore_index=-100,
             )
 

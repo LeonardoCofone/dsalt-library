@@ -266,9 +266,7 @@ class DSALTTrainer:
         if self.device.type == "cuda":
             stats   = get_gpu_memory_stats(self.device)
             mem_str = (
-                f" | mem={stats.get('allocated_gb', 0):.1f}/"
-                f"{stats.get('total_gb', 0):.1f}GB"
-                f"({stats.get('utilization_pct', 0):.0f}%)"
+                f" | mem={stats.get('allocated_gb', 0):.1f}GB "
             )
 
         base = self._unwrap()
@@ -285,12 +283,11 @@ class DSALTTrainer:
         )
 
         self.logger.info(
-            f"[{mode}] step={self.global_step:6d}/{self.total_steps}"
+            f"[{mode}] step ={self.global_step:3d}/{self.total_steps}"
             f" | loss={accum_loss:.4f}"
             f" | ppl={ppl:.2f}"
             f" | lr={lr_now:.2e}"
-            f" | {it_s:.1f}it/s"
-            f" | {tok_s:,}tok/s"
+            f" | {it_s:.2f}it/s"
             f"{mem_str}"
             f"{eff_rank_str}"
         )
@@ -360,7 +357,7 @@ class DSALTTrainer:
                 val_ppl = self._validate()
                 if self.is_main:
                     self.logger.info(
-                        f"step={self.global_step:6d} | val_ppl={val_ppl:.4f}"
+                        f"step ={self.global_step:3d} | val_ppl={val_ppl:.4f}"
                         + (" ← best" if val_ppl < self.best_val_ppl else "")
                     )
                 if val_ppl < self.best_val_ppl:
