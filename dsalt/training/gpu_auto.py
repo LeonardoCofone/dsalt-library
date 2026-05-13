@@ -27,8 +27,18 @@ def init_accelerator(
     return accelerator
 
 
-def prepare_model_training(accelerator, model, optimizer, train_loader, val_loader):
-    model, optimizer, train_loader, val_loader = accelerator.prepare(
-        model, optimizer, train_loader, val_loader
+def prepare_model_training(
+    accelerator,
+    model,
+    optimizer,
+    train_loader,
+    val_loader,
+    scheduler,
+):
+    return accelerator.prepare(
+        model,
+        optimizer,
+        train_loader,
+        val_loader,
+        scheduler,
     )
-    return model, optimizer, train_loader, val_loader

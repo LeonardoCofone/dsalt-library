@@ -58,8 +58,8 @@ class DSALTTrainer:
         self.device = self.accelerator.device
 
         self.model = model
-        self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
+        self.optimizer = self._build_optimizer()
 
         self.model, self.optimizer, self.train_loader, self.val_loader = prepare_model_training(
             self.accelerator,
@@ -69,7 +69,7 @@ class DSALTTrainer:
             self.val_loader,
         )
 
-        self.use_triton = self.accelerator.device.type == "cuda"
+        self.use_triton = self.device.type == "cuda"
 
         self.global_step = 0
         self.best_val_ppl = float("inf")
@@ -99,8 +99,9 @@ class DSALTTrainer:
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     def _window_regularization_loss(self) -> torch.Tensor:
-        reg = torch.tensor(0.0, device=self.device)
-        base_model = self.model.module if hasattr(self.model, "module") else self.model
+        device = next(self.model.parameters()).device
+        reg = torch.tensor(0.0, device=device)
+        base_model = self.accelerator.unwrap_model(self.model)
         for layer in base_model.layers:
             w_proj = layer.attn.window_proj
             reg = reg + w_proj.weight.pow(2).mean()
@@ -108,14 +109,16 @@ class DSALTTrainer:
 
     def _forward_step(self, batch) -> torch.Tensor:
         if isinstance(batch, (list, tuple)):
-            input_ids = input_ids.to(self.device)
-            labels = labels.to(self.device)
+            input_ids, labels = batch[0], batch[1]
         elif isinstance(batch, dict):
             input_ids = batch["input_ids"]
             labels = batch.get("labels", input_ids)
         else:
             input_ids = batch
             labels = input_ids
+
+        input_ids = input_ids.to(self.device)
+        labels = labels.to(self.device)
 
         with self.accelerator.autocast():
             out = self.model(
@@ -150,9 +153,10 @@ class DSALTTrainer:
                 use_triton=self.use_triton,
                 gradient_checkpointing=False,
             )
-            n_tokens = (labels[:, 1:] != -100).sum()
+            n_tokens = (labels[:, 1:] != -100).sum().item()
+
+            total_tokens += n_tokens
             total_loss += out["loss"].item() * n_tokens
-            total_tokens += n_tokens.item()
 
         avg_loss = total_loss / max(1, total_tokens)
         ppl = math.exp(min(avg_loss, 20.0))
@@ -160,7 +164,7 @@ class DSALTTrainer:
         return ppl
 
     def _save_checkpoint(self, tag: str):
-        base_model = self.model.module if hasattr(self.model, "module") else self.model
+        base_model = self.accelerator.unwrap_model(self.model)
         ckpt = {
             "step": self.global_step,
             "model_state_dict": base_model.state_dict(),
@@ -175,7 +179,7 @@ class DSALTTrainer:
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        base_model = self.model.module if hasattr(self.model, "module") else self.model
+        base_model = self.accelerator.unwrap_model(self.model)
         base_model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
