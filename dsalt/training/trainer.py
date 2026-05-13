@@ -89,7 +89,7 @@ class DSALTTrainer:
         self._amp_dtype = self._resolve_amp_dtype(mixed_precision)
         self._use_amp   = self._amp_dtype is not None
         self._scaler    = (
-            torch.cuda.amp.GradScaler()
+            torch.amp.GradScaler("cuda")
             if self._use_amp and self._amp_dtype == torch.float16
             else None
         )
@@ -104,7 +104,8 @@ class DSALTTrainer:
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=False,
+                find_unused_parameters=True,
+                gradient_as_bucket_view=True,
             )
 
         self.model = model
