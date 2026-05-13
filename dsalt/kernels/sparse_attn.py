@@ -45,13 +45,13 @@ def _sparse_attn_fwd_kernel(
             k_base = K_ptr + pid_b * stride_kb + pid_h * stride_kh + k_pos * stride_kn
             v_base = V_ptr + pid_b * stride_vb + pid_h * stride_vh + k_pos * stride_vn
 
-            dot = tl.zeros([1], dtype=tl.float32)
+            dot = 0.0
             for off in range(0, D, BLOCK_D):
                 cols = off + tl.arange(0, BLOCK_D)
                 mask_d = cols < D
                 k_val = tl.load(k_base + cols, mask=mask_d, other=0.0).to(tl.float32)
-                dot += tl.sum(q * k_val, axis=0)
-            dot = dot[0] * scale
+                dot = dot + tl.sum(q * tl.where(mask_d, k_val, 0.0), axis=0)
+            dot = dot * scale
 
             m_new    = tl.maximum(m_i, dot)
             rescale  = tl.exp(m_i - m_new)
@@ -74,13 +74,13 @@ def _sparse_attn_fwd_kernel(
             k_base = K_ptr + pid_b * stride_kb + pid_h * stride_kh + lmk_pos * stride_kn
             v_base = V_ptr + pid_b * stride_vb + pid_h * stride_vh + lmk_pos * stride_vn
 
-            dot = tl.zeros([1], dtype=tl.float32)
+            dot = 0.0
             for off in range(0, D, BLOCK_D):
                 cols  = off + tl.arange(0, BLOCK_D)
                 mask_d = cols < D
                 k_val = tl.load(k_base + cols, mask=mask_d, other=0.0).to(tl.float32)
-                dot  += tl.sum(q * k_val, axis=0)
-            dot = dot[0] * scale
+                dot = dot + tl.sum(q * tl.where(mask_d, k_val, 0.0), axis=0)
+            dot = dot * scale
 
             m_new   = tl.maximum(m_i, dot)
             rescale = tl.exp(m_i - m_new)
