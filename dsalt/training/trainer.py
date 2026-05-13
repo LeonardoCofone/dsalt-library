@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from .gpu_auto import get_device, model_to_device
+from .gpu_auto import init_accelerator, prepare_model_training
 from .logging_config import get_logger
 
 
@@ -50,8 +50,24 @@ class DSALTTrainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.logger = get_logger("dsalt.trainer", log_dir=str(self.save_dir))
 
-        self.device = get_device(device, num_gpus)
-        self.model = model_to_device(model, self.device, num_gpus if device == "cuda" else 1)
+        self.accelerator = init_accelerator(
+            mixed_precision="fp16",
+            grad_accum=grad_accum,
+        )
+
+        self.model = model
+        self.optimizer = self._build_optimizer()
+        self.scheduler = self._build_scheduler()
+
+        self.model, self.optimizer, self.train_loader, self.val_loader = prepare_model_training(
+            self.accelerator,
+            self.model,
+            self.optimizer,
+            self.train_loader,
+            self.val_loader,
+        )
+
+        self.use_triton = True
 
         self.use_triton = self.device.type == "cuda"
 
@@ -95,22 +111,24 @@ class DSALTTrainer:
 
     def _forward_step(self, batch) -> torch.Tensor:
         if isinstance(batch, (list, tuple)):
-            input_ids, labels = batch[0].to(self.device), batch[1].to(self.device)
+            input_ids, labels = batch[0], batch[1]
         elif isinstance(batch, dict):
-            input_ids = batch["input_ids"].to(self.device)
-            labels = batch.get("labels", input_ids).to(self.device)
+            input_ids = batch["input_ids"]
+            labels = batch.get("labels", input_ids)
         else:
-            input_ids = batch.to(self.device)
+            input_ids = batch
             labels = input_ids
 
-        out = self.model(
-            input_ids,
-            labels=labels,
-            use_triton=self.use_triton,
-            gradient_checkpointing=self.gradient_checkpointing,
-        )
-        loss = out["loss"]
-        loss = loss + self._window_regularization_loss()
+        with self.accelerator.autocast():
+            out = self.model(
+                input_ids,
+                labels=labels,
+                use_triton=self.use_triton,
+                gradient_checkpointing=self.gradient_checkpointing,
+            )
+            loss = out["loss"]
+            loss = loss + self._window_regularization_loss()
+
         return loss
 
     @torch.no_grad()
@@ -154,7 +172,8 @@ class DSALTTrainer:
         }
         path = self.save_dir / f"checkpoint_{tag}.pt"
         torch.save(ckpt, path)
-        self.logger.info(f"Saved checkpoint: {path}")
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Saved checkpoint: {path}")
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
@@ -164,7 +183,8 @@ class DSALTTrainer:
         self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         self.global_step = ckpt["step"]
         self.best_val_ppl = ckpt.get("best_val_ppl", float("inf"))
-        self.logger.info(f"Resumed from step {self.global_step}")
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Resumed from step {self.global_step}")
 
     def train(self):
         self.model.train()
@@ -173,11 +193,12 @@ class DSALTTrainer:
         data_iter = iter(self.train_loader)
         accum_loss = 0.0
 
-        self.logger.info(
-            f"Starting training | total_steps={self.total_steps} | "
-            f"grad_accum={self.grad_accum} | device={self.device} | "
-            f"triton={self.use_triton} | gc={self.gradient_checkpointing}"
-        )
+        if self.accelerator.is_main_process:
+            self.logger.info(
+                f"Starting training | total_steps={self.total_steps} | "
+                f"grad_accum={self.grad_accum} | device={self.device} | "
+                f"triton={self.use_triton} | gc={self.gradient_checkpointing}"
+            )
 
         while self.global_step < self.total_steps:
             for micro_step in range(self.grad_accum):
@@ -188,10 +209,10 @@ class DSALTTrainer:
                     batch = next(data_iter)
 
                 loss = self._forward_step(batch) / self.grad_accum
-                loss.backward()
+                self.accelerator.backward(loss)
                 accum_loss += loss.item()
 
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             self.optimizer.step()
             self.scheduler.step()
             self.optimizer.zero_grad()
@@ -199,17 +220,19 @@ class DSALTTrainer:
 
             if self.global_step % self.log_every == 0:
                 lr_now = self.scheduler.get_last_lr()[0]
-                self.logger.info(
-                    f"step={self.global_step:6d} | "
-                    f"loss={accum_loss:.4f} | "
-                    f"ppl={math.exp(min(accum_loss, 20.0)):.2f} | "
-                    f"lr={lr_now:.2e}"
-                )
+                if self.accelerator.is_main_process:
+                    self.logger.info(
+                        f"step={self.global_step:6d} | "
+                        f"loss={accum_loss:.4f} | "
+                        f"ppl={math.exp(min(accum_loss, 20.0)):.2f} | "
+                        f"lr={lr_now:.2e}"
+                    )
                 accum_loss = 0.0
 
             if self.global_step % self.val_every == 0:
                 val_ppl = self._validate()
-                self.logger.info(f"step={self.global_step:6d} | val_ppl={val_ppl:.4f}")
+                if self.accelerator.is_main_process:
+                    self.logger.info(f"step={self.global_step:6d} | val_ppl={val_ppl:.4f}")
                 if val_ppl < self.best_val_ppl:
                     self.best_val_ppl = val_ppl
                     self._save_checkpoint("best")
@@ -221,4 +244,5 @@ class DSALTTrainer:
                 break
 
         self._save_checkpoint("final")
-        self.logger.info(f"Training complete | best_val_ppl={self.best_val_ppl:.4f}")
+        if self.accelerator.is_main_process:
+           self.logger.info(f"Training complete | best_val_ppl={self.best_val_ppl:.4f}")

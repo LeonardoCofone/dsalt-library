@@ -1,42 +1,36 @@
-import os
 import torch
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
+from accelerate import Accelerator
 
 
-def setup_ddp(rank: int, world_size: int, backend: str = "nccl"):
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "12355")
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
-def cleanup_ddp():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def wrap_model_ddp(model: nn.Module, rank: int) -> DDP:
-    return DDP(model.to(rank), device_ids=[rank], output_device=rank, find_unused_parameters=False)
-
-
-def get_device(device: str, num_gpus: int) -> torch.device:
-    if device == "cpu":
-        return torch.device("cpu")
-    if not torch.cuda.is_available():
-        return torch.device("cpu")
-    if num_gpus == 1:
-        return torch.device("cuda:0")
-    return torch.device("cuda")
-
-
-def model_to_device(model: nn.Module, device: torch.device, num_gpus: int) -> nn.Module:
-    model = model.to(device)
-    if device.type == "cuda" and num_gpus > 1:
-        model = nn.DataParallel(model, device_ids=list(range(num_gpus)))
-    return model
-
-
-def count_gpus() -> int:
+def count_gpus():
     return torch.cuda.device_count()
+
+
+def init_accelerator(
+    mixed_precision: str = "fp16",
+    grad_accum: int = 1,
+    num_processes: int = None,
+):
+    accelerator = Accelerator(
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=grad_accum,
+        device_placement=True,
+        split_batches=True,
+        step_scheduler_with_optimizer=False,
+        num_processes=num_processes,
+    )
+    return accelerator
+
+
+def prepare_model_training(accelerator, model, optimizer, train_loader, val_loader):
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader
+    )
+    return model, optimizer, train_loader, val_loader
