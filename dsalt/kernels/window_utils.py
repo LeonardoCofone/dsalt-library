@@ -34,6 +34,31 @@ def build_local_window_mask(
     return local_mask
 
 
+def build_soft_window_bias(
+    seq_len: int,
+    window_sizes: torch.Tensor,
+    device: torch.device,
+    causal: bool = True,
+) -> torch.Tensor:
+    positions = torch.arange(seq_len, device=device, dtype=window_sizes.dtype)
+    i_idx = positions.unsqueeze(1)
+    j_idx = positions.unsqueeze(0)
+
+    w = window_sizes.unsqueeze(1)
+
+    dist = i_idx - j_idx
+    in_window_soft = torch.sigmoid(w - dist)
+
+    if causal:
+        causal_mask = (j_idx <= i_idx).to(window_sizes.dtype)
+        in_window_soft = in_window_soft * causal_mask
+
+    hard_mask = build_local_window_mask(seq_len, window_sizes, device, causal)
+    bias = in_window_soft.masked_fill(~hard_mask, 0.0)
+
+    return bias
+
+
 def build_local_window_mask_packed(
     cu_seqlens: torch.Tensor,
     window_sizes: torch.Tensor,
@@ -58,6 +83,41 @@ def build_local_window_mask_packed(
         mask[start:end, start:end] = local
 
     return mask
+
+
+def build_soft_window_bias_packed(
+    cu_seqlens: torch.Tensor,
+    window_sizes: torch.Tensor,
+    total_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    bias = torch.zeros(total_len, total_len, dtype=window_sizes.dtype, device=device)
+
+    for b in range(len(cu_seqlens) - 1):
+        start = cu_seqlens[b].item()
+        end = cu_seqlens[b + 1].item()
+        seq_len = end - start
+
+        local_w = window_sizes[start:end]
+
+        positions = torch.arange(seq_len, device=device, dtype=window_sizes.dtype)
+        i_idx = positions.unsqueeze(1)
+        j_idx = positions.unsqueeze(0)
+        w = local_w.unsqueeze(1)
+
+        dist = i_idx - j_idx
+        soft = torch.sigmoid(w - dist)
+        causal_mask = (j_idx <= i_idx).to(window_sizes.dtype)
+        soft = soft * causal_mask
+
+        local_w_int = local_w.long().clamp(min=1, max=seq_len)
+        w_int = local_w_int.unsqueeze(1)
+        hard = (j_idx.long() >= (i_idx.long() - w_int + 1)) & (j_idx.long() <= i_idx.long())
+        soft = soft.masked_fill(~hard, 0.0)
+
+        bias[start:end, start:end] = soft
+
+    return bias
 
 
 def apply_rotary_emb(
