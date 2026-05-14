@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..kernels.sparse_attn import build_window_mask_batched, sparse_attention_pytorch_fallback
+from ..kernels.sparse_attn import sparse_attention_forward
 
 
 def _yarn_freqs(d_head: int, max_seq_len: int, base: float = 10000.0, scale: float = 1.0):
@@ -61,13 +61,11 @@ class DSALTAttention(nn.Module):
     def _compute_lmk_indices(
         self,
         x_norm: torch.Tensor,
-        window_mask: torch.Tensor,
+        w_int: torch.Tensor,
     ) -> torch.Tensor:
-        B, N, C = x_norm.shape
+        B, N, _ = x_norm.shape
         H = self.n_heads
         device = x_norm.device
-
-        alpha_vals = torch.sigmoid(self.alpha_raw)
 
         x_f = x_norm.float()
         xv = x_f @ self.v_proj.weight.float().T
@@ -80,20 +78,25 @@ class DSALTAttention(nn.Module):
         mu_v = nv.mean(dim=-1, keepdim=True)
         sg_v = nv.std(dim=-1, keepdim=True).clamp(min=1e-8)
 
-        z_x = (nx - mu_x) / sg_x
-        z_v = (nv - mu_v) / sg_v
+        z_x = ((nx - mu_x) / sg_x).unsqueeze(1).expand(B, H, N)
+        z_v = ((nv - mu_v) / sg_v).unsqueeze(1).expand(B, H, N)
 
-        alpha_exp = alpha_vals.view(1, H, 1)
-        z_x_exp = z_x.unsqueeze(1).expand(B, H, N)
-        z_v_exp = z_v.unsqueeze(1).expand(B, H, N)
-        scores = alpha_exp * z_v_exp + (1.0 - alpha_exp) * z_x_exp
+        alpha = torch.sigmoid(self.alpha_raw).view(1, H, 1)
+        scores = alpha * z_v + (1.0 - alpha) * z_x
 
-        in_any_window = window_mask.any(dim=1)
-        outside = (~in_any_window).unsqueeze(1).expand(B, H, N)
-        scores = scores.masked_fill(~outside, float("-inf"))
+        i_idx = torch.arange(N, device=device).view(1, 1, N)
+        col_off = torch.arange(int(w_int.max().item()), device=device).view(1, 1, 1, -1)
+        j_win = (i_idx.unsqueeze(-1) - col_off).clamp(min=0)
+        w_exp = w_int.unsqueeze(1).unsqueeze(-1)
+        in_win_mask = (col_off < w_exp) & (col_off <= i_idx.unsqueeze(-1))
+
+        in_window = torch.zeros(B, N, dtype=torch.bool, device=device)
+        in_window.scatter_(1, j_win.squeeze(1).view(B, -1).clamp(0, N - 1),
+                           in_win_mask.squeeze(1).view(B, -1))
+
+        scores = scores.masked_fill(in_window.unsqueeze(1).expand(B, H, N), float("-inf"))
 
         _, lmk_indices = torch.topk(scores, self.k_lmk, dim=-1, sorted=False)
-
         return lmk_indices
 
     def forward(
@@ -116,11 +119,9 @@ class DSALTAttention(nn.Module):
         w_cont = self.n_min + torch.sigmoid(w_logits) * (self.n_max - self.n_min)
         w_int = w_cont.round().long().clamp(self.n_min, self.n_max)
 
-        window_mask = build_window_mask_batched(w_int, N)
+        lmk_indices = self._compute_lmk_indices(x_norm, w_int)
 
-        lmk_indices = self._compute_lmk_indices(x_norm, window_mask)
-
-        attn_out = sparse_attention_pytorch_fallback(q, k, v, window_mask, lmk_indices)
+        attn_out = sparse_attention_forward(q, k, v, w_int, lmk_indices)
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, N, C)
 
