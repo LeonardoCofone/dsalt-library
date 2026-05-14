@@ -258,41 +258,38 @@ class DSALTTrainer:
         if not self.is_main:
             return
 
-        it_s    = self._timer.avg_it_s
-        tok_s   = int(it_s * self._tokens_per_batch * self.grad_accum)
-        lr_now  = self.scheduler.get_last_lr()[0]
-        ppl     = math.exp(min(accum_loss, 20.0))
-        mem_str = ""
-        eff_rank_str = ""
-
+        stats = self._timer.stop()
+        it_s = stats.get("it_s", 0.0)
+        tok_s = int(it_s * self._tokens_per_batch * self.grad_accum)
+        lr_now = self.scheduler.get_last_lr()[0]
+        ppl = math.exp(min(accum_loss, 20.0))
+        
+        mem_gb = 0.0
         if self.device.type == "cuda":
-            stats   = get_gpu_memory_stats(self.device)
-            mem_str = (
-                f" | mem={stats.get('allocated_gb', 0):.1f}GB "
-            )
+            gpu_stats = get_gpu_memory_stats(self.device)
+            mem_gb = gpu_stats.get("allocated_gb", 0.0)
 
+        eff_r = 0.0
         base = self._unwrap()
         if hasattr(base, "layers") and len(base.layers) > 0:
             layer = base.layers[0]
             if hasattr(layer, "attn") and hasattr(layer.attn, "window_proj"):
-                eff_r        = _effective_rank(layer.attn.window_proj.weight)
-                eff_rank_str = f" | eff_rank={eff_r:.1f}"
+                eff_r = _effective_rank(layer.attn.window_proj.weight)
 
-        mode = (
-            "CPU"
-            if self.device.type == "cpu"
-            else (f"DDP×{self.world_size}" if self.world_size > 1 else "GPU")
-        )
+        mode = "CPU" if self.device.type == "cpu" else (f"DDPx{self.world_size}" if self.world_size > 1 else "GPU")
+
+        extra_data = {
+            "it_s": it_s,
+            "tok_s": tok_s,
+            "mem_gb": mem_gb,
+            "rank_eff": eff_r
+        }
 
         self.logger.info(
-            f"[{mode}] step ={self.global_step:3d}/{self.total_steps}"
-            f" | loss={accum_loss:.4f}"
-            f" | ppl={ppl:.2f}"
-            f" | lr={lr_now:.2e}"
-            f" | {it_s:.2f}it/s"
-            f"{mem_str}"
-            f"{eff_rank_str}"
+            f"[{mode}] step {self.global_step:3d} | loss {accum_loss:.4f} | ppl {ppl:.2f} | lr {lr_now:.2e}",
+            extra=extra_data
         )
+        self._timer.start()
 
     def train(self):
         self.model.train()
