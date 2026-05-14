@@ -3,31 +3,30 @@
         ├── .gitignore
         ├── README.md
     └── 📁dsalt
-        └── 📁kernels
-            ├── __init__.py  
-            ├── landmark_tokens_ker.py  
-            ├── RMSENorm.py
-            ├── sparse_attn.py
-            ├── window_utils.py
-        └── 📁model
-            ├── __init__.py
-            ├── dsalt_lm.py
-        └── 📁modules
-            ├── __init__.py
-            ├── dsalt_attention.py
-            ├── dsalt_transformer.py
-        └── 📁training
-            ├── __init__.py  
-            ├── gpu_auto.py  
-            ├── logging_config.py  
-            ├── trainer.py
-        ├── __init__.py
-        ├── py.typed
-    └── 📁tests
-        ├── test_dsalt_lm.py
-        ├── test_hybrid_energy.py
-        ├── test_main.py
-        ├── test_sparse_attn.py
+        ├── 📁kernels
+        │    ├── __init__.py          # Espone le funzioni di basso livello (scoring e masking)
+        │    ├── landmark_tokens_ker.py # Logica di selezione dei Landmark (Energy-based scoring + Top-K)
+        │    ├── RMSENorm.py          # Implementazione della Root Mean Square Layer Normalization (stabilità)
+        │    ├── sparse_attn.py       # Funzioni atomiche per il calcolo dell'attenzione sparsa (logica core)
+        │    ├── window_utils.py      # Utility per gestire la sliding window (masking, padding, indici relativi)
+        │
+        ├── 📁model
+        │    ├── __init__.py          # Inizializzazione del namespace del modello
+        │    ├── dsalt_lm.py          # Definizione della classe Language Model (Causal LM head + Wrapper)
+        │
+        ├── 📁modules
+        │    ├── __init__.py          # Espone i blocchi del Transformer
+        │    ├── dsalt_attention.py   # Implementazione dell'attenzione DSALT (Window + Landmark fusion)
+        │    ├── dsalt_transformer.py # Definizione del Transformer Block e della struttura a strati (Encoder/Decoder)
+        │
+        ├── 📁training
+        │    ├── __init__.py          # Utility per l'avvio del loop di training
+        │    ├── gpu_auto.py          # Rilevamento hardware, setup DDP (DistributedDataParallel) e allocazione VRAM
+        │    ├── logging_config.py    # Configurazione di WandB/Tensorboard per monitorare Loss e Rank Collapse
+        │    ├── trainer.py           # Loop di allenamento, backpropagation, checkpointing e scheduling LR
+        │
+        ├── __init__.py               # Versione della libreria e import principali
+        └── py.typed                  # Marcatore per indicare a mypy che il pacchetto supporta il type hinting
     ├── .env
     ├── .gitignore
     ├── CHANGELOG.md

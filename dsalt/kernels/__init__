@@ -1,3 +1,0 @@
-from .flash_engine.moba_engine import parallel_moba
-
-all = ["parallel_moba"]

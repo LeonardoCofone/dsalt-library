@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from ..kernels.old_kernels import TritonRMSNorm
+
+from ..kernels.RMSENorm import RMSENorm
 from .dsalt_attention import DSALTAttention
 
 class SwiGLUFFN(nn.Module):
@@ -13,8 +14,10 @@ class SwiGLUFFN(nn.Module):
         self.down_proj = nn.Linear(d_ff, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x_norm: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.down_proj(F.silu(self.gate_proj(x_norm)) * self.up_proj(x_norm)))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(
+            self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        )
 
 class DSALTTransformerBlock(nn.Module):
     def __init__(
@@ -29,10 +32,11 @@ class DSALTTransformerBlock(nn.Module):
         dropout: float = 0.0,
         yarn_scale: float = 1.0,
         layer_idx: int = 0,
+        use_moba: bool = True,
     ):
         super().__init__()
-        self.attn_norm = TritonRMSNorm(d_model)
-        self.ffn_norm = TritonRMSNorm(d_model)
+        self.attn_norm = RMSENorm(d_model)
+        self.ffn_norm = RMSENorm(d_model)
         self.attn = DSALTAttention(
             d_model=d_model,
             n_heads=n_heads,
@@ -43,24 +47,36 @@ class DSALTTransformerBlock(nn.Module):
             dropout=dropout,
             yarn_scale=yarn_scale,
             layer_idx=layer_idx,
+            use_moba=use_moba,
         )
         self.ffn = SwiGLUFFN(d_model=d_model, d_ff=d_ff, dropout=dropout)
 
     def forward(
         self,
         x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
         gradient_checkpointing: bool = False,
     ) -> torch.Tensor:
+        
+        def attention_wrapper(h, q_lens, m_len):
+            return self.attn(self.attn_norm(h), cu_seqlens=q_lens, max_seqlen=m_len)
+
         if gradient_checkpointing and self.training:
-            def attn_fn(x_, cs_, ms_):
-                return self.attn(self.attn_norm(x_), cs_, ms_)
-            def ffn_fn(x_):
-                return self.ffn(self.ffn_norm(x_))
-            x = x + torch.utils.checkpoint.checkpoint(attn_fn, x, cu_seqlens, max_seqlen, use_reentrant=False)
-            x = x + torch.utils.checkpoint.checkpoint(ffn_fn, x, use_reentrant=False)
+            x = x + torch.utils.checkpoint.checkpoint(
+                attention_wrapper, x, cu_seqlens, max_seqlen, use_reentrant=False
+            )
         else:
-            x = x + self.attn(self.attn_norm(x), cu_seqlens, max_seqlen)
+            x = x + self.attn(self.attn_norm(x), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+
+        def ffn_wrapper(h):
+            return self.ffn(self.ffn_norm(h))
+
+        if gradient_checkpointing and self.training:
+            x = x + torch.utils.checkpoint.checkpoint(
+                ffn_wrapper, x, use_reentrant=False
+            )
+        else:
             x = x + self.ffn(self.ffn_norm(x))
+
         return x

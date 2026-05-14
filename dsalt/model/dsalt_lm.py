@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
-from ..kernels.old_kernels import TritonRMSNorm
-from ..modules import DSALTTransformerBlock
+import torch.nn.functional as F
+
+from ..kernels.RMSENorm import RMSENorm
+from ..modules.dsalt_transformer import DSALTTransformerBlock
 
 class DSALTLMHeadModel(nn.Module):
     def __init__(
@@ -18,6 +20,8 @@ class DSALTLMHeadModel(nn.Module):
         dropout: float = 0.0,
         yarn_scale: float = 1.0,
         tie_weights: bool = True,
+        use_moba: bool = True,
+        padding_idx: int | None = None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -26,7 +30,10 @@ class DSALTLMHeadModel(nn.Module):
 
         d_ff = d_ff if d_ff is not None else 4 * d_model
 
-        self.embed_tokens = nn.Embedding(vocab_size, d_model)
+        self.embed_tokens = nn.Embedding(
+            vocab_size, d_model,
+            padding_idx=padding_idx if padding_idx is not None else -1,
+        )
         self.embed_dropout = nn.Dropout(dropout)
 
         self.layers = nn.ModuleList([
@@ -41,11 +48,11 @@ class DSALTLMHeadModel(nn.Module):
                 dropout=dropout,
                 yarn_scale=yarn_scale,
                 layer_idx=i,
-            )
-            for i in range(n_layers)
+                use_moba=use_moba,
+            ) for i in range(n_layers)
         ])
 
-        self.final_norm = TritonRMSNorm(d_model)
+        self.final_norm = RMSENorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
         if tie_weights:
@@ -64,19 +71,24 @@ class DSALTLMHeadModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
         labels: torch.Tensor | None = None,
         gradient_checkpointing: bool = False,
+        padding_mask: torch.BoolTensor | None = None,
     ) -> dict:
-        x = self.embed_dropout(self.embed_tokens(input_ids))
+        if max_seqlen is None:
+            max_seqlen = input_ids.shape[-1]
+
+        x = self.embed_tokens(input_ids)
+        x = self.embed_dropout(x)
 
         for layer in self.layers:
             x = layer(
-                x, 
-                cu_seqlens=cu_seqlens, 
-                max_seqlen=max_seqlen, 
-                gradient_checkpointing=gradient_checkpointing
+                x,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                gradient_checkpointing=gradient_checkpointing,
             )
 
         x = self.final_norm(x)
@@ -84,7 +96,7 @@ class DSALTLMHeadModel(nn.Module):
 
         loss = None
         if labels is not None:
-            loss = torch.nn.functional.cross_entropy(
+            loss = F.cross_entropy(
                 logits.view(-1, self.vocab_size),
                 labels.view(-1),
                 ignore_index=-100,
