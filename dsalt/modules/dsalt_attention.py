@@ -28,7 +28,6 @@ class DSALTAttention(nn.Module):
     ):
         super().__init__()
         assert d_model % n_heads == 0
-
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
@@ -44,7 +43,6 @@ class DSALTAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.window_proj = nn.Linear(d_model, 1, bias=True)
-
         self.alpha_raw = nn.Parameter(torch.full((n_heads,), math.log(0.6 / 0.4)))
 
         cos, sin = _yarn_freqs(self.d_head, max_seq_len, scale=yarn_scale)
@@ -58,11 +56,7 @@ class DSALTAttention(nn.Module):
         x1, x2 = x[..., :D // 2], x[..., D // 2:]
         return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
-    def _compute_lmk_indices(
-        self,
-        x_norm: torch.Tensor,
-        w_int: torch.Tensor,
-    ) -> torch.Tensor:
+    def _compute_lmk_indices(self, x_norm: torch.Tensor, w_int: torch.Tensor) -> torch.Tensor:
         B, N, _ = x_norm.shape
         H = self.n_heads
         device = x_norm.device
@@ -72,39 +66,25 @@ class DSALTAttention(nn.Module):
 
         nx = x_f.norm(dim=-1)
         nv = xv.norm(dim=-1)
-
-        mu_x = nx.mean(dim=-1, keepdim=True)
-        sg_x = nx.std(dim=-1, keepdim=True).clamp(min=1e-8)
-        mu_v = nv.mean(dim=-1, keepdim=True)
-        sg_v = nv.std(dim=-1, keepdim=True).clamp(min=1e-8)
-
-        z_x = ((nx - mu_x) / sg_x).unsqueeze(1).expand(B, H, N)
-        z_v = ((nv - mu_v) / sg_v).unsqueeze(1).expand(B, H, N)
+        z_x = (nx - nx.mean(-1, keepdim=True)) / nx.std(-1, keepdim=True).clamp(min=1e-8)
+        z_v = (nv - nv.mean(-1, keepdim=True)) / nv.std(-1, keepdim=True).clamp(min=1e-8)
 
         alpha = torch.sigmoid(self.alpha_raw).view(1, H, 1)
-        scores = alpha * z_v + (1.0 - alpha) * z_x
+        scores = alpha * z_v.unsqueeze(1).expand(B, H, N) + \
+                 (1.0 - alpha) * z_x.unsqueeze(1).expand(B, H, N)
 
-        i_idx = torch.arange(N, device=device).view(1, 1, N)
-        col_off = torch.arange(int(w_int.max().item()), device=device).view(1, 1, 1, -1)
-        j_win = (i_idx.unsqueeze(-1) - col_off).clamp(min=0)
-        w_exp = w_int.unsqueeze(1).unsqueeze(-1)
-        in_win_mask = (col_off < w_exp) & (col_off <= i_idx.unsqueeze(-1))
+        i_idx = torch.arange(N, device=device)
+        j_idx = torch.arange(N, device=device)
+        dist = i_idx.unsqueeze(1) - j_idx.unsqueeze(0)
+        in_win_2d = (dist >= 0) & (dist < w_int.unsqueeze(-1))
+        in_win_any = in_win_2d.any(dim=1)
 
-        in_window = torch.zeros(B, N, dtype=torch.bool, device=device)
-        in_window.scatter_(1, j_win.squeeze(1).view(B, -1).clamp(0, N - 1),
-                           in_win_mask.squeeze(1).view(B, -1))
-
-        scores = scores.masked_fill(in_window.unsqueeze(1).expand(B, H, N), float("-inf"))
+        scores = scores.masked_fill(in_win_any.unsqueeze(1).expand(B, H, N), float("-inf"))
 
         _, lmk_indices = torch.topk(scores, self.k_lmk, dim=-1, sorted=False)
         return lmk_indices
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        x_norm: torch.Tensor,
-        use_triton: bool = True,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, x_norm: torch.Tensor, use_triton: bool = True) -> torch.Tensor:
         B, N, C = x.shape
         dtype_in = x.dtype
 
@@ -120,12 +100,9 @@ class DSALTAttention(nn.Module):
         w_int = w_cont.round().long().clamp(self.n_min, self.n_max)
 
         lmk_indices = self._compute_lmk_indices(x_norm, w_int)
-
         attn_out = sparse_attention_forward(q, k, v, w_int, lmk_indices)
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, N, C)
-
         if self.dropout_p > 0.0 and self.training:
             attn_out = F.dropout(attn_out, p=self.dropout_p)
-
         return self.out_proj(attn_out.to(dtype_in))
