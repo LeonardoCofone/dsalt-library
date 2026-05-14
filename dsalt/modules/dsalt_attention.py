@@ -247,16 +247,14 @@ class DSALTAttention(nn.Module):
 
         attn_mask = self._build_packed_attn_mask(x, cu_seqlens, total_len, device)
 
-        q_h = q.permute(1, 0, 2)
-        k_h = k.permute(1, 0, 2)
-        v_h = v.permute(1, 0, 2)
-
         out = sparse_attention_forward_packed(
-            q_h, k_h, v_h,
+            q, k, v,             
             attn_mask=attn_mask,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=self.max_seq_len,
             dropout_p=self.dropout,
             training=self.training,
         )
 
-        out = out.permute(1, 0, 2).contiguous().view(total_len, self.d_model)
+        out = out.contiguous().view(total_len, self.d_model)
         return self.out_proj(out)

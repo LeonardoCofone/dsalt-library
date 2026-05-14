@@ -31,7 +31,7 @@ def sparse_attention_forward(
 
 
 def sparse_attention_forward_packed(
-    q: torch.Tensor,
+    q: torch.Tensor, 
     k: torch.Tensor,
     v: torch.Tensor,
     attn_mask: torch.Tensor,
@@ -41,7 +41,7 @@ def sparse_attention_forward_packed(
     training: bool = False,
 ) -> torch.Tensor:
     if _FLASH_AVAILABLE and q.is_cuda:
-        out = flash_attn_varlen_func(
+        return flash_attn_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
@@ -50,8 +50,7 @@ def sparse_attention_forward_packed(
             dropout_p=dropout_p if training else 0.0,
             causal=True,
         )
-        return out
-
+    
     outputs = []
     num_seqs = cu_seqlens.shape[0] - 1
 
@@ -64,10 +63,10 @@ def sparse_attention_forward_packed(
         ki = k[start:end].permute(1, 0, 2).unsqueeze(0)
         vi = v[start:end].permute(1, 0, 2).unsqueeze(0)
 
-        mask_i = attn_mask[start:end, start:end]  
+        mask_i = attn_mask[start:end, start:end]
         additive_i = torch.zeros(seq_len, seq_len, dtype=qi.dtype, device=qi.device)
         additive_i = additive_i.masked_fill(~mask_i, float("-inf"))
-        additive_i = additive_i.unsqueeze(0).unsqueeze(0) 
+        additive_i = additive_i.unsqueeze(0).unsqueeze(0)
 
         out_i = F.scaled_dot_product_attention(
             qi, ki, vi,
