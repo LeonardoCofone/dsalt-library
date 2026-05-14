@@ -1,3 +1,4 @@
+"""
 from .old_kernels.RMSENorm import TritonRMSNorm
 from .old_kernels.window_utils import compute_window_sizes_triton, build_window_mask_triton
 from .old_kernels.landmark_tokens_ker import compute_hybrid_energy_triton, apply_yarn_rope_triton, select_landmarks
@@ -12,3 +13,4 @@ __all__ = [
     "select_landmarks",
     "sparse_attention_forward",
 ]
+"""
