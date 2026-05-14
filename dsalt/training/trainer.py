@@ -261,7 +261,7 @@ class DSALTTrainer:
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=False,
+                find_unused_parameters=True,
                 gradient_as_bucket_view=True,
             )
 
