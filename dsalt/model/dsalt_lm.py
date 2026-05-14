@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
-
-from ..kernels import TritonRMSNorm
+from ..kernels.old_kernels import TritonRMSNorm
 from ..modules import DSALTTransformerBlock
-
 
 class DSALTLMHeadModel(nn.Module):
     def __init__(
@@ -22,14 +20,14 @@ class DSALTLMHeadModel(nn.Module):
         tie_weights: bool = True,
     ):
         super().__init__()
-        self.d_model    = d_model
-        self.n_layers   = n_layers
+        self.d_model = d_model
+        self.n_layers = n_layers
         self.vocab_size = vocab_size
 
         d_ff = d_ff if d_ff is not None else 4 * d_model
 
-        self.embed_tokens   = nn.Embedding(vocab_size, d_model)
-        self.embed_dropout  = nn.Dropout(dropout)
+        self.embed_tokens = nn.Embedding(vocab_size, d_model)
+        self.embed_dropout = nn.Dropout(dropout)
 
         self.layers = nn.ModuleList([
             DSALTTransformerBlock(
@@ -48,7 +46,7 @@ class DSALTLMHeadModel(nn.Module):
         ])
 
         self.final_norm = TritonRMSNorm(d_model)
-        self.lm_head    = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
         if tie_weights:
             self.lm_head.weight = self.embed_tokens.weight
@@ -66,23 +64,29 @@ class DSALTLMHeadModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         labels: torch.Tensor | None = None,
-        use_triton: bool = True,
         gradient_checkpointing: bool = False,
     ) -> dict:
         x = self.embed_dropout(self.embed_tokens(input_ids))
 
         for layer in self.layers:
-            x = layer(x, use_triton=use_triton, gradient_checkpointing=gradient_checkpointing)
+            x = layer(
+                x, 
+                cu_seqlens=cu_seqlens, 
+                max_seqlen=max_seqlen, 
+                gradient_checkpointing=gradient_checkpointing
+            )
 
-        x      = self.final_norm(x)
+        x = self.final_norm(x)
         logits = self.lm_head(x)
 
         loss = None
         if labels is not None:
             loss = torch.nn.functional.cross_entropy(
-                logits[:, :-1, :].contiguous().view(-1, self.vocab_size),
-                labels[:, 1:].contiguous().view(-1),
+                logits.view(-1, self.vocab_size),
+                labels.view(-1),
                 ignore_index=-100,
             )
 

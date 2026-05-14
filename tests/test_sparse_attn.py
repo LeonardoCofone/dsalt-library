@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from dsalt.kernels import sparse_attn
+from dsalt.kernels.old_kernels import sparse_attn
 
 def _dummy_inputs(
     batch: int = 1,

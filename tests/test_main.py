@@ -25,18 +25,18 @@ import torch.nn as nn
 # Allow running from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dsalt.kernels.sparse_attn import (
+from dsalt.kernels.old_kernels.sparse_attn import (
     _build_sparse_mask,
     _cpu_reference_forward,
     _cpu_reference_backward,
     dsalt_attention,
 )
-from dsalt.kernels.RMSENorm import (
+from dsalt.kernels.old_kernels.RMSENorm import (
     compute_hybrid_energy_scores,
     select_landmarks,
     compute_landmark_idx,
 )
-from dsalt.kernels.window_utils import WindowSizePredictor
+from dsalt.kernels.old_kernels.window_utils import WindowSizePredictor
 from dsalt.modules.dsalt_attention import DSALTAttention
 from dsalt.modules.dsalt_transformer import DSALTTransformer
 from dsalt.training.trainer import DSALTTrainer

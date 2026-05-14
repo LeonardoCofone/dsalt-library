@@ -176,31 +176,28 @@ class DSALTTrainer:
 
 
     def _extract_batch(self, batch):
-        if isinstance(batch, (list, tuple)):
-            ids, labels = batch[0], batch[1]
-        elif isinstance(batch, dict):
-            ids    = batch["input_ids"]
-            labels = batch.get("labels", ids)
-        else:
-            ids    = batch
-            labels = ids
+        # batch ora è una lista/tupla di 4 elementi: [ids, labels, cu_seqlens, max_seqlen]
+        ids, labels, cu_seqlens, max_seqlen = batch
+        
         return (
             ids.to(self.device, non_blocking=True),
             labels.to(self.device, non_blocking=True),
+            cu_seqlens.to(self.device, non_blocking=True),
+            max_seqlen # Questo è un intero, non serve .to(device)
         )
 
     def _forward_step(self, batch) -> torch.Tensor:
-        ids, labels = self._extract_batch(batch)
+        ids, labels, cu_seqlens, max_seqlen = self._extract_batch(batch)
         self._tokens_per_batch = ids.numel()
 
-        if self._use_amp:
-            with torch.autocast(device_type=self.device.type, dtype=self._amp_dtype):
-                out  = self.model(ids, labels=labels, use_triton=self.use_triton,
-                                  gradient_checkpointing=self.gradient_checkpointing)
-                loss = out["loss"]
-        else:
-            out  = self.model(ids, labels=labels, use_triton=self.use_triton,
-                              gradient_checkpointing=self.gradient_checkpointing)
+        with torch.autocast(device_type=self.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
+            out = self.model(
+                ids, 
+                cu_seqlens=cu_seqlens, 
+                max_seqlen=max_seqlen, 
+                labels=labels,
+                gradient_checkpointing=self.gradient_checkpointing
+            )
             loss = out["loss"]
 
         return loss
@@ -212,9 +209,14 @@ class DSALTTrainer:
         total_tokens = 0
 
         for batch in self.val_loader:
-            ids, labels = self._extract_batch(batch)
-            out          = self.model(ids, labels=labels, use_triton=False,
-                                      gradient_checkpointing=False)
+            ids, labels, cu_seqlens, max_seqlen = self._extract_batch(batch)
+            out = self.model(
+                ids, 
+                cu_seqlens=cu_seqlens, 
+                max_seqlen=max_seqlen, 
+                labels=labels,
+                gradient_checkpointing=False
+            )
             total_loss   += out["loss"].item() * ids.numel()
             total_tokens += ids.numel()
 

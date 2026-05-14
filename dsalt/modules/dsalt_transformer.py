@@ -2,22 +2,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-
-from ..kernels import TritonRMSNorm
+from ..kernels.old_kernels import TritonRMSNorm
 from .dsalt_attention import DSALTAttention
-
 
 class SwiGLUFFN(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.0):
         super().__init__()
         self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
-        self.up_proj   = nn.Linear(d_model, d_ff, bias=False)
+        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
         self.down_proj = nn.Linear(d_ff, d_model, bias=False)
-        self.dropout   = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x_norm: torch.Tensor) -> torch.Tensor:
         return self.dropout(self.down_proj(F.silu(self.gate_proj(x_norm)) * self.up_proj(x_norm)))
-
 
 class DSALTTransformerBlock(nn.Module):
     def __init__(
@@ -35,8 +32,7 @@ class DSALTTransformerBlock(nn.Module):
     ):
         super().__init__()
         self.attn_norm = TritonRMSNorm(d_model)
-        self.ffn_norm  = TritonRMSNorm(d_model)
-
+        self.ffn_norm = TritonRMSNorm(d_model)
         self.attn = DSALTAttention(
             d_model=d_model,
             n_heads=n_heads,
@@ -53,17 +49,18 @@ class DSALTTransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        use_triton: bool = True,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         gradient_checkpointing: bool = False,
     ) -> torch.Tensor:
         if gradient_checkpointing and self.training:
-            def attn_fn(x_):
-                return self.attn(x_, self.attn_norm(x_), use_triton=use_triton)
+            def attn_fn(x_, cs_, ms_):
+                return self.attn(self.attn_norm(x_), cs_, ms_)
             def ffn_fn(x_):
                 return self.ffn(self.ffn_norm(x_))
-            x = x + torch.utils.checkpoint.checkpoint(attn_fn, x, use_reentrant=False)
+            x = x + torch.utils.checkpoint.checkpoint(attn_fn, x, cu_seqlens, max_seqlen, use_reentrant=False)
             x = x + torch.utils.checkpoint.checkpoint(ffn_fn, x, use_reentrant=False)
         else:
-            x = x + self.attn(x, self.attn_norm(x), use_triton=use_triton)
+            x = x + self.attn(self.attn_norm(x), cu_seqlens, max_seqlen)
             x = x + self.ffn(self.ffn_norm(x))
         return x
