@@ -8,64 +8,67 @@ def sparse_attention_forward(
     v: torch.Tensor,
     w_int: torch.Tensor,
     lmk_indices: torch.Tensor,
+    chunk_size: int = 128,
 ) -> torch.Tensor:
     B, H, N, D = q.shape
-    k_lmk = lmk_indices.shape[-1]
+    k_lmk  = lmk_indices.shape[-1]
     device = q.device
-    dtype = q.dtype
-    scale = D ** -0.5
+    dtype  = q.dtype
+    scale  = D ** -0.5
 
     q_f = q.float()
     k_f = k.float()
     v_f = v.float()
 
     w_max = int(w_int.max().item())
+    out   = torch.zeros(B, H, N, D, device=device, dtype=torch.float32)
+
+    # pre-gather landmark k/v once — [B, H, k_lmk, D]
+    b_lmk = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, k_lmk)
+    h_lmk = torch.arange(H, device=device).view(1, H, 1).expand(B, H, k_lmk)
+    k_lmk_g = k_f[b_lmk, h_lmk, lmk_indices]
+    v_lmk_g = v_f[b_lmk, h_lmk, lmk_indices]
+
     i_idx = torch.arange(N, device=device)
+    col_off = torch.arange(w_max, device=device)
 
-    # ── window branch ────────────────────────────────────────────────────────
-    col_off  = torch.arange(w_max, device=device)
-    j_win    = (i_idx.unsqueeze(1) - col_off.unsqueeze(0)).clamp(min=0)   # [N, w_max]
+    for start in range(0, N, chunk_size):
+        end  = min(start + chunk_size, N)
+        C    = end - start
 
-    valid_win  = col_off.unsqueeze(0) <= i_idx.unsqueeze(1)               # [N, w_max]
-    within_w   = col_off.unsqueeze(0) <  w_int.unsqueeze(-1)              # [B, N, w_max]
-    win_mask   = (within_w & valid_win.unsqueeze(0))                       # [B, N, w_max]
-    win_mask   = win_mask.unsqueeze(1).expand(B, H, N, w_max)
+        i_c = i_idx[start:end]                                    # [C]
+        q_c = q_f[:, :, start:end, :]                             # [B, H, C, D]
+        w_c = w_int[:, start:end]                                  # [B, C]
 
-    k_win = k_f[:, :, j_win, :]                                           # [B, H, N, w_max, D]
-    v_win = v_f[:, :, j_win, :]
+        # window branch — peak alloc: [B, H, C, w_max, D]
+        j_win     = (i_c.unsqueeze(1) - col_off.unsqueeze(0)).clamp(min=0)   # [C, w_max]
+        valid_win = col_off.unsqueeze(0) <= i_c.unsqueeze(1)                 # [C, w_max]
+        within_w  = col_off.unsqueeze(0) < w_c.unsqueeze(-1)                 # [B, C, w_max]
+        win_mask  = (within_w & valid_win.unsqueeze(0)).unsqueeze(1).expand(B, H, C, w_max)
 
-    logits_win = (q_f.unsqueeze(3) * k_win).sum(-1) * scale               # [B, H, N, w_max]
-    logits_win = logits_win.masked_fill(~win_mask, float("-inf"))
+        k_win = k_f[:, :, j_win, :]                               # [B, H, C, w_max, D]
+        v_win = v_f[:, :, j_win, :]
 
-    # ── landmark branch ───────────────────────────────────────────────────────
-    # lmk_indices: [B, H, k_lmk]  →  expand to [B, H, N, k_lmk]
-    lmk_exp = lmk_indices.unsqueeze(2).expand(B, H, N, k_lmk)            # FIX: dim 2 not 3
+        logits_win = (q_c.unsqueeze(3) * k_win).sum(-1) * scale   # [B, H, C, w_max]
+        logits_win = logits_win.masked_fill(~win_mask, float("-inf"))
 
-    b_idx = torch.arange(B, device=device).view(B, 1, 1, 1).expand(B, H, N, k_lmk)
-    h_idx = torch.arange(H, device=device).view(1, H, 1, 1).expand(B, H, N, k_lmk)
+        # landmark branch
+        logits_lmk = torch.einsum("bhcd,bhkd->bhck", q_c, k_lmk_g) * scale  # [B, H, C, k_lmk]
 
-    k_lmk_vecs = k_f[b_idx, h_idx, lmk_exp]                              # [B, H, N, k_lmk, D]
-    v_lmk_vecs = v_f[b_idx, h_idx, lmk_exp]
+        lmk_exp = lmk_indices.unsqueeze(2).expand(B, H, C, k_lmk)
+        row_exp = i_c.view(1, 1, C, 1).expand(B, H, C, k_lmk)
+        dist    = (row_exp - lmk_exp).clamp(min=0)
+        lmk_mask = (lmk_exp < row_exp) & (dist >= w_c.unsqueeze(1).unsqueeze(-1))
 
-    logits_lmk = (q_f.unsqueeze(3) * k_lmk_vecs).sum(-1) * scale         # [B, H, N, k_lmk]
+        logits_lmk = logits_lmk.masked_fill(~lmk_mask, float("-inf"))
 
-    row_idx    = i_idx.view(1, 1, N, 1).expand(B, H, N, k_lmk)
-    lmk_causal = lmk_exp < row_idx
-    dist       = (row_idx - lmk_exp).clamp(min=0)
-    lmk_in_win = dist < w_int.unsqueeze(1).unsqueeze(-1)                  # [B, H, N, k_lmk]
-    lmk_valid  = lmk_causal & ~lmk_in_win
+        # joint softmax
+        attn = torch.softmax(torch.cat([logits_win, logits_lmk], dim=-1), dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0)
 
-    logits_lmk = logits_lmk.masked_fill(~lmk_valid, float("-inf"))
-
-    # ── joint softmax ─────────────────────────────────────────────────────────
-    logits_all = torch.cat([logits_win, logits_lmk], dim=-1)
-    attn       = torch.softmax(logits_all, dim=-1)
-    attn       = torch.nan_to_num(attn, nan=0.0)
-
-    attn_win = attn[..., :w_max]
-    attn_lmk = attn[..., w_max:]
-
-    out = (attn_win.unsqueeze(-1) * v_win).sum(-2) \
-        + (attn_lmk.unsqueeze(-1) * v_lmk_vecs).sum(-2)
+        out[:, :, start:end] = (
+            (attn[..., :w_max].unsqueeze(-1) * v_win).sum(-2)
+            + torch.einsum("bhck,bhkd->bhcd", attn[..., w_max:], v_lmk_g)
+        )
 
     return out.to(dtype)
