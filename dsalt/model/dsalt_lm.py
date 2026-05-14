@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from ..kernels.RMSENorm import RMSENorm
 from ..modules.dsalt_transformer import DSALTTransformerBlock
 
+
 class DSALTLMHeadModel(nn.Module):
     def __init__(
         self,
@@ -20,20 +21,16 @@ class DSALTLMHeadModel(nn.Module):
         dropout: float = 0.0,
         yarn_scale: float = 1.0,
         tie_weights: bool = True,
-        use_moba: bool = True,
         padding_idx: int | None = None,
     ):
         super().__init__()
-        self.d_model = d_model
-        self.n_layers = n_layers
+        self.d_model    = d_model
+        self.n_layers   = n_layers
         self.vocab_size = vocab_size
 
         d_ff = d_ff if d_ff is not None else 4 * d_model
 
-        self.embed_tokens = nn.Embedding(
-            vocab_size, d_model,
-            padding_idx=padding_idx if padding_idx is not None else -1,
-        )
+        self.embed_tokens  = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
         self.embed_dropout = nn.Dropout(dropout)
 
         self.layers = nn.ModuleList([
@@ -48,12 +45,12 @@ class DSALTLMHeadModel(nn.Module):
                 dropout=dropout,
                 yarn_scale=yarn_scale,
                 layer_idx=i,
-                use_moba=use_moba,
-            ) for i in range(n_layers)
+            )
+            for i in range(n_layers)
         ])
 
         self.final_norm = RMSENorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head    = nn.Linear(d_model, vocab_size, bias=False)
 
         if tie_weights:
             self.lm_head.weight = self.embed_tokens.weight
@@ -80,8 +77,7 @@ class DSALTLMHeadModel(nn.Module):
         if max_seqlen is None:
             max_seqlen = input_ids.shape[-1]
 
-        x = self.embed_tokens(input_ids)
-        x = self.embed_dropout(x)
+        x = self.embed_dropout(self.embed_tokens(input_ids))
 
         for layer in self.layers:
             x = layer(
@@ -91,8 +87,7 @@ class DSALTLMHeadModel(nn.Module):
                 gradient_checkpointing=gradient_checkpointing,
             )
 
-        x = self.final_norm(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(self.final_norm(x))
 
         loss = None
         if labels is not None:
