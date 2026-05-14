@@ -8,7 +8,6 @@ try:
 except ImportError:
     _FLASH_AVAILABLE = False
 
-
 def sparse_attention_forward(
     q: torch.Tensor,
     k: torch.Tensor,
