@@ -71,15 +71,15 @@ class DSALTAttention(nn.Module):
         k: torch.Tensor,
         lmk_indices: torch.Tensor,
     ) -> torch.Tensor:
-        B, H, N, D  = k.shape
-        k_lmk       = lmk_indices.shape[-1]
+        B, H, N, D = k.shape
+        k_lmk      = lmk_indices.shape[-1]
 
         flat_idx = lmk_indices.reshape(-1)
-        cos_lmk  = self.yarn_cos[flat_idx, :D // 2].to(k.device).reshape(B, H, N, k_lmk, D // 2)
-        sin_lmk  = self.yarn_sin[flat_idx, :D // 2].to(k.device).reshape(B, H, N, k_lmk, D // 2)
+        cos_lmk  = self.yarn_cos[flat_idx, :D // 2].to(k.device).reshape(B, H, k_lmk, D // 2)
+        sin_lmk  = self.yarn_sin[flat_idx, :D // 2].to(k.device).reshape(B, H, k_lmk, D // 2)
 
-        b_idx = torch.arange(B, device=k.device).view(B, 1, 1, 1).expand(B, H, N, k_lmk)
-        h_idx = torch.arange(H, device=k.device).view(1, H, 1, 1).expand(B, H, N, k_lmk)
+        b_idx = torch.arange(B, device=k.device).view(B, 1, 1).expand(B, H, k_lmk)
+        h_idx = torch.arange(H, device=k.device).view(1, H, 1).expand(B, H, k_lmk)
 
         k_lmk_vecs = k[b_idx, h_idx, lmk_indices]
         x1 = k_lmk_vecs[..., :D // 2]
@@ -102,7 +102,7 @@ class DSALTAttention(nn.Module):
 
         alpha_vals = torch.sigmoid(self.alpha_raw)
 
-        xv = (x_norm.float() @ self.v_proj.weight.T)
+        xv  = (x_norm.float() @ self.v_proj.weight.T)
         x_f = x_norm.float()
 
         nx   = x_f.norm(dim=-1)
@@ -120,16 +120,14 @@ class DSALTAttention(nn.Module):
         z_v_exp   = z_v.unsqueeze(1).expand(B, H, N)
         scores    = alpha_exp * z_v_exp + (1.0 - alpha_exp) * z_x_exp
 
-        outside = ~window_mask
-        outside_exp = outside.unsqueeze(1).expand(B, H, N, N)
-        scores_for_query = scores.unsqueeze(2).expand(B, H, N, N)
-        scores_masked    = torch.where(outside_exp, scores_for_query,
-                                       torch.full_like(scores_for_query, float("-inf")))
+        in_any_window = window_mask.any(dim=1)
+        outside_exp   = (~in_any_window).unsqueeze(1).expand(B, H, N)
+        scores        = torch.where(outside_exp, scores, torch.full_like(scores, float("-inf")))
 
-        n_outside_per_query = outside.sum(dim=-1).min().item()
-        k_eff = max(1, min(self.k_lmk, int(n_outside_per_query)))
+        k_eff = min(self.k_lmk, int((~in_any_window).sum(dim=-1).min().item()))
+        k_eff = max(k_eff, 1)
 
-        _, lmk_indices = torch.topk(scores_masked, k_eff, dim=-1)
+        _, lmk_indices = torch.topk(scores, k_eff, dim=-1)
 
         if k_eff < self.k_lmk:
             lmk_indices = F.pad(lmk_indices, (0, self.k_lmk - k_eff), value=0)
