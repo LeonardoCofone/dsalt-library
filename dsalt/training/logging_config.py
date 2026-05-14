@@ -94,12 +94,12 @@ class _StepFormatter(logging.Formatter):
     def _banner(self, msg: str) -> str:
         lines = [
             f"\n{BOLD}{CYAN}{SEP2[len(DIM):-len(RESET)]}{RESET}",
-            f"{BOLD}{CYAN}  ██████╗ ███████╗ █████╗ ██╗  ████████╗{RESET}",
-            f"{BOLD}{CYAN}  ██╔══██╗██╔════╝██╔══██╗██║  ╚══██╔══╝{RESET}",
-            f"{BOLD}{CYAN}  ██║  ██║███████╗███████║██║     ██║   {RESET}",
-            f"{BOLD}{CYAN}  ██║  ██║╚════██║██╔══██║██║     ██║   {RESET}",
-            f"{BOLD}{CYAN}  ██████╔╝███████║██║  ██║███████╗██║   {RESET}",
-            f"{BOLD}{CYAN}  ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝   {RESET}",
+            f"{BOLD}{CYAN}  ██████╗  ███████╗  █████╗  ██╗   ████████╗{RESET}",
+            f"{BOLD}{CYAN}  ██╔══██╗ ██╔════╝ ██╔══██╗ ██║   ╚══██╔══╝{RESET}",
+            f"{BOLD}{CYAN}  ██║  ██║ ███████╗ ███████║ ██║      ██║   {RESET}",
+            f"{BOLD}{CYAN}  ██║  ██║ ╚════██║ ██╔══██║ ██║      ██║   {RESET}",
+            f"{BOLD}{CYAN}  ██████╔╝ ███████║ ██║  ██║ ███████╗ ██║   {RESET}",
+            f"{BOLD}{CYAN}  ╚═════╝  ╚══════╝ ╚═╝  ╚═╝ ╚══════╝ ╚═╝   {RESET}",
             f"{BOLD}{CYAN}{'━' * 72}{RESET}",
         ]
         for part in msg.split("|"):
