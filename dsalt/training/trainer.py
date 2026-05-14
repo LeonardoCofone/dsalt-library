@@ -33,35 +33,33 @@ def compute_metrics(model: nn.Module, ids: torch.Tensor, cu_seqlens: torch.Tenso
     m = _unwrap_model(model)
     m.eval()
 
-    device = ids.device
+    device    = ids.device
     total_len = ids.shape[0]
 
     x = m.embed_tokens(ids)
-
     layer_hiddens = [x.clone()]
     for layer in m.layers:
         x = layer(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         layer_hiddens.append(x.clone())
 
-    # --- sigma2 e eff_rank su matrice di attenzione dell'ultimo layer ---
     last_attn = m.layers[-1].attn
-    sigma2 = float("nan")
-    eff_rank = float("nan")
-    sigma2_per_layer = []
-    eff_rank_per_layer_attn = []
+    sigma2    = float("nan")
+    eff_rank  = float("nan")
+    sigma2_per_layer         = []
+    eff_rank_per_layer_attn  = []
 
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
-        P = last_attn._last_P.float()
+        P     = last_attn._last_P.float()
         P_avg = P.mean(dim=0).detach().cpu()
-        sv = torch.linalg.svdvals(P_avg)
-        sigma2 = sv[1].item() if sv.shape[0] > 1 else 0.0
-        sv_norm = sv / (sv.sum() + 1e-9)
+        sv    = torch.linalg.svdvals(P_avg)
+        sigma2   = sv[1].item() if sv.shape[0] > 1 else 0.0
+        sv_norm  = sv / (sv.sum() + 1e-9)
         eff_rank = torch.exp(-(sv_norm * (sv_norm + 1e-9).log()).sum()).item()
 
     for layer in m.layers:
         attn = layer.attn
         if hasattr(attn, "_last_P") and attn._last_P is not None:
-            sv_l = torch.linalg.svdvals(attn._last_P.float().mean(dim=0).detach().cpu())
+            sv_l  = torch.linalg.svdvals(attn._last_P.float().mean(dim=0).detach().cpu())
             sigma2_per_layer.append(sv_l[1].item() if sv_l.shape[0] > 1 else 0.0)
             sv_ln = sv_l / (sv_l.sum() + 1e-9)
             eff_rank_per_layer_attn.append(torch.exp(-(sv_ln * (sv_ln + 1e-9).log()).sum()).item())
@@ -69,29 +67,26 @@ def compute_metrics(model: nn.Module, ids: torch.Tensor, cu_seqlens: torch.Tenso
             sigma2_per_layer.append(float("nan"))
             eff_rank_per_layer_attn.append(float("nan"))
 
-    # --- eff_rank sugli hidden states per layer ---
     eff_rank_per_layer = []
     for h_l in layer_hiddens[1:]:
-        sv_h = torch.linalg.svdvals(h_l.float().detach().cpu())
+        sv_h  = torch.linalg.svdvals(h_l.float().detach().cpu())
         sv_hn = sv_h / (sv_h.sum() + 1e-9)
         eff_rank_per_layer.append(torch.exp(-(sv_hn * (sv_hn + 1e-9).log()).sum()).item())
 
-    # --- res_norm: norma residua dell'ultimo hidden ---
-    h_final = layer_hiddens[-1]
-    h_mean = h_final.mean(dim=0, keepdim=True)
+    h_final  = layer_hiddens[-1]
+    h_mean   = h_final.mean(dim=0, keepdim=True)
     res_norm = ((h_final - h_mean).norm() / (layer_hiddens[0].norm() + 1e-9)).item()
 
     res_per_layer = []
-    h0_norm = layer_hiddens[0].norm().item()
+    h0_norm       = layer_hiddens[0].norm().item()
     for h_l in layer_hiddens[1:]:
         xm = h_l.mean(dim=0, keepdim=True)
         res_per_layer.append(((h_l - xm).norm() / (h0_norm + 1e-9)).item())
 
-    # --- attn entropy ---
-    attn_entropy = float("nan")
+    attn_entropy    = float("nan")
     entropy_per_layer = []
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
-        P_safe = last_attn._last_P.float().clamp(min=1e-9)
+        P_safe       = last_attn._last_P.float().clamp(min=1e-9)
         attn_entropy = -(P_safe * P_safe.log()).sum(dim=-1).mean().item()
 
     for layer in m.layers:
@@ -102,71 +97,71 @@ def compute_metrics(model: nn.Module, ids: torch.Tensor, cu_seqlens: torch.Tenso
         else:
             entropy_per_layer.append(float("nan"))
 
-    # --- token distance (coppie distanti min 64 token nella sequenza packed) ---
-    min_dist = 64
-    n_pairs = min(64, total_len - min_dist)
-    token_dist = float("nan")
+    min_dist            = 64
+    n_pairs             = min(64, total_len - min_dist)
+    token_dist          = float("nan")
     token_dist_per_layer = []
     if n_pairs > 0:
-        pairs_i = torch.randint(min_dist, total_len, (n_pairs,), device=device)
-        pairs_j = pairs_i - min_dist
-        hi = layer_hiddens[-1][pairs_i]
-        hj = layer_hiddens[-1][pairs_j]
+        pairs_i    = torch.randint(min_dist, total_len, (n_pairs,), device=device)
+        pairs_j    = pairs_i - min_dist
+        hi         = layer_hiddens[-1][pairs_i]
+        hj         = layer_hiddens[-1][pairs_j]
         token_dist = (hi - hj).norm(dim=-1).mean().item()
         for h_l in layer_hiddens[1:]:
             hi_l = h_l[pairs_i]
             hj_l = h_l[pairs_j]
             token_dist_per_layer.append((hi_l - hj_l).norm(dim=-1).mean().item())
 
-    # --- noise propagation (perturbazione a metà della prima sequenza) ---
-    noise_norm = float("nan")
+    noise_norm      = float("nan")
     noise_per_layer = []
-    seq0_len = (cu_seqlens[1] - cu_seqlens[0]).item()
+    seq0_len        = (cu_seqlens[1] - cu_seqlens[0]).item()
     if seq0_len > 128:
         inject_pos = int(seq0_len // 4)
-        ids_pert = ids.clone()
+        ids_pert   = ids.clone()
         ids_pert[inject_pos] = torch.randint(0, m.vocab_size, (1,), device=device).item()
 
-        x_pert = m.embed_tokens(ids_pert)
+        x_pert            = m.embed_tokens(ids_pert)
         layer_hiddens_pert = [x_pert.clone()]
         for layer in m.layers:
             x_pert = layer(x_pert, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             layer_hiddens_pert.append(x_pert.clone())
 
         far_start = inject_pos + 64
-        far_end = int(cu_seqlens[1].item())
+        far_end   = int(cu_seqlens[1].item())
         if far_end > far_start:
-            noise_norm = (layer_hiddens_pert[-1][far_start:far_end] - layer_hiddens[-1][far_start:far_end]).norm(dim=-1).mean().item()
+            noise_norm = (
+                layer_hiddens_pert[-1][far_start:far_end] - layer_hiddens[-1][far_start:far_end]
+            ).norm(dim=-1).mean().item()
             for hl_orig, hl_pert in zip(layer_hiddens[1:], layer_hiddens_pert[1:]):
-                noise_per_layer.append((hl_pert[far_start:far_end] - hl_orig[far_start:far_end]).norm(dim=-1).mean().item())
+                noise_per_layer.append(
+                    (hl_pert[far_start:far_end] - hl_orig[far_start:far_end]).norm(dim=-1).mean().item()
+                )
 
-    # --- head specialization std e attn sink ---
     head_spec_std = float("nan")
-    attn_sink = float("nan")
+    attn_sink     = float("nan")
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
-        P = last_attn._last_P.float().clamp(min=1e-9)
-        entropy_heads = -(P * P.log()).sum(dim=-1).mean(dim=(0, 1))
-        head_spec_std = entropy_heads.std().item()
-        attn_sink = last_attn._last_P.float()[:, :, 0].mean().item()
+        P              = last_attn._last_P.float().clamp(min=1e-9)
+        entropy_heads  = -(P * P.log()).sum(dim=-1).mean(dim=-1)
+        # std(correction=0) evita il crash con n_heads == 1
+        head_spec_std  = entropy_heads.std(correction=0).item() if entropy_heads.numel() > 0 else float("nan")
+        attn_sink      = last_attn._last_P.float()[:, :, 0].mean().item()
 
-    # --- alpha per head (gate win/landmark) ---
     alpha_per_head = []
     for layer in m.layers:
         attn = layer.attn
         if hasattr(attn, "alpha_w"):
             alpha_per_head.append(torch.sigmoid(attn.alpha_w).detach().cpu().tolist())
 
-    # --- out-of-window mass per layer ---
     oow_mass_per_layer = []
     for layer in m.layers:
         attn = layer.attn
         if hasattr(attn, "_last_P") and attn._last_P is not None and hasattr(attn, "n_min"):
-            P_l = attn._last_P.float()
-            T_l = P_l.shape[-1]
+            P_l       = attn._last_P.float()
+            T_l       = P_l.shape[-1]
             positions = torch.arange(T_l, device=P_l.device).float()
-            dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()
+            dist      = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()
             in_window = (dist < attn.n_min).unsqueeze(0).unsqueeze(0)
-            oow = P_l.masked_fill(in_window, 0.0).sum(dim=-1).mean().item()
+            oow       = P_l.masked_fill(in_window, 0.0).sum(dim=-1).mean().item()
             oow_mass_per_layer.append(oow)
         else:
             oow_mass_per_layer.append(float("nan"))
@@ -261,7 +256,7 @@ class DSALTTrainer:
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=True,
+                find_unused_parameters=False,
                 gradient_as_bucket_view=True,
             )
 
@@ -276,10 +271,10 @@ class DSALTTrainer:
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler(self.optimizer)
 
-        self.global_step        = 0
-        self.best_val_ppl       = float("inf")
-        self._timer             = StepTimer(window=50)
-        self._tokens_per_batch  = 0
+        self.global_step       = 0
+        self.best_val_ppl      = float("inf")
+        self._timer            = StepTimer(window=50, device=self.device)
+        self._tokens_per_batch = 0
 
         self.history = {k: [] for k in [
             "train_loss", "sigma2", "eff_rank", "res_norm", "attn_entropy",
@@ -398,7 +393,7 @@ class DSALTTrainer:
         self.best_val_ppl = ckpt.get("best_val_ppl", float("inf"))
         self.history      = ckpt.get("history", self.history)
         if self.is_main:
-            self.logger.info(f"ripreso dallo step {self.global_step}")
+            self.logger.info(f"checkpoint ripreso dallo step {self.global_step}")
 
     def _log_step(self, accum_loss: float) -> None:
         if not self.is_main:
@@ -406,13 +401,11 @@ class DSALTTrainer:
 
         stats  = self._timer.stop()
         it_s   = stats.get("it_s", 0.0)
-        tok_s  = int(it_s * self._tokens_per_batch * self.grad_accum)
-        lr_now = self.scheduler.get_last_lr()[0]
-        ppl    = math.exp(min(accum_loss, 20.0))
-
         mem_gb = 0.0
         if self.device.type == "cuda":
             mem_gb = get_gpu_memory_stats(self.device).get("allocated_gb", 0.0)
+
+        lr_now = self.scheduler.get_last_lr()[0]
 
         metrics = compute_metrics(
             _unwrap_model(self.model),
@@ -421,18 +414,23 @@ class DSALTTrainer:
             self._last_max_seqlen,
         )
 
-        mode = f"DDP×{self.world_size}" if self.world_size > 1 else "GPU"
+        def _fs(v) -> str:
+            return f"{v:.6f}" if math.isfinite(v) else "nan"
 
-        self.logger.info(
-            f"{it_s:.2f} it/s | {mem_gb:.1f} GB | "
-            f"[{mode}] step {self.global_step:3d} | "
-            f"loss {accum_loss:.4f} | ppl {ppl:.2f} | "
-            f"σ₂ {metrics['sigma2']:.6f} | rank {metrics['eff_rank']:.1f} | "
-            f"res {metrics['res_norm']:.4f} | H {metrics['attn_entropy']:.4f} | "
-            f"noise {metrics['noise_norm']:.4f} | sink {metrics['attn_sink']:.4f} | "
-            f"head_std {metrics['head_spec_std']:.4f} | "
-            f"lr {lr_now:.2e}"
+        msg = (
+            f"step={self.global_step} | "
+            f"loss={accum_loss:.4f} | "
+            f"lr={lr_now:.2e} | "
+            f"σ²={_fs(metrics['sigma2'])} | "
+            f"rank={_fs(metrics['eff_rank'])} | "
+            f"res={metrics['res_norm']:.4f} | "
+            f"H={_fs(metrics['attn_entropy'])} | "
+            f"noise={_fs(metrics['noise_norm'])} | "
+            f"sink={_fs(metrics['attn_sink'])} | "
+            f"head_std={_fs(metrics['head_spec_std'])}"
         )
+
+        self.logger.info(msg, extra={"it_s": it_s, "mem_gb": mem_gb})
 
         self.history["train_loss"].append(accum_loss)
         self.history["it_s"].append(it_s)
@@ -454,7 +452,7 @@ class DSALTTrainer:
 
         if self.is_main:
             n_params = sum(p.numel() for p in _unwrap_model(self.model).parameters() if p.requires_grad)
-            mode = (
+            mode     = (
                 f"DDP×{self.world_size} (backend={self.ddp_backend})"
                 if self.world_size > 1 else "1×GPU"
             )
@@ -510,9 +508,10 @@ class DSALTTrainer:
                 if self.is_main:
                     self.history["val_ppl"].append(val_ppl)
                     self.history["val_steps"].append(self.global_step)
+                    is_best = val_ppl < self.best_val_ppl
                     self.logger.info(
-                        f"step {self.global_step:3d} | val_ppl={val_ppl:.4f}"
-                        + (" ← best" if val_ppl < self.best_val_ppl else "")
+                        f"step={self.global_step} | val_ppl={val_ppl:.4f}"
+                        + (" ← best" if is_best else "")
                     )
                 if val_ppl < self.best_val_ppl:
                     self.best_val_ppl = val_ppl
