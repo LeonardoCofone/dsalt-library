@@ -11,7 +11,7 @@ def setup_ddp(backend: str = "nccl") -> tuple[int, int, int]:
     if world_size > 1:
         torch.cuda.set_device(local_rank)
         if not dist.is_initialized():
-            dist.init_process_group(backend=backend, device_id=torch.device())
+            dist.init_process_group(backend=backend, device_id=torch.device(f"cuda:{local_rank}"))
         
         if torch.cuda.get_device_capability()[0] >= 8:
             torch.set_float32_matmul_precision('high')
