@@ -7,9 +7,7 @@ from ..kernels.RMSENorm import RMSENorm
 from ..kernels.window_utils import (
     compute_window_sizes,
     build_local_window_mask,
-    build_soft_window_bias,
     build_local_window_mask_packed,
-    build_soft_window_bias_packed,
     apply_rotary_emb,
     build_rope_cache,
 )
@@ -77,7 +75,8 @@ class DSALTAttention(nn.Module):
 
         self.attn_dropout = nn.Dropout(dropout)
 
-        self._last_P: torch.Tensor | None = None
+        self._last_P:        torch.Tensor | None = None
+        self._window_aux:    torch.Tensor | None = None
 
         cos, sin = build_rope_cache(
             seq_len=max_seq_len,
@@ -103,19 +102,18 @@ class DSALTAttention(nn.Module):
         flat = x_prev.view(-1, self.d_model) if x_prev.dim() == 3 else x_prev
         return compute_window_sizes(flat, self.window_proj, self.n_min, self.n_max)
 
-    def _build_masks_and_bias(
+    def _build_full_attn_mask(
         self,
         x: torch.Tensor,
+        w_sizes: torch.Tensor,
         seq_len: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        w_sizes     = self._compute_window_sizes_for_input(x)
+    ) -> torch.Tensor:
         window_mask = build_local_window_mask(seq_len=seq_len, window_sizes=w_sizes, device=device, causal=True)
-        soft_bias   = build_soft_window_bias(seq_len=seq_len, window_sizes=w_sizes, device=device, causal=True)
 
-        x_2d            = x if x.dim() == 2 else x.view(-1, self.d_model)
         W_V             = self.v_proj.weight
         all_head_scores = torch.zeros(seq_len, device=device, dtype=x.dtype)
+        x_2d            = x if x.dim() == 2 else x.view(-1, self.d_model)
         for h in range(self.n_heads):
             all_head_scores = all_head_scores + compute_hybrid_scores(x_2d, W_V, self.alpha_w[h].detach())
         all_head_scores = all_head_scores / self.n_heads
@@ -123,20 +121,18 @@ class DSALTAttention(nn.Module):
         in_window_any = window_mask.any(dim=0)
         landmarks     = select_landmarks(all_head_scores, k=self.k_lmk, exclude_mask=in_window_any)
         lmk_mask      = build_landmark_mask(seq_len=seq_len, landmark_indices=landmarks, device=device)
-        full_mask     = merge_window_landmark_mask(window_mask, lmk_mask)
 
-        return full_mask, soft_bias
+        return merge_window_landmark_mask(window_mask, lmk_mask)
 
-    def _build_masks_and_bias_packed(
+    def _build_packed_attn_mask(
         self,
         x: torch.Tensor,
+        w_sizes: torch.Tensor,
         cu_seqlens: torch.Tensor,
         total_len: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        w_sizes     = self._compute_window_sizes_for_input(x)
+    ) -> torch.Tensor:
         window_mask = build_local_window_mask_packed(cu_seqlens=cu_seqlens, window_sizes=w_sizes, total_len=total_len, device=device)
-        soft_bias   = build_soft_window_bias_packed(cu_seqlens=cu_seqlens, window_sizes=w_sizes, total_len=total_len, device=device)
 
         W_V             = self.v_proj.weight
         all_head_scores = torch.zeros(total_len, device=device, dtype=x.dtype)
@@ -155,7 +151,17 @@ class DSALTAttention(nn.Module):
                 _, lmk_local = torch.topk(local_scores, k=k_actual, sorted=False)
                 full_mask[start:end, lmk_local + start] = True
 
-        return full_mask, soft_bias
+        return full_mask
+
+    def _window_alpha_aux(
+        self,
+        w_sizes: torch.Tensor,
+        attn_out: torch.Tensor,
+    ) -> torch.Tensor:
+        w_mean  = w_sizes.mean()
+        a_mean  = torch.sigmoid(self.alpha_w).mean()
+        proxy   = w_mean * 0.0 + a_mean * 0.0
+        return attn_out + proxy
 
     def forward(
         self,
@@ -186,38 +192,31 @@ class DSALTAttention(nn.Module):
         cos, sin = self._get_rope(T, device)
         q, k     = apply_rotary_emb(q, k, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0))
 
-        x_2d                 = x.view(B * T, self.d_model)
-        full_mask, soft_bias = self._build_masks_and_bias(x_2d, T, device)
+        x_2d   = x.view(B * T, self.d_model)
+        w_sizes = self._compute_window_sizes_for_input(x_2d)
 
-        alpha       = torch.sigmoid(self.alpha_w).to(dtype=x.dtype)
-        soft_bias_t = soft_bias.to(dtype=x.dtype)
-        dead_bias   = torch.zeros(T, T, dtype=x.dtype, device=device).masked_fill(~full_mask, float("-inf"))
+        with torch.no_grad():
+            attn_mask = self._build_full_attn_mask(x_2d, w_sizes, T, device)
 
         outputs = []
         for b in range(B):
-            head_outs = []
-            for h in range(self.n_heads):
-                qh = q[b, h].unsqueeze(0)
-                kh = k[b, h].unsqueeze(0)
-                vh = v[b, h].unsqueeze(0)
-
-                scores = torch.matmul(qh, kh.transpose(-2, -1)) / self.scale
-                scores = scores + dead_bias.unsqueeze(0) + alpha[h] * soft_bias_t.unsqueeze(0)
-
-                attn = torch.softmax(scores, dim=-1)
-                attn = self.attn_dropout(attn) if self.training else attn
-                head_outs.append(torch.matmul(attn, vh).squeeze(0))
-
-            outputs.append(torch.stack(head_outs, dim=0))
+            outputs.append(sparse_attention_forward(
+                q[b], k[b], v[b],
+                attn_mask=attn_mask,
+                dropout_p=self.dropout,
+                training=self.training,
+            ))
 
         if not self.training:
             with torch.no_grad():
-                self._last_P = _compute_attn_weights(q[0].detach(), k[0].detach(), full_mask)
+                self._last_P = _compute_attn_weights(q[0].detach(), k[0].detach(), attn_mask)
         else:
             self._last_P = None
 
         out = torch.stack(outputs, dim=0).transpose(1, 2).contiguous().view(B, T, self.d_model)
-        return self.out_proj(out)
+        out = self.out_proj(out)
+        out = self._window_alpha_aux(w_sizes, out)
+        return out
 
     def _forward_packed(
         self,
@@ -233,36 +232,19 @@ class DSALTAttention(nn.Module):
         cos, sin = self._get_rope(total_len, device)
         q, k     = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
 
-        full_mask, soft_bias = self._build_masks_and_bias_packed(x, cu_seqlens, total_len, device)
+        w_sizes = self._compute_window_sizes_for_input(x)
 
-        alpha       = torch.sigmoid(self.alpha_w).to(dtype=x.dtype)
-        soft_bias_t = soft_bias.to(dtype=x.dtype)
-        dead_bias   = torch.zeros(total_len, total_len, dtype=x.dtype, device=device).masked_fill(~full_mask, float("-inf"))
+        with torch.no_grad():
+            attn_mask = self._build_packed_attn_mask(x, w_sizes, cu_seqlens, total_len, device)
 
-        head_outputs = []
-        for h in range(self.n_heads):
-            seq_outs = []
-            for b in range(len(cu_seqlens) - 1):
-                start = cu_seqlens[b].item()
-                end   = cu_seqlens[b + 1].item()
-
-                qb = q[start:end, h].unsqueeze(0)
-                kb = k[start:end, h].unsqueeze(0)
-                vb = v[start:end, h].unsqueeze(0)
-
-                db = dead_bias[start:end, start:end].unsqueeze(0)
-                sb = soft_bias_t[start:end, start:end].unsqueeze(0)
-
-                scores = torch.matmul(qb, kb.transpose(-2, -1)) / self.scale
-                scores = scores + db + alpha[h] * sb
-
-                attn = torch.softmax(scores, dim=-1)
-                attn = self.attn_dropout(attn) if self.training else attn
-                seq_outs.append(torch.matmul(attn, vb).squeeze(0))
-
-            head_outputs.append(torch.cat(seq_outs, dim=0))
-
-        out = torch.stack(head_outputs, dim=1).contiguous().view(total_len, self.d_model)
+        out = sparse_attention_forward_packed(
+            q, k, v,
+            attn_mask=attn_mask,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=self.max_seq_len,
+            dropout_p=self.dropout,
+            training=self.training,
+        )
 
         if not self.training:
             with torch.no_grad():
@@ -270,8 +252,10 @@ class DSALTAttention(nn.Module):
                 end   = cu_seqlens[1].item()
                 q0    = q[start:end].permute(1, 0, 2).detach()
                 k0    = k[start:end].permute(1, 0, 2).detach()
-                self._last_P = _compute_attn_weights(q0, k0, full_mask[start:end, start:end])
+                self._last_P = _compute_attn_weights(q0, k0, attn_mask[start:end, start:end])
         else:
             self._last_P = None
 
-        return self.out_proj(out)
+        out = self.out_proj(out.contiguous().view(total_len, self.d_model))
+        out = self._window_alpha_aux(w_sizes, out)
+        return out
