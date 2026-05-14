@@ -35,7 +35,6 @@ class DSALTAttention(nn.Module):
         dropout: float = 0.0,
         yarn_scale: float = 1.0,
         layer_idx: int = 0,
-        use_moba: bool = True,
     ):
         super().__init__()
 
@@ -51,7 +50,6 @@ class DSALTAttention(nn.Module):
         self.dropout = dropout
         self.yarn_scale = yarn_scale
         self.layer_idx = layer_idx
-        self.use_moba = use_moba
         self.scale = math.sqrt(self.head_dim)
 
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
@@ -61,10 +59,12 @@ class DSALTAttention(nn.Module):
 
         self.window_proj = nn.Linear(d_model, 1, bias=True)
 
-        alpha_init = math.log(0.6 / (1.0 - 0.6))
-        self.alpha = nn.Parameter(torch.full((n_heads,), alpha_init))
+        alpha_w_init = math.log(0.6 / (1.0 - 0.6))
+        self.alpha_w = nn.Parameter(torch.full((n_heads,), alpha_w_init))
 
         self.attn_dropout = nn.Dropout(dropout)
+
+        self._last_P: torch.Tensor | None = None
 
         cos, sin = build_rope_cache(
             seq_len=max_seq_len,
@@ -118,7 +118,7 @@ class DSALTAttention(nn.Module):
 
         all_head_scores = torch.zeros(seq_len, device=device)
         for h in range(self.n_heads):
-            scores_h = compute_hybrid_scores(x if x.dim() == 2 else x.view(-1, self.d_model), W_V, self.alpha[h])
+            scores_h = compute_hybrid_scores(x if x.dim() == 2 else x.view(-1, self.d_model), W_V, self.alpha_w[h])
             all_head_scores = all_head_scores + scores_h
         all_head_scores = all_head_scores / self.n_heads
 
@@ -149,7 +149,7 @@ class DSALTAttention(nn.Module):
         W_V = self.v_proj.weight
         all_head_scores = torch.zeros(total_len, device=device)
         for h in range(self.n_heads):
-            scores_h = compute_hybrid_scores(x, W_V, self.alpha[h])
+            scores_h = compute_hybrid_scores(x, W_V, self.alpha_w[h])
             all_head_scores = all_head_scores + scores_h
         all_head_scores = all_head_scores / self.n_heads
 
@@ -209,17 +209,22 @@ class DSALTAttention(nn.Module):
         attn_mask = self._build_full_attn_mask(x_flat, T, device)
 
         outputs = []
+        attn_weights = []
         for b in range(B):
             q_b = q[b]
             k_b = k[b]
             v_b = v[b]
-            out_b = sparse_attention_forward(
+            out_b, P_b = sparse_attention_forward(
                 q_b, k_b, v_b,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout,
                 training=self.training,
+                return_attn_weights=True,
             )
             outputs.append(out_b)
+            attn_weights.append(P_b)
+
+        self._last_P = torch.stack(attn_weights, dim=0)
 
         out = torch.stack(outputs, dim=0)
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
@@ -247,14 +252,17 @@ class DSALTAttention(nn.Module):
 
         attn_mask = self._build_packed_attn_mask(x, cu_seqlens, total_len, device)
 
-        out = sparse_attention_forward_packed(
-            q, k, v,             
+        out, P = sparse_attention_forward_packed(
+            q, k, v,
             attn_mask=attn_mask,
             cu_seqlens=cu_seqlens,
             max_seqlen=self.max_seq_len,
             dropout_p=self.dropout,
             training=self.training,
+            return_attn_weights=True,
         )
+
+        self._last_P = P
 
         out = out.contiguous().view(total_len, self.d_model)
         return self.out_proj(out)
