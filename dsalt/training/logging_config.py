@@ -10,6 +10,7 @@ RESET    = "\033[0m"
 BOLD     = "\033[1m"
 DIM      = "\033[2m"
 RED      = "\033[91m"
+ORANGE   = "\033[38;5;208m"
 GREEN    = "\033[92m"
 YELLOW   = "\033[93m"
 MAGENTA  = "\033[95m"
@@ -42,7 +43,12 @@ def _mem_color(gb: float) -> str:
 
 
 def _loss_color(v: float) -> str:
-    return RED if v > 10 else (YELLOW if v > 5 else GREEN)
+    return (
+        GREEN  if v < 2.0 else
+        YELLOW if v < 3.5 else
+        ORANGE if v < 5.5 else
+        RED
+    )
 
 
 def _fmt_val(s: str, decimals: int = 4, color: str = WHITE) -> str:

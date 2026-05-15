@@ -10,10 +10,9 @@ def sparse_attention_forward(
     dropout_p: float = 0.0,
     training: bool = False,
 ) -> torch.Tensor:
-    additive = torch.zeros_like(attn_mask.to(dtype=q.dtype)).masked_fill(~attn_mask, float("-inf"))
+    additive = attn_mask.to(dtype=q.dtype).masked_fill(~attn_mask, float("-inf"))
     while additive.dim() < 4:
         additive = additive.unsqueeze(0)
-
     return F.scaled_dot_product_attention(
         q, k, v,
         attn_mask=additive,
@@ -31,29 +30,22 @@ def sparse_attention_forward_packed(
     dropout_p: float = 0.0,
     training: bool = False,
 ) -> torch.Tensor:
-    outputs  = []
     num_seqs = cu_seqlens.shape[0] - 1
+    outputs  = [None] * num_seqs
+    dp       = dropout_p if training else 0.0
 
     for i in range(num_seqs):
-        start   = int(cu_seqlens[i])
-        end     = int(cu_seqlens[i + 1])
-        seq_len = end - start
+        start = int(cu_seqlens[i])
+        end   = int(cu_seqlens[i + 1])
 
         qi = q[start:end].transpose(0, 1).unsqueeze(0)
         ki = k[start:end].transpose(0, 1).unsqueeze(0)
         vi = v[start:end].transpose(0, 1).unsqueeze(0)
 
         mask_i     = attn_mask[start:end, start:end]
-        additive_i = torch.zeros(seq_len, seq_len, dtype=qi.dtype, device=qi.device)
-        additive_i = additive_i.masked_fill(~mask_i, float("-inf"))
-        additive_i = additive_i.unsqueeze(0).unsqueeze(0)
+        additive_i = mask_i.to(dtype=qi.dtype).masked_fill(~mask_i, float("-inf")).unsqueeze(0).unsqueeze(0)
 
-        out_i = F.scaled_dot_product_attention(
-            qi, ki, vi,
-            attn_mask=additive_i,
-            dropout_p=dropout_p if training else 0.0,
-        )
-        outputs.append(out_i.squeeze(0).transpose(0, 1))
+        outputs[i] = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=additive_i, dropout_p=dp).squeeze(0).transpose(0, 1)
 
     return torch.cat(outputs, dim=0)
 

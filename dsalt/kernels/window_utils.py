@@ -8,9 +8,7 @@ def compute_window_sizes(
     n_min: int,
     n_max: int,
 ) -> torch.Tensor:
-    logits = proj(x_prev).squeeze(-1)
-    w_cont = n_min + torch.sigmoid(logits) * (n_max - n_min)
-    return w_cont
+    return n_min + torch.sigmoid(proj(x_prev).squeeze(-1)) * (n_max - n_min)
 
 
 def build_local_window_mask(
@@ -19,27 +17,13 @@ def build_local_window_mask(
     device: torch.device,
     causal: bool = True,
 ) -> torch.Tensor:
-    """Crea una maschera booleana di finestra locale.
-
-    La versione precedente usava una sigmoide per produrre valori continui,
-    ma il kernel di attenzione si aspetta una maschera booleana.  Convertiamo
-    le dimensioni della finestra in interi e costruiamo la maschera con
-    confronti di indice, analogamente a ``build_local_window_mask_packed``.
-    """
     positions = torch.arange(seq_len, device=device)
-    i_idx = positions.unsqueeze(1)
-    j_idx = positions.unsqueeze(0)
-
-    # Convertiamo le dimensioni della finestra a interi entro [1, seq_len]
-    w = window_sizes.clamp(min=1, max=seq_len).long().unsqueeze(1)
-
-    # Maschera booleana: j è nella finestra [i-w+1, i]
-    local_mask = (j_idx >= (i_idx - w + 1)) & (j_idx <= i_idx)
-
+    diff      = positions.unsqueeze(1) - positions.unsqueeze(0)
+    w         = window_sizes.clamp(min=1, max=seq_len).long().unsqueeze(1)
+    mask      = (diff >= 0) & (diff < w)
     if not causal:
-        local_mask = local_mask | local_mask.T
-
-    return local_mask
+        mask = mask | mask.T
+    return mask
 
 
 def build_local_window_mask_packed(
@@ -48,23 +32,22 @@ def build_local_window_mask_packed(
     total_len: int,
     device: torch.device,
 ) -> torch.Tensor:
-    mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
+    row_idx = torch.arange(total_len, device=device)
+    col_idx = torch.arange(total_len, device=device)
 
-    for b in range(len(cu_seqlens) - 1):
-        start = cu_seqlens[b].item()
-        end = cu_seqlens[b + 1].item()
-        seq_len = end - start
+    seq_ids  = torch.zeros(total_len, dtype=torch.long, device=device)
+    seq_off  = torch.zeros(total_len, dtype=torch.long, device=device)
+    num_seqs = cu_seqlens.shape[0] - 1
 
-        local_w = window_sizes[start:end].long().clamp(min=1, max=seq_len)
+    for b in range(num_seqs):
+        s, e = int(cu_seqlens[b]), int(cu_seqlens[b + 1])
+        seq_ids[s:e]  = b
+        seq_off[s:e]  = torch.arange(e - s, device=device)
 
-        positions = torch.arange(seq_len, device=device)
-        i_idx = positions.unsqueeze(1)
-        j_idx = positions.unsqueeze(0)
-        w = local_w.unsqueeze(1)
-
-        local = (j_idx >= (i_idx - w + 1)) & (j_idx <= i_idx)
-        mask[start:end, start:end] = local
-
+    w    = window_sizes.clamp(min=1).long()
+    diff = seq_off.unsqueeze(1) - seq_off.unsqueeze(0)
+    same = seq_ids.unsqueeze(1) == seq_ids.unsqueeze(0)
+    mask = same & (diff >= 0) & (diff < w.unsqueeze(1))
     return mask
 
 
@@ -74,14 +57,10 @@ def apply_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    def rotate_half(x: torch.Tensor) -> torch.Tensor:
-        half = x.shape[-1] // 2
-        x1, x2 = x[..., :half], x[..., half:]
-        return torch.cat([-x2, x1], dim=-1)
-
-    q_rot = q * cos + rotate_half(q) * sin
-    k_rot = k * cos + rotate_half(k) * sin
-    return q_rot, k_rot
+    half  = q.shape[-1] // 2
+    def _rot(x):
+        return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+    return q * cos + _rot(q) * sin, k * cos + _rot(k) * sin
 
 
 def build_rope_cache(
@@ -92,8 +71,7 @@ def build_rope_cache(
     base: float = 10000.0,
     scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    theta = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=dtype) / head_dim))
+    theta     = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=dtype) / head_dim))
     positions = torch.arange(seq_len, device=device, dtype=dtype) / scale
-    freqs = torch.outer(positions, theta)
-    emb = torch.cat([freqs, freqs], dim=-1)
+    emb       = torch.cat([torch.outer(positions, theta)] * 2, dim=-1)
     return emb.cos(), emb.sin()
