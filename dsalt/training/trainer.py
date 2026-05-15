@@ -29,7 +29,12 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
 
 
 @torch.no_grad()
-def compute_metrics(model: nn.Module, ids: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> dict:
+def compute_metrics(
+    model: nn.Module,
+    ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> dict:
     m = _unwrap_model(model)
     m.eval()
 
@@ -45,8 +50,8 @@ def compute_metrics(model: nn.Module, ids: torch.Tensor, cu_seqlens: torch.Tenso
     last_attn = m.layers[-1].attn
     sigma2    = float("nan")
     eff_rank  = float("nan")
-    sigma2_per_layer         = []
-    eff_rank_per_layer_attn  = []
+    sigma2_per_layer        = []
+    eff_rank_per_layer_attn = []
 
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
         P     = last_attn._last_P.float()
@@ -83,7 +88,7 @@ def compute_metrics(model: nn.Module, ids: torch.Tensor, cu_seqlens: torch.Tenso
         xm = h_l.mean(dim=0, keepdim=True)
         res_per_layer.append(((h_l - xm).norm() / (h0_norm + 1e-9)).item())
 
-    attn_entropy    = float("nan")
+    attn_entropy      = float("nan")
     entropy_per_layer = []
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
         P_safe       = last_attn._last_P.float().clamp(min=1e-9)
@@ -97,9 +102,9 @@ def compute_metrics(model: nn.Module, ids: torch.Tensor, cu_seqlens: torch.Tenso
         else:
             entropy_per_layer.append(float("nan"))
 
-    min_dist            = 64
-    n_pairs             = min(64, total_len - min_dist)
-    token_dist          = float("nan")
+    min_dist             = 64
+    n_pairs              = min(64, total_len - min_dist)
+    token_dist           = float("nan")
     token_dist_per_layer = []
     if n_pairs > 0:
         pairs_i    = torch.randint(min_dist, total_len, (n_pairs,), device=device)
@@ -120,7 +125,7 @@ def compute_metrics(model: nn.Module, ids: torch.Tensor, cu_seqlens: torch.Tenso
         ids_pert   = ids.clone()
         ids_pert[inject_pos] = torch.randint(0, m.vocab_size, (1,), device=device).item()
 
-        x_pert            = m.embed_tokens(ids_pert)
+        x_pert             = m.embed_tokens(ids_pert)
         layer_hiddens_pert = [x_pert.clone()]
         for layer in m.layers:
             x_pert = layer(x_pert, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
@@ -140,11 +145,10 @@ def compute_metrics(model: nn.Module, ids: torch.Tensor, cu_seqlens: torch.Tenso
     head_spec_std = float("nan")
     attn_sink     = float("nan")
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
-        P              = last_attn._last_P.float().clamp(min=1e-9)
-        entropy_heads  = -(P * P.log()).sum(dim=-1).mean(dim=-1)
-        # std(correction=0) evita il crash con n_heads == 1
-        head_spec_std  = entropy_heads.std(correction=0).item() if entropy_heads.numel() > 0 else float("nan")
-        attn_sink      = last_attn._last_P.float()[:, :, 0].mean().item()
+        P             = last_attn._last_P.float().clamp(min=1e-9)
+        entropy_heads = -(P * P.log()).sum(dim=-1).mean(dim=-1)
+        head_spec_std = entropy_heads.std(correction=0).item() if entropy_heads.numel() > 0 else float("nan")
+        attn_sink     = last_attn._last_P.float()[:, :, 0].mean().item()
 
     alpha_per_head = []
     for layer in m.layers:
@@ -275,9 +279,11 @@ class DSALTTrainer:
         self.best_val_ppl      = float("inf")
         self._timer            = StepTimer(window=50, device=self.device)
         self._tokens_per_batch = 0
+        self._accum_loss_sum   = 0.0
+        self._accum_loss_steps = 0
 
         self.history = {k: [] for k in [
-            "train_loss", "sigma2", "eff_rank", "res_norm", "attn_entropy",
+            "train_loss", "train_ppl", "sigma2", "eff_rank", "res_norm", "attn_entropy",
             "noise_norm", "token_dist", "head_spec_std", "attn_sink",
             "sigma2_per_layer", "entropy_per_layer", "noise_per_layer",
             "eff_rank_per_layer", "res_per_layer", "token_dist_per_layer",
@@ -342,8 +348,13 @@ class DSALTTrainer:
         self._last_max_seqlen  = max_seqlen
 
         with torch.autocast(device_type=self.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
-            out  = self.model(ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, labels=labels,
-                              gradient_checkpointing=self.gradient_checkpointing)
+            out  = self.model(
+                ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                labels=labels,
+                gradient_checkpointing=self.gradient_checkpointing,
+            )
             loss = out["loss"]
         return loss
 
@@ -351,22 +362,27 @@ class DSALTTrainer:
     def _validate(self) -> float:
         self.model.eval()
         total_loss, total_tokens = 0.0, 0
- 
+
         for batch in self.val_loader:
             ids, labels, cu_seqlens, max_seqlen = self._extract_batch(batch)
-            valid_tokens = (labels != -100).sum().item()
-            out = self.model(ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, labels=labels,
-                             gradient_checkpointing=False)
+            valid_tokens  = (labels != -100).sum().item()
+            out           = self.model(
+                ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                labels=labels,
+                gradient_checkpointing=False,
+            )
             total_loss   += out["loss"].item() * valid_tokens
             total_tokens += valid_tokens
- 
+
         self.model.train()
- 
+
         if self.world_size > 1:
             t = torch.tensor([total_loss, float(total_tokens)], device=self.device)
             torch.distributed.all_reduce(t)
             total_loss, total_tokens = t[0].item(), t[1].item()
- 
+
         avg_loss = total_loss / max(total_tokens, 1)
         return math.exp(min(avg_loss, 20.0))
 
@@ -406,7 +422,8 @@ class DSALTTrainer:
         if self.device.type == "cuda":
             mem_gb = get_gpu_memory_stats(self.device).get("allocated_gb", 0.0)
 
-        lr_now = self.scheduler.get_last_lr()[0]
+        lr_now   = self.scheduler.get_last_lr()[0]
+        train_ppl = math.exp(min(accum_loss, 20.0))
 
         metrics = compute_metrics(
             _unwrap_model(self.model),
@@ -421,6 +438,7 @@ class DSALTTrainer:
         msg = (
             f"step={self.global_step} | "
             f"loss={accum_loss:.4f} | "
+            f"ppl={train_ppl:.4f} | "
             f"lr={lr_now:.2e} | "
             f"σ²={_fs(metrics['sigma2'])} | "
             f"rank={_fs(metrics['eff_rank'])} | "
@@ -434,6 +452,7 @@ class DSALTTrainer:
         self.logger.info(msg, extra={"it_s": it_s, "mem_gb": mem_gb})
 
         self.history["train_loss"].append(accum_loss)
+        self.history["train_ppl"].append(train_ppl)
         self.history["it_s"].append(it_s)
         self.history["gpu_mem_gb"].append(mem_gb)
         for k in ["sigma2", "eff_rank", "res_norm", "attn_entropy", "noise_norm",

@@ -28,7 +28,9 @@ class DSALTLMHeadModel(nn.Module):
         self.n_layers   = n_layers
         self.vocab_size = vocab_size
 
-        d_ff = d_ff if d_ff is not None else 4 * d_model
+        hidden_dim = int(8 / 3 * d_model)
+        multiple_of = 128
+        d_ff = ((hidden_dim + multiple_of - 1) // multiple_of) * multiple_of
 
         self.embed_tokens  = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
         self.embed_dropout = nn.Dropout(dropout)
