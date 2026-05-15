@@ -23,10 +23,13 @@ def build_local_window_mask(
     i_idx = positions.unsqueeze(1)
     j_idx = positions.unsqueeze(0)
 
-    w = window_sizes.long().clamp(min=1, max=seq_len)
+    w = window_sizes.clamp(min=1.0, max=float(seq_len))
     w = w.unsqueeze(1)
 
-    local_mask = (j_idx >= (i_idx - w + 1)) & (j_idx <= i_idx)
+    dist = i_idx - j_idx
+    dist = dist.float()
+
+    local_mask = torch.sigmoid((w - dist) * 5.0)
 
     if not causal:
         local_mask = local_mask | local_mask.T

@@ -196,9 +196,8 @@ class DSALTAttention(nn.Module):
 
         x_flat = x.mean(dim=0)
 
-        with torch.no_grad():
-            w_sizes   = self._compute_window_sizes_for_input(x_flat)
-            attn_mask = self._build_full_attn_mask(x_flat, w_sizes, T, device)
+        w_sizes = self._compute_window_sizes_for_input(x_flat)
+        attn_mask = self._build_full_attn_mask(x_flat, w_sizes, T, device)
 
         out = sparse_attention_forward(
             q, k, v,
