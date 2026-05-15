@@ -170,7 +170,7 @@ class _StepFormatter(logging.Formatter):
         except Exception:
             progress = f"{BOLD}step {CYAN}{step}{RESET}"
 
-        hdr = f"  {ts}   {progress}   {speed_s}   {mem_s} {mem_bar}"
+        hdr = f"  {ts}   {progress}   {speed_s}   {mem_s}"
 
         rows = [
             f"  {_cell('loss', loss_s)}{G}{_cell('ppl',       ppl_s)}",

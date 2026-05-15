@@ -351,21 +351,22 @@ class DSALTTrainer:
     def _validate(self) -> float:
         self.model.eval()
         total_loss, total_tokens = 0.0, 0
-
+ 
         for batch in self.val_loader:
             ids, labels, cu_seqlens, max_seqlen = self._extract_batch(batch)
+            valid_tokens = (labels != -100).sum().item()
             out = self.model(ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, labels=labels,
                              gradient_checkpointing=False)
-            total_loss   += out["loss"].item() * ids.numel()
-            total_tokens += ids.numel()
-
+            total_loss   += out["loss"].item() * valid_tokens
+            total_tokens += valid_tokens
+ 
         self.model.train()
-
+ 
         if self.world_size > 1:
             t = torch.tensor([total_loss, float(total_tokens)], device=self.device)
             torch.distributed.all_reduce(t)
             total_loss, total_tokens = t[0].item(), t[1].item()
-
+ 
         avg_loss = total_loss / max(total_tokens, 1)
         return math.exp(min(avg_loss, 20.0))
 
