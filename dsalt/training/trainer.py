@@ -469,6 +469,7 @@ class DSALTTrainer:
         self.optimizer.zero_grad()
         data_iter  = iter(self.train_loader)
         accum_loss = 0.0
+        step_loss = 0.0
 
         if self.is_main:
             n_params = sum(p.numel() for p in _unwrap_model(self.model).parameters() if p.requires_grad)
@@ -486,6 +487,7 @@ class DSALTTrainer:
         self._timer.start()
 
         while self.global_step < self.total_steps:
+            step_loss = 0.0
             for _ in range(self.grad_accum):
                 try:
                     batch = next(data_iter)
@@ -519,7 +521,7 @@ class DSALTTrainer:
             self.global_step += 1
 
             if self.global_step % self.log_every == 0:
-                self._log_step(accum_loss)
+                self._log_step(accum_loss / self.log_every)
                 accum_loss = 0.0
 
             if self.global_step % self.val_every == 0:
