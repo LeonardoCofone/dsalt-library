@@ -27,8 +27,8 @@ def _compute_attn_weights(
     q: torch.Tensor,
     k: torch.Tensor,
     attn_mask: torch.Tensor,
+    scale: float,
 ) -> torch.Tensor:
-    scale    = math.sqrt(q.shape[-1])
     scores   = torch.matmul(q, k.transpose(-2, -1)) / scale
     additive = torch.zeros_like(scores)
     additive = additive.masked_fill(~attn_mask.unsqueeze(0).expand_as(scores), float("-inf"))
@@ -93,9 +93,8 @@ class DSALTAttention(nn.Module):
             return build_rope_cache(seq_len=seq_len, head_dim=self.head_dim, device=device, scale=self.yarn_scale)
         return self.rope_cos[:seq_len].to(device), self.rope_sin[:seq_len].to(device)
 
-    def _compute_window_sizes_for_input(self, x_prev: torch.Tensor) -> torch.Tensor:
-        flat = x_prev.view(-1, self.d_model) if x_prev.dim() == 3 else x_prev
-        return compute_window_sizes(flat, self.window_proj, self.n_min, self.n_max)
+    def _compute_window_sizes_for_input(self, x_flat: torch.Tensor) -> torch.Tensor:
+        return compute_window_sizes(x_flat, self.window_proj, self.n_min, self.n_max)
 
     def _window_alpha_aux(self, w_sizes: torch.Tensor, attn_out: torch.Tensor) -> torch.Tensor:
         w_mean = w_sizes.mean()
@@ -117,13 +116,15 @@ class DSALTAttention(nn.Module):
         )
 
         dh    = self.head_dim
-        W_V   = self.v_proj.weight
-        alpha = torch.sigmoid(self.alpha_w)
+        W_V   = self.v_proj.weight.detach()
+        alpha = torch.sigmoid(self.alpha_w.detach())
+
+        x_2d = x.view(-1, self.d_model) if x.dim() == 3 else x
 
         all_head_scores = torch.zeros(seq_len, device=device, dtype=x.dtype)
         for h in range(self.n_heads):
             W_V_h = W_V[h * dh : (h + 1) * dh, :]
-            all_head_scores = all_head_scores + compute_hybrid_scores(x, W_V_h, alpha[h].detach())
+            all_head_scores = all_head_scores + compute_hybrid_scores(x_2d, W_V_h, alpha[h])
         all_head_scores = all_head_scores / self.n_heads
 
         in_window_any = window_mask.any(dim=0)
@@ -148,13 +149,13 @@ class DSALTAttention(nn.Module):
         )
 
         dh    = self.head_dim
-        W_V   = self.v_proj.weight
-        alpha = torch.sigmoid(self.alpha_w)
+        W_V   = self.v_proj.weight.detach()
+        alpha = torch.sigmoid(self.alpha_w.detach())
 
         all_head_scores = torch.zeros(total_len, device=device, dtype=x.dtype)
         for h in range(self.n_heads):
             W_V_h = W_V[h * dh : (h + 1) * dh, :]
-            all_head_scores = all_head_scores + compute_hybrid_scores(x, W_V_h, alpha[h].detach())
+            all_head_scores = all_head_scores + compute_hybrid_scores(x, W_V_h, alpha[h])
         all_head_scores = all_head_scores / self.n_heads
 
         for b in range(len(cu_seqlens) - 1):
@@ -193,11 +194,11 @@ class DSALTAttention(nn.Module):
         cos, sin = self._get_rope(T, device)
         q, k = apply_rotary_emb(q, k, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0))
 
-        x_first = x[0]
-        w_sizes  = self._compute_window_sizes_for_input(x_first)
+        x_flat = x.mean(dim=0)
 
         with torch.no_grad():
-            attn_mask = self._build_full_attn_mask(x_first, w_sizes, T, device)
+            w_sizes   = self._compute_window_sizes_for_input(x_flat)
+            attn_mask = self._build_full_attn_mask(x_flat, w_sizes, T, device)
 
         out = sparse_attention_forward(
             q, k, v,
@@ -208,7 +209,9 @@ class DSALTAttention(nn.Module):
 
         if not self.training:
             with torch.no_grad():
-                self._last_P = _compute_attn_weights(q[0].detach(), k[0].detach(), attn_mask)
+                self._last_P = _compute_attn_weights(
+                    q[0].detach(), k[0].detach(), attn_mask, self.scale
+                )
         else:
             self._last_P = None
 
@@ -230,9 +233,8 @@ class DSALTAttention(nn.Module):
         cos, sin = self._get_rope(total_len, device)
         q, k = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
 
-        w_sizes = self._compute_window_sizes_for_input(x)
-
         with torch.no_grad():
+            w_sizes   = self._compute_window_sizes_for_input(x)
             attn_mask = self._build_packed_attn_mask(x, w_sizes, cu_seqlens, total_len, device)
 
         out = sparse_attention_forward_packed(
@@ -250,7 +252,9 @@ class DSALTAttention(nn.Module):
                 end   = int(cu_seqlens[1])
                 q0    = q[start:end].transpose(0, 1).detach()
                 k0    = k[start:end].transpose(0, 1).detach()
-                self._last_P = _compute_attn_weights(q0, k0, attn_mask[start:end, start:end])
+                self._last_P = _compute_attn_weights(
+                    q0, k0, attn_mask[start:end, start:end], self.scale
+                )
         else:
             self._last_P = None
 

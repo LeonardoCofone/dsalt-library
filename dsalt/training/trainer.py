@@ -305,7 +305,7 @@ class DSALTTrainer:
         for name, p in base.named_parameters():
             if not p.requires_grad:
                 continue
-            if any(kw in name for kw in ["win_gate", "alpha_w"]):
+            if any(kw in name for kw in ["win_gate", "alpha_w", "window_proj"]):
                 dsalt_params.append(p)
             elif p.ndim < 2 or any(k in name for k in ("norm", "bias", "embed")):
                 nodecay.append(p)

@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,9 +29,9 @@ class DSALTLMHeadModel(nn.Module):
         self.n_layers   = n_layers
         self.vocab_size = vocab_size
 
-        hidden_dim = int(8 / 3 * d_model)
+        hidden_dim  = int(8 / 3 * d_model)
         multiple_of = 128
-        d_ff = ((hidden_dim + multiple_of - 1) // multiple_of) * multiple_of
+        d_ff        = ((hidden_dim + multiple_of - 1) // multiple_of) * multiple_of
 
         self.embed_tokens  = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
         self.embed_dropout = nn.Dropout(dropout)
@@ -61,9 +62,14 @@ class DSALTLMHeadModel(nn.Module):
 
     def _init_weights(self):
         nn.init.normal_(self.embed_tokens.weight, std=0.02)
-        for module in self.modules():
+        residual_std = 0.02 / math.sqrt(2 * self.n_layers)
+
+        for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, std=0.02)
+                if any(k in name for k in ("out_proj", "down_proj")):
+                    nn.init.normal_(module.weight, std=residual_std)
+                else:
+                    nn.init.normal_(module.weight, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
