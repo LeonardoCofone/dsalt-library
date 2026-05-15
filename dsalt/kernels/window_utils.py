@@ -19,17 +19,22 @@ def build_local_window_mask(
     device: torch.device,
     causal: bool = True,
 ) -> torch.Tensor:
+    """Crea una maschera booleana di finestra locale.
+
+    La versione precedente usava una sigmoide per produrre valori continui,
+    ma il kernel di attenzione si aspetta una maschera booleana.  Convertiamo
+    le dimensioni della finestra in interi e costruiamo la maschera con
+    confronti di indice, analogamente a ``build_local_window_mask_packed``.
+    """
     positions = torch.arange(seq_len, device=device)
     i_idx = positions.unsqueeze(1)
     j_idx = positions.unsqueeze(0)
 
-    w = window_sizes.clamp(min=1.0, max=float(seq_len))
-    w = w.unsqueeze(1)
+    # Convertiamo le dimensioni della finestra a interi entro [1, seq_len]
+    w = window_sizes.clamp(min=1, max=seq_len).long().unsqueeze(1)
 
-    dist = i_idx - j_idx
-    dist = dist.float()
-
-    local_mask = torch.sigmoid((w - dist) * 5.0)
+    # Maschera booleana: j è nella finestra [i-w+1, i]
+    local_mask = (j_idx >= (i_idx - w + 1)) & (j_idx <= i_idx)
 
     if not causal:
         local_mask = local_mask | local_mask.T
