@@ -8,7 +8,8 @@
         │    ├── landmark_tokens_ker.py # Logica di selezione dei Landmark (Energy-based scoring + Top-K)
         │    ├── RMSENorm.py          # Implementazione della Root Mean Square Layer Normalization (stabilità)
         │    ├── sparse_attn.py       # Funzioni atomiche per il calcolo dell'attenzione sparsa (logica core)
-        │    ├── window_utils.py      # Utility per gestire la sliding window (masking, padding, indici relativi)
+        │    ├── window_utils.py      # Utility per gestire la sliding window (masking, padding, indici relativi)  
+        │    ├── dsalt_triton_attn.py      #triton
         │
         ├── 📁model
         │    ├── __init__.py          # Inizializzazione del namespace del modello

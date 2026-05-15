@@ -18,7 +18,14 @@ from .sparse_attn import (
     merge_window_landmark_mask,
 )
 
+try:
+    from .dsalt_triton_attn import dsalt_triton_attention
+    _TRITON_OK = True
+except Exception:
+    _TRITON_OK = False
+
 __all__ = [
+    "dsalt_triton_attention",
     "RMSENorm",
     "compute_window_sizes",
     "build_local_window_mask",
