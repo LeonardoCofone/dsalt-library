@@ -7,16 +7,11 @@ def compute_hybrid_scores(
     W_V:   torch.Tensor,
     alpha: torch.Tensor,
 ) -> torch.Tensor:
-    x_norm = x.norm(dim=-1)
-    xwv    = (x @ W_V.T).norm(dim=-1)
-
-    mu_x, std_x = x_norm.mean(), x_norm.std().clamp(min=1e-6)
-    mu_v, std_v = xwv.mean(),    xwv.std().clamp(min=1e-6)
-
-    z_x = (x_norm - mu_x) / std_x
-    z_v = (xwv   - mu_v)  / std_v
-
-    return alpha * z_v + (1.0 - alpha) * z_x
+    x_norm       = x.norm(dim=-1)
+    xwv          = (x @ W_V.T).norm(dim=-1)
+    mu_x, std_x  = x_norm.mean(), x_norm.std().clamp(min=1e-6)
+    mu_v, std_v  = xwv.mean(),    xwv.std().clamp(min=1e-6)
+    return alpha * (xwv - mu_v) / std_v + (1.0 - alpha) * (x_norm - mu_x) / std_x
 
 
 def select_landmarks(
@@ -26,19 +21,9 @@ def select_landmarks(
 ) -> torch.Tensor:
     if exclude_mask is not None:
         scores = scores.masked_fill(exclude_mask, float("-inf"))
-    k_actual = min(k, int((scores != float("-inf")).sum()))
+    k_actual   = min(k, int((scores != float("-inf")).sum()))
     _, indices = torch.topk(scores, k=k_actual, dim=-1, sorted=False)
     return indices
-
-
-def build_landmark_mask(
-    seq_len:          int,
-    landmark_indices: torch.Tensor,
-    device:           torch.device,
-) -> torch.Tensor:
-    mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
-    mask[:, landmark_indices] = True
-    return mask
 
 
 class HybridEnergyLandmarkSelector(nn.Module):
@@ -57,7 +42,7 @@ class HybridEnergyLandmarkSelector(nn.Module):
         k:           int,
         window_mask: torch.Tensor,
     ) -> torch.Tensor:
-        alpha     = torch.sigmoid(self.alpha[layer_idx, head_idx])
-        scores    = compute_hybrid_scores(x, W_V, alpha)
+        alpha    = torch.sigmoid(self.alpha[layer_idx, head_idx])
+        scores   = compute_hybrid_scores(x, W_V, alpha)
         in_window = window_mask.any(dim=0)
         return select_landmarks(scores, k=k, exclude_mask=in_window)

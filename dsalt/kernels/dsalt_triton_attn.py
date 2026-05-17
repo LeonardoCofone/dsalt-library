@@ -23,11 +23,11 @@ def _dsalt_fwd_kernel(
     stride_ot, stride_oh, stride_od,
     stride_lkh, stride_lkb, stride_lks, stride_lkd,
     stride_lvh, stride_lvb, stride_lvs, stride_lvd,
-    scale: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    scale:    tl.constexpr,
+    BLOCK_M:  tl.constexpr,
+    BLOCK_N:  tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    K_LMK: tl.constexpr,
+    K_LMK:   tl.constexpr,
 ):
     pid_bm = tl.program_id(0)
     pid_h  = tl.program_id(1)
@@ -39,9 +39,9 @@ def _dsalt_fwd_kernel(
     seq_len   = seq_end - seq_start
     m_start   = block_off * BLOCK_M
 
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, HEAD_DIM)
-    offs_n = tl.arange(0, BLOCK_N)
+    offs_m  = tl.arange(0, BLOCK_M)
+    offs_d  = tl.arange(0, HEAD_DIM)
+    offs_n  = tl.arange(0, BLOCK_N)
     valid_m = (m_start + offs_m) < seq_len
 
     q_ptrs = (
@@ -71,17 +71,24 @@ def _dsalt_fwd_kernel(
         valid_n      = ((offs_n + n_start) < seq_len) & blk_in_range
 
         k_blk = tl.load(
-            K + (seq_start + n_start + offs_n[None, :]) * stride_kt + pid_h * stride_kh + offs_d[:, None] * stride_kd,
+            K + (seq_start + n_start + offs_n[None, :]) * stride_kt
+              + pid_h * stride_kh
+              + offs_d[:, None] * stride_kd,
             mask=valid_n[None, :], other=0.0,
         ).to(tl.float32)
         v_blk = tl.load(
-            V + (seq_start + n_start + offs_n[None, :]) * stride_vt + pid_h * stride_vh + offs_d[:, None] * stride_vd,
+            V + (seq_start + n_start + offs_n[None, :]) * stride_vt
+              + pid_h * stride_vh
+              + offs_d[:, None] * stride_vd,
             mask=valid_n[None, :], other=0.0,
         ).to(tl.float32)
 
-        qk     = tl.dot(q, k_blk) * scale
-        j_abs  = n_start + offs_n
-        in_win = (j_abs[None, :] >= i_abs[:, None] - w_sizes[:, None] + 1) & (j_abs[None, :] <= i_abs[:, None])
+        qk    = tl.dot(q, k_blk) * scale
+        j_abs = n_start + offs_n
+        in_win = (
+            (j_abs[None, :] >= i_abs[:, None] - w_sizes[:, None] + 1) &
+            (j_abs[None, :] <= i_abs[:, None])
+        )
         final  = in_win & valid_n[None, :] & valid_m[:, None]
         qk     = tl.where(final, qk, float("-inf"))
 
@@ -89,13 +96,19 @@ def _dsalt_fwd_kernel(
         p      = tl.where(final, tl.exp(qk - m_new[:, None]), 0.0)
         l_corr = tl.exp(m_i - m_new)
         l_i    = l_i * l_corr + tl.sum(p, axis=1)
-        acc    = acc * l_corr[:, None] + tl.dot(p.to(tl.float16), tl.trans(v_blk).to(tl.float16)).to(tl.float32)
-        m_i    = m_new
+        acc    = acc * l_corr[:, None] + tl.dot(
+            p.to(tl.float16), tl.trans(v_blk).to(tl.float16)
+        ).to(tl.float32)
+        m_i     = m_new
         n_start += BLOCK_N
 
     for lk in range(0, K_LMK):
-        lk_k = tl.load(Lmk_K + pid_h * stride_lkh + seq_id * stride_lkb + lk * stride_lks + offs_d * stride_lkd).to(tl.float32)
-        lk_v = tl.load(Lmk_V + pid_h * stride_lvh + seq_id * stride_lvb + lk * stride_lvs + offs_d * stride_lvd).to(tl.float32)
+        lk_k = tl.load(
+            Lmk_K + pid_h * stride_lkh + seq_id * stride_lkb + lk * stride_lks + offs_d * stride_lkd
+        ).to(tl.float32)
+        lk_v = tl.load(
+            Lmk_V + pid_h * stride_lvh + seq_id * stride_lvb + lk * stride_lvs + offs_d * stride_lvd
+        ).to(tl.float32)
 
         qk_lk  = tl.where(valid_m, tl.sum(q * lk_k[None, :], axis=1) * scale, float("-inf"))
         m_new  = tl.maximum(m_i, qk_lk)
@@ -105,18 +118,35 @@ def _dsalt_fwd_kernel(
         acc    = acc * l_corr[:, None] + p_lk[:, None] * lk_v[None, :]
         m_i    = m_new
 
-    out_val = tl.where(l_i[:, None] > 1e-9, acc / l_i[:, None], tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32))
+    out_val = tl.where(
+        l_i[:, None] > 1e-9,
+        acc / l_i[:, None],
+        tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32),
+    )
     tl.store(
-        Out + (seq_start + m_start + offs_m[:, None]) * stride_ot + pid_h * stride_oh + offs_d[None, :] * stride_od,
+        Out
+        + (seq_start + m_start + offs_m[:, None]) * stride_ot
+        + pid_h * stride_oh
+        + offs_d[None, :] * stride_od,
         out_val.to(Out.dtype.element_ty),
         mask=valid_m[:, None],
     )
 
 
-def _make_seq_off(cu_seqlens: torch.Tensor, total: int, device: torch.device) -> torch.Tensor:
-    lens    = cu_seqlens[1:] - cu_seqlens[:-1]
-    seq_off = torch.arange(total, device=device) - cu_seqlens[:-1].repeat_interleave(lens)
-    return seq_off
+def _build_seq_block_map(
+    cu_seqlens: torch.Tensor,
+    block_m:    int,
+    device:     torch.device,
+) -> tuple[torch.Tensor, int]:
+    lens       = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu()
+    blocks_per = (lens + block_m - 1) // block_m
+    total_blks = int(blocks_per.sum())
+    seq_col    = torch.repeat_interleave(torch.arange(lens.shape[0], dtype=torch.int32), blocks_per)
+    blk_col    = (
+        torch.arange(total_blks, dtype=torch.int32)
+        - torch.repeat_interleave(blocks_per.cumsum(0) - blocks_per, blocks_per).int()
+    )
+    return torch.stack([seq_col, blk_col], dim=1).to(device).contiguous(), total_blks
 
 
 def _compute_landmark_indices(
@@ -130,39 +160,33 @@ def _compute_landmark_indices(
     device   = x.device
     total    = x.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
+    lens     = cu_seqlens[1:] - cu_seqlens[:-1]
+    starts   = cu_seqlens[:-1].to(device)
+    seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+    seq_off  = torch.arange(total, device=device) - starts[seq_ids]
 
-    x_norm = x.norm(dim=-1)
-    xwv    = (x @ W_V.T).norm(dim=-1)
-    mu_x, std_x = x_norm.mean(), x_norm.std().clamp(min=1e-6)
-    mu_v, std_v = xwv.mean(),    xwv.std().clamp(min=1e-6)
-    a      = alpha.mean()
-    scores = a * (xwv - mu_v) / std_v + (1.0 - a) * (x_norm - mu_x) / std_x
+    x_norm       = x.norm(dim=-1)
+    xwv          = (x @ W_V.T).norm(dim=-1)
+    mu_x, std_x  = x_norm.mean(), x_norm.std().clamp(min=1e-6)
+    mu_v, std_v  = xwv.mean(),    xwv.std().clamp(min=1e-6)
+    a            = alpha.mean()
+    scores       = a * (xwv - mu_v) / std_v + (1.0 - a) * (x_norm - mu_x) / std_x
 
-    lens    = cu_seqlens[1:] - cu_seqlens[:-1]
-    seq_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
-    seq_off = _make_seq_off(cu_seqlens, total, device)
-    w_int   = w_sizes.long().clamp(min=1)
-    lo      = (seq_off - w_int + 1).clamp(min=0)
+    w_int = w_sizes.long().clamp(min=1)
+    lo    = (seq_off - w_int + 1).clamp(min=0)
 
-    max_len = int(lens.max())
-
-    lo_pad = torch.full((num_seqs, max_len), torch.iinfo(torch.long).max, device=device)
-    lo_pad[seq_ids, seq_off] = lo
-
-    min_lo_fwd   = lo_pad.cummin(dim=1).values
-    min_lo_suffix = torch.empty_like(lo_pad)
-    min_lo_suffix[:, -1] = lo_pad[:, -1]
-    min_lo_suffix[:, :-1] = torch.minimum(lo_pad[:, :-1], min_lo_fwd[:, 1:].roll(0))
-    min_lo_suffix = lo_pad.flip(1).cummin(dim=1).values.flip(1)
-
-    covered = min_lo_suffix[seq_ids, seq_off] <= seq_off
-
+    max_len   = int(lens.max())
     score_pad = torch.full((num_seqs, max_len), float("-inf"), device=device)
+
+    covered_lo  = lo_pad = torch.full((num_seqs, max_len), max_len, device=device, dtype=torch.long)
+    lo_pad[seq_ids, seq_off] = lo
+    min_lo_suffix = lo_pad.flip(1).cummin(dim=1).values.flip(1)
+    covered       = min_lo_suffix[seq_ids, seq_off] <= seq_off
+
     score_pad[seq_ids, seq_off] = scores.masked_fill(covered, float("-inf"))
 
     k_eff        = min(k_lmk, max_len)
     _, top_local = torch.topk(score_pad, k_eff, dim=1, sorted=False)
-
     if k_eff >= k_lmk:
         return top_local
     fill = top_local[:, :1].expand(num_seqs, k_lmk - k_eff)
@@ -178,28 +202,12 @@ def _build_landmark_kv(
     n_heads:     int,
     head_dim:    int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    device   = K.device
+    starts  = cu_seqlens[:-1].to(K.device)
+    abs_idx = (starts.unsqueeze(1) + lmk_indices).reshape(-1)
     num_seqs = cu_seqlens.shape[0] - 1
-    starts   = cu_seqlens[:-1].to(device)
-    abs_idx  = (starts.unsqueeze(1) + lmk_indices).view(-1)
     lmk_K = K[abs_idx].view(num_seqs, k_lmk, n_heads, head_dim).permute(2, 0, 1, 3).contiguous()
     lmk_V = V[abs_idx].view(num_seqs, k_lmk, n_heads, head_dim).permute(2, 0, 1, 3).contiguous()
     return lmk_K, lmk_V
-
-
-def _build_seq_block_map(
-    cu_seqlens: torch.Tensor,
-    BLOCK_M:    int,
-    device:     torch.device,
-) -> tuple[torch.Tensor, int]:
-    lens       = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu()
-    blocks_per = (lens + BLOCK_M - 1) // BLOCK_M
-    total_blks = int(blocks_per.sum())
-    seq_col    = torch.repeat_interleave(torch.arange(lens.shape[0], dtype=torch.int32), blocks_per)
-    blk_col    = torch.arange(total_blks, dtype=torch.int32) - torch.repeat_interleave(
-        blocks_per.cumsum(0) - blocks_per, blocks_per
-    ).int()
-    return torch.stack([seq_col, blk_col], dim=1).to(device).contiguous(), total_blks
 
 
 def dsalt_triton_attention(
@@ -218,14 +226,17 @@ def dsalt_triton_attention(
     scale      = 1.0 / math.sqrt(head_dim)
     HEAD_DIM_C = triton.next_power_of_2(head_dim)
 
-    q_c   = q.contiguous().to(torch.float16)
-    k_c   = k.contiguous().to(torch.float16)
-    v_c   = v.contiguous().to(torch.float16)
-    out   = torch.zeros_like(q_c)
+    q_c = q.contiguous().to(torch.float16)
+    k_c = k.contiguous().to(torch.float16)
+    v_c = v.contiguous().to(torch.float16)
+    out = torch.zeros_like(q_c)
+
     w_int = w_sizes.clamp(min=1).long().contiguous()
 
     with torch.no_grad():
-        lmk_indices              = _compute_landmark_indices(x.float(), W_V.float(), alpha.float(), w_sizes.float(), cu_seqlens, k_lmk)
+        lmk_indices              = _compute_landmark_indices(
+            x.float(), W_V.float(), alpha.float(), w_sizes.float(), cu_seqlens, k_lmk
+        )
         lmk_K, lmk_V            = _build_landmark_kv(k_c, v_c, lmk_indices, cu_seqlens, k_lmk, n_heads, head_dim)
         seq_block_map, total_blk = _build_seq_block_map(cu_seqlens, 64, device)
 

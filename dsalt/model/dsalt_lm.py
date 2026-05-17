@@ -3,62 +3,56 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..kernels.RMSENorm import RMSENorm
+from ..kernels.RMSENorm         import RMSENorm
 from ..modules.dsalt_transformer import DSALTTransformerBlock
 
 
 def _chunked_cross_entropy(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    labels: torch.Tensor,
-    chunk_size: int = 1024,
+    x:          torch.Tensor,
+    weight:     torch.Tensor,
+    labels:     torch.Tensor,
+    chunk_size: int = 512,
 ) -> torch.Tensor:
-    total_tokens = x.shape[0]
+    total     = x.shape[0]
+    loss_acc  = torch.zeros((), device=x.device, dtype=torch.float32)
+    valid_acc = torch.zeros((), device=x.device, dtype=torch.long)
 
-    loss_sum = torch.tensor(0.0, device=x.device, dtype=torch.float32)
-    denom    = torch.tensor(0,   device=x.device, dtype=torch.long)
-
-    for start in range(0, total_tokens, chunk_size):
-        end = min(start + chunk_size, total_tokens)
-
-        x_c = x[start:end]
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
         y_c = labels[start:end]
 
-        logits = F.linear(x_c, weight)
+        valid = (y_c != -100)
+        if not valid.any():
+            continue
 
-        loss = F.cross_entropy(
-            logits.float(),
-            y_c,
-            ignore_index=-100,
-            reduction="sum",
-        )
+        logits = F.linear(x[start:end], weight)
+        loss   = F.cross_entropy(logits, y_c, ignore_index=-100, reduction="sum")
 
-        loss_sum = loss_sum + loss
-        denom    = denom + (y_c != -100).sum()
+        loss_acc  = loss_acc  + loss.float()
+        valid_acc = valid_acc + valid.sum()
 
-        del logits, loss, x_c, y_c
+        del logits, loss
 
-    denom = denom.clamp(min=1)
-    return loss_sum / denom.float()
+    return loss_acc / valid_acc.clamp(min=1).float()
 
 
 class DSALTLMHeadModel(nn.Module):
     def __init__(
         self,
-        vocab_size:  int,
-        d_model:     int,
-        n_layers:    int,
-        n_heads:     int,
-        n_min:       int,
-        n_max:       int,
-        k_lmk:       int,
-        max_seq_len: int,
-        d_ff:        int | None = None,
-        dropout:     float = 0.0,
-        yarn_scale:  float = 1.0,
-        tie_weights: bool  = True,
-        padding_idx: int | None = None,
-        lm_head_chunk_size: int = 1024,
+        vocab_size:         int,
+        d_model:            int,
+        n_layers:           int,
+        n_heads:            int,
+        n_min:              int,
+        n_max:              int,
+        k_lmk:              int,
+        max_seq_len:        int,
+        d_ff:               int | None = None,
+        dropout:            float      = 0.0,
+        yarn_scale:         float      = 1.0,
+        tie_weights:        bool       = True,
+        padding_idx:        int | None = None,
+        lm_head_chunk_size: int        = 512,
     ):
         super().__init__()
         self.d_model            = d_model
@@ -104,10 +98,10 @@ class DSALTLMHeadModel(nn.Module):
     def forward(
         self,
         input_ids:              torch.Tensor,
-        cu_seqlens:             torch.Tensor | None = None,
-        max_seqlen:             int | None = None,
-        labels:                 torch.Tensor | None = None,
-        gradient_checkpointing: bool = False,
+        cu_seqlens:             torch.Tensor | None     = None,
+        max_seqlen:             int | None              = None,
+        labels:                 torch.Tensor | None     = None,
+        gradient_checkpointing: bool                    = False,
         padding_mask:           torch.BoolTensor | None = None,
     ) -> dict:
         if max_seqlen is None:
@@ -129,10 +123,13 @@ class DSALTLMHeadModel(nn.Module):
         logits = None
 
         if labels is not None:
-            x_2d = x.view(-1, self.d_model)
-            loss  = _chunked_cross_entropy(
-                x_2d, self.lm_head.weight, labels.view(-1), self.lm_head_chunk_size
-            )
+            with torch.autocast(x.device.type, enabled=False):
+                loss = _chunked_cross_entropy(
+                    x.view(-1, self.d_model),
+                    self.lm_head.weight,
+                    labels.view(-1),
+                    self.lm_head_chunk_size,
+                )
         else:
             logits = self.lm_head(x)
 

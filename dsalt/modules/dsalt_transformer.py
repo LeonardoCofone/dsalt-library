@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from ..kernels.RMSENorm import RMSENorm
-from .dsalt_attention import DSALTAttention
+from ..kernels.RMSENorm  import RMSENorm
+from .dsalt_attention    import DSALTAttention
 
 
 class SwiGLUFFN(nn.Module):
@@ -13,10 +13,10 @@ class SwiGLUFFN(nn.Module):
         self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
         self.up_proj   = nn.Linear(d_model, d_ff, bias=False)
         self.down_proj = nn.Linear(d_ff, d_model, bias=False)
-        self.dropout   = nn.Dropout(dropout)
+        self.drop      = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+        return self.drop(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
 class DSALTTransformerBlock(nn.Module):
@@ -47,8 +47,8 @@ class DSALTTransformerBlock(nn.Module):
         self,
         x:                      torch.Tensor,
         cu_seqlens:             torch.Tensor | None = None,
-        max_seqlen:             int | None = None,
-        gradient_checkpointing: bool = False,
+        max_seqlen:             int | None          = None,
+        gradient_checkpointing: bool                = False,
     ) -> torch.Tensor:
         if gradient_checkpointing and self.training:
             x = x + torch.utils.checkpoint.checkpoint(
