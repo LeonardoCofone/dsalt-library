@@ -17,32 +17,19 @@ def build_local_window_mask(
     device:       torch.device,
     causal:       bool = True,
 ) -> torch.Tensor:
-    # Costruisce la mask per sequenza singola in O(n * w_max) invece di O(n²).
-    # Per ogni token i, gli indici validi sono [i - w[i] + 1, i].
-    w    = window_sizes.clamp(min=1, max=seq_len).long()
     rows = torch.arange(seq_len, device=device)
+    w    = window_sizes.clamp(min=1, max=seq_len).long()
+    lo   = (rows - w + 1).clamp(min=0)
+    hi   = rows
 
-    # Massimo numero di posizioni coperte: serve solo per allocare.
-    # Costruiamo la mask riga per riga usando scatter, senza espandere [n, n].
-    mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
-
-    # lo[i] = max(0, i - w[i] + 1), hi[i] = i  (causal)
-    lo = (rows - w + 1).clamp(min=0)
-    hi = rows
-
-    # Invece di fare diff/broadcast n×n, usiamo un segmented fill:
-    # per ogni i settiamo mask[i, lo[i]:hi[i]+1] = True.
-    # Trick vettorizzato con cumsum: costruiamo un vettore di delta e scansioniamo.
-    # delta[i, lo[i]] += 1, delta[i, hi[i]+1] -= 1  → cumsum lungo dim=1 → mask.
     delta = torch.zeros(seq_len, seq_len + 1, dtype=torch.int8, device=device)
-    idx_i = rows.unsqueeze(1)
-    delta.scatter_add_(1, lo.unsqueeze(1),  torch.ones(seq_len, 1, dtype=torch.int8, device=device))
-    delta.scatter_add_(1, (hi + 1).unsqueeze(1), -torch.ones(seq_len, 1, dtype=torch.int8, device=device))
-    mask = delta[:, :seq_len].cumsum(dim=1) > 0
+    ones  = torch.ones(seq_len, 1, dtype=torch.int8, device=device)
+    delta.scatter_add_(1, lo.unsqueeze(1), ones)
+    delta.scatter_add_(1, (hi + 1).unsqueeze(1), -ones)
+    mask = delta[:, :seq_len].cumsum(dim=1).bool()
 
     if not causal:
         mask = mask | mask.T
-
     return mask
 
 
@@ -52,26 +39,32 @@ def build_local_window_mask_packed(
     total_len:    int,
     device:       torch.device,
 ) -> torch.Tensor:
-    # Costruisce la mask packed processando ogni sequenza indipendentemente,
-    # cosi' ogni sottochiamata e' O(L_b * w_max_b) invece di O(total^2).
     num_seqs = cu_seqlens.shape[0] - 1
-    mask     = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
+    lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+    seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+    seq_off  = torch.cat([torch.arange(int(l), device=device) for l in lens.tolist()])
+
+    w   = window_sizes.clamp(min=1).long()
+    lo  = (seq_off - w + 1).clamp(min=0)
+    hi  = seq_off
+
+    starts = cu_seqlens[:-1].to(device)
+
+    mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
+
+    max_len = int(lens.max())
+    delta   = torch.zeros(num_seqs, max_len, max_len + 1, dtype=torch.int8, device=device)
+    ones    = torch.ones(total_len, 1, dtype=torch.int8, device=device)
+
+    delta[seq_ids, seq_off, lo].add_(1)
+    delta[seq_ids, seq_off, hi + 1].add_(-1)
+
+    sub = delta[:, :, :max_len].cumsum(dim=2).bool()
 
     for b in range(num_seqs):
         s = int(cu_seqlens[b]); e = int(cu_seqlens[b + 1])
         L = e - s
-
-        w_b  = window_sizes[s:e].clamp(min=1).long()
-        rows = torch.arange(L, device=device)
-        lo   = (rows - w_b + 1).clamp(min=0)
-        hi   = rows
-
-        delta = torch.zeros(L, L + 1, dtype=torch.int8, device=device)
-        delta.scatter_add_(1, lo.unsqueeze(1), torch.ones(L, 1, dtype=torch.int8, device=device))
-        delta.scatter_add_(1, (hi + 1).unsqueeze(1), -torch.ones(L, 1, dtype=torch.int8, device=device))
-        sub_mask = delta[:, :L].cumsum(dim=1) > 0
-
-        mask[s:e, s:e] = sub_mask
+        mask[s:e, s:e] = sub[b, :L, :L]
 
     return mask
 

@@ -58,13 +58,11 @@ def _dsalt_fwd_kernel(
     )
     q = tl.load(q_ptrs, mask=valid_m[:, None], other=0.0).to(tl.float32)
 
-    w_ptrs  = W_sizes + seq_start + m_start + offs_m
-    w_sizes = tl.load(w_ptrs, mask=valid_m, other=1).to(tl.int32)
-    w_sizes = tl.maximum(w_sizes, 1)
-
+    w_ptrs      = W_sizes + seq_start + m_start + offs_m
+    w_sizes     = tl.load(w_ptrs, mask=valid_m, other=1).to(tl.int32)
+    w_sizes     = tl.maximum(w_sizes, 1)
     w_max_block = tl.max(w_sizes, axis=0)
-
-    i_abs = m_start + offs_m
+    i_abs       = m_start + offs_m
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -72,15 +70,12 @@ def _dsalt_fwd_kernel(
 
     window_start = tl.maximum(0, m_start - w_max_block + 1)
     window_end   = m_start + BLOCK_M
-
-    n_start = window_start - (window_start % BLOCK_N)
+    n_start      = window_start - (window_start % BLOCK_N)
 
     for _ in range(0, (window_end - n_start + BLOCK_N - 1) // BLOCK_N):
-        n_end_blk = n_start + BLOCK_N
-
+        n_end_blk    = n_start + BLOCK_N
         blk_in_range = (n_end_blk > window_start) & (n_start < window_end) & (n_start < seq_len)
-
-        valid_n = ((offs_n + n_start) < seq_len) & blk_in_range
+        valid_n      = ((offs_n + n_start) < seq_len) & blk_in_range
 
         k_ptrs = (
             K
@@ -95,19 +90,16 @@ def _dsalt_fwd_kernel(
             + offs_d[:, None] * stride_vd
         )
 
-        k_blk = tl.load(k_ptrs, mask=valid_n[None, :], other=0.0).to(tl.float32)
-        v_blk = tl.load(v_ptrs, mask=valid_n[None, :], other=0.0).to(tl.float32)
-
-        qk = tl.dot(q, k_blk) * scale
-
+        k_blk  = tl.load(k_ptrs, mask=valid_n[None, :], other=0.0).to(tl.float32)
+        v_blk  = tl.load(v_ptrs, mask=valid_n[None, :], other=0.0).to(tl.float32)
+        qk     = tl.dot(q, k_blk) * scale
         j_abs  = n_start + offs_n
         causal = j_abs[None, :] <= i_abs[:, None]
         win_lo = i_abs[:, None] - w_sizes[:, None] + 1
         in_win = (j_abs[None, :] >= win_lo) & causal
         final  = in_win & valid_n[None, :] & valid_m[:, None]
 
-        qk = tl.where(final, qk, float("-inf"))
-
+        qk     = tl.where(final, qk, float("-inf"))
         m_new  = tl.maximum(m_i, tl.max(qk, axis=1))
         p      = tl.exp(qk - m_new[:, None])
         p      = tl.where(final, p, 0.0)
@@ -115,7 +107,6 @@ def _dsalt_fwd_kernel(
         l_i    = l_i * l_corr + tl.sum(p, axis=1)
         acc    = acc * l_corr[:, None] + tl.dot(p.to(tl.float16), tl.trans(v_blk).to(tl.float16)).to(tl.float32)
         m_i    = m_new
-
         n_start += BLOCK_N
 
     for lk in range(0, K_LMK):
@@ -134,12 +125,10 @@ def _dsalt_fwd_kernel(
             + offs_d * stride_lvd
         )
 
-        lk_k = tl.load(lk_k_ptr).to(tl.float32)
-        lk_v = tl.load(lk_v_ptr).to(tl.float32)
-
-        qk_lk = tl.sum(q * lk_k[None, :], axis=1) * scale
-        qk_lk = tl.where(valid_m, qk_lk, float("-inf"))
-
+        lk_k   = tl.load(lk_k_ptr).to(tl.float32)
+        lk_v   = tl.load(lk_v_ptr).to(tl.float32)
+        qk_lk  = tl.sum(q * lk_k[None, :], axis=1) * scale
+        qk_lk  = tl.where(valid_m, qk_lk, float("-inf"))
         m_new  = tl.maximum(m_i, qk_lk)
         p_lk   = tl.where(valid_m, tl.exp(qk_lk - m_new), 0.0)
         l_corr = tl.exp(m_i - m_new)
@@ -162,21 +151,6 @@ def _dsalt_fwd_kernel(
     tl.store(out_ptrs, out_val.to(Out.dtype.element_ty), mask=valid_m[:, None])
 
 
-def _compute_seq_offsets(
-    cu_seqlens: torch.Tensor,
-    total:      int,
-    device:     torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_seqs = cu_seqlens.shape[0] - 1
-    seq_ids  = torch.zeros(total, dtype=torch.long, device=device)
-    seq_off  = torch.zeros(total, dtype=torch.long, device=device)
-    for b in range(num_seqs):
-        s = int(cu_seqlens[b]); e = int(cu_seqlens[b + 1])
-        seq_ids[s:e] = b
-        seq_off[s:e] = torch.arange(e - s, device=device)
-    return seq_ids, seq_off
-
-
 def _compute_landmark_indices(
     x:          torch.Tensor,
     W_V:        torch.Tensor,
@@ -189,49 +163,56 @@ def _compute_landmark_indices(
     total    = x.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
 
-    a_mean = alpha.mean()
-
     x_norm = x.norm(dim=-1)
     xwv    = (x @ W_V.T).norm(dim=-1)
+    mu_x   = x_norm.mean();  std_x = x_norm.std().clamp(min=1e-6)
+    mu_v   = xwv.mean();     std_v = xwv.std().clamp(min=1e-6)
+    a      = alpha.mean()
+    scores = a * (xwv - mu_v) / std_v + (1.0 - a) * (x_norm - mu_x) / std_x
 
-    mu_x  = x_norm.mean();  std_x = x_norm.std().clamp(min=1e-6)
-    mu_v  = xwv.mean();     std_v = xwv.std().clamp(min=1e-6)
-    z_x   = (x_norm - mu_x) / std_x
-    z_v   = (xwv   - mu_v)  / std_v
-    scores = a_mean * z_v + (1.0 - a_mean) * z_x
+    lens    = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+    seq_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+    seq_off = torch.cat([torch.arange(int(l), device=device) for l in lens.tolist()])
+    w_int   = w_sizes.long().clamp(min=1)
+    lo      = (seq_off - w_int + 1).clamp(min=0)
 
-    _, seq_off = _compute_seq_offsets(cu_seqlens, total, device)
-    w_int = w_sizes.long().clamp(min=1)
+    starts  = cu_seqlens[:-1].to(device)
+    ends    = cu_seqlens[1:].to(device)
 
-    # Un token j è "dentro almeno una window" sse esiste i >= j tale che
-    # seq_off[i] - w[i] + 1 <= seq_off[j] <= seq_off[i].
-    # Equivalente: min_lo_from_j_onward <= seq_off[j]
-    # dove min_lo[i] = seq_off[i] - w[i] + 1.
-    # Calcoliamo questo per sequenza con un cummin da destra: O(n).
-    lo = seq_off - w_int + 1
+    # indice invertito dentro la sequenza
+    inv_pos = ends[seq_ids] - 1 - (starts[seq_ids] + seq_off)
 
-    in_window_any = torch.zeros(total, dtype=torch.bool, device=device)
-    for b in range(num_seqs):
-        s = int(cu_seqlens[b]); e = int(cu_seqlens[b + 1])
-        lo_b  = lo[s:e]
-        off_b = seq_off[s:e]
-        # cummin da destra: min_lo[j] = min(lo[j], lo[j+1], ..., lo[e-1])
-        min_lo_suffix = lo_b.flip(0).cummin(0).values.flip(0)
-        # j è coperto da almeno una window se min_lo_suffix[j] <= off_b[j]
-        in_window_any[s:e] = min_lo_suffix <= off_b
+    # scatter lo nel buffer invertito
+    lo_inv  = torch.empty(total, dtype=torch.long, device=device)
+    lo_inv[starts[seq_ids] + inv_pos] = lo
 
+    # cummin per sequenza — le sequenze sono contigue, lo facciamo in batch
+    # costruendo un tensore padded [num_seqs, max_len] e poi cummin
+    max_len    = int(lens.max())
+    lo_pad     = torch.full((num_seqs, max_len), torch.iinfo(torch.long).max, device=device)
+    row_idx    = seq_ids
+    col_idx    = inv_pos
+    lo_pad[row_idx, col_idx] = lo_inv[starts[seq_ids] + inv_pos]
+
+    min_lo_inv_pad = lo_pad.cummin(dim=1).values
+
+    # raccogliamo min_lo_suffix per ogni token
+    min_lo_suffix = min_lo_inv_pad[seq_ids, inv_pos]
+
+    in_window_any = min_lo_suffix <= seq_off
     masked_scores = scores.masked_fill(in_window_any, float("-inf"))
 
-    lmk_indices = torch.zeros(num_seqs, k_lmk, dtype=torch.long, device=device)
-    for b in range(num_seqs):
-        s  = int(cu_seqlens[b]); e = int(cu_seqlens[b + 1])
-        sc = masked_scores[s:e]
-        k_act = min(k_lmk, int((sc != float("-inf")).sum()))
-        if k_act > 0:
-            _, idx = torch.topk(sc, k_act, sorted=False)
-            lmk_indices[b, :k_act] = idx
-            if k_act < k_lmk:
-                lmk_indices[b, k_act:] = idx[0]
+    # top-k per sequenza in batch [num_seqs, max_len]
+    score_pad = torch.full((num_seqs, max_len), float("-inf"), device=device)
+    score_pad[seq_ids, seq_off] = masked_scores
+
+    k_eff        = min(k_lmk, max_len)
+    _, top_local = torch.topk(score_pad, k_eff, dim=1, sorted=False)
+
+    lmk_indices = top_local[:, :k_lmk]
+    if k_eff < k_lmk:
+        fill = top_local[:, :1].expand(num_seqs, k_lmk - k_eff)
+        lmk_indices = torch.cat([top_local, fill], dim=1)
 
     return lmk_indices
 
@@ -245,17 +226,13 @@ def _build_landmark_kv(
     n_heads:     int,
     head_dim:    int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    num_seqs = cu_seqlens.shape[0] - 1
     device   = K.device
+    num_seqs = cu_seqlens.shape[0] - 1
+    starts   = cu_seqlens[:-1].to(device)
+    abs_idx  = (starts.unsqueeze(1) + lmk_indices).view(-1)
 
-    starts  = cu_seqlens[:-1].to(device)
-    abs_idx = (starts.unsqueeze(1) + lmk_indices).view(-1)
-
-    K_flat = K[abs_idx]
-    V_flat = V[abs_idx]
-
-    lmk_K = K_flat.view(num_seqs, k_lmk, n_heads, head_dim).permute(2, 0, 1, 3).contiguous()
-    lmk_V = V_flat.view(num_seqs, k_lmk, n_heads, head_dim).permute(2, 0, 1, 3).contiguous()
+    lmk_K = K[abs_idx].view(num_seqs, k_lmk, n_heads, head_dim).permute(2, 0, 1, 3).contiguous()
+    lmk_V = V[abs_idx].view(num_seqs, k_lmk, n_heads, head_dim).permute(2, 0, 1, 3).contiguous()
 
     return lmk_K, lmk_V
 
@@ -265,18 +242,16 @@ def _build_seq_block_map(
     BLOCK_M:    int,
     device:     torch.device,
 ) -> tuple[torch.Tensor, int]:
-    num_seqs   = cu_seqlens.shape[0] - 1
-    seq_lens   = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu()
-    blocks_per = ((seq_lens + BLOCK_M - 1) // BLOCK_M).tolist()
-    total_blks = sum(int(b) for b in blocks_per)
+    lens       = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu()
+    blocks_per = ((lens + BLOCK_M - 1) // BLOCK_M)
+    total_blks = int(blocks_per.sum())
 
-    entries = torch.zeros(total_blks, 2, dtype=torch.int32)
-    ptr = 0
-    for b in range(num_seqs):
-        nb = int(blocks_per[b])
-        entries[ptr:ptr + nb, 0] = b
-        entries[ptr:ptr + nb, 1] = torch.arange(nb, dtype=torch.int32)
-        ptr += nb
+    seq_col = torch.repeat_interleave(
+        torch.arange(lens.shape[0], dtype=torch.int32),
+        blocks_per,
+    )
+    blk_col = torch.cat([torch.arange(int(b), dtype=torch.int32) for b in blocks_per.tolist()])
+    entries = torch.stack([seq_col, blk_col], dim=1)
 
     return entries.to(device).contiguous(), total_blks
 
@@ -293,16 +268,14 @@ def dsalt_triton_attention(
     k_lmk:      int,
 ) -> torch.Tensor:
     total_len, n_heads, head_dim = q.shape
-    device = q.device
-    scale  = 1.0 / math.sqrt(head_dim)
-
+    device     = q.device
+    scale      = 1.0 / math.sqrt(head_dim)
     HEAD_DIM_C = triton.next_power_of_2(head_dim)
 
     q_c = q.contiguous().to(torch.float16)
     k_c = k.contiguous().to(torch.float16)
     v_c = v.contiguous().to(torch.float16)
     out = torch.zeros_like(q_c)
-
     w_int = w_sizes.clamp(min=1).long().contiguous()
 
     with torch.no_grad():
@@ -316,15 +289,11 @@ def dsalt_triton_attention(
         seq_block_map, total_blocks = _build_seq_block_map(cu_seqlens, 64, device)
 
     cu_int = cu_seqlens.to(torch.int32).contiguous()
-
-    grid = lambda meta: (total_blocks, n_heads)
+    grid   = lambda meta: (total_blocks, n_heads)
 
     _dsalt_fwd_kernel[grid](
         q_c, k_c, v_c, out,
-        w_int,
-        lmk_K, lmk_V,
-        cu_int,
-        seq_block_map,
+        w_int, lmk_K, lmk_V, cu_int, seq_block_map,
         q_c.stride(0), q_c.stride(1), q_c.stride(2),
         k_c.stride(0), k_c.stride(1), k_c.stride(2),
         v_c.stride(0), v_c.stride(1), v_c.stride(2),
