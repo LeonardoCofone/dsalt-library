@@ -9,13 +9,11 @@ from .window_utils import (
 from .landmark_tokens_ker import (
     compute_hybrid_scores,
     select_landmarks,
-    build_landmark_mask,
     HybridEnergyLandmarkSelector,
 )
 from .sparse_attn import (
     sparse_attention_forward,
     sparse_attention_forward_packed,
-    merge_window_landmark_mask,
 )
 
 try:
@@ -34,9 +32,7 @@ __all__ = [
     "build_rope_cache",
     "compute_hybrid_scores",
     "select_landmarks",
-    "build_landmark_mask",
     "HybridEnergyLandmarkSelector",
     "sparse_attention_forward",
     "sparse_attention_forward_packed",
-    "merge_window_landmark_mask",
 ]

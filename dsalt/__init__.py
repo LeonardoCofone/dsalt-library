@@ -7,6 +7,7 @@ Questo pacchetto aggrega i componenti principali di DSALT, includendo:
 """
 
 from dsalt.kernels import (
+    dsalt_triton_attention,
     RMSENorm,
     compute_window_sizes,
     build_local_window_mask,
@@ -15,19 +16,23 @@ from dsalt.kernels import (
     build_rope_cache,
     compute_hybrid_scores,
     select_landmarks,
-    build_landmark_mask,
     HybridEnergyLandmarkSelector,
     sparse_attention_forward,
     sparse_attention_forward_packed,
-    merge_window_landmark_mask,
 )
-from dsalt.modules import DSALTAttention, DSALTTransformerBlock, SwiGLUFFN
-from dsalt.model.dsalt_lm import DSALTLMHeadModel
 
+from dsalt.modules import (
+    DSALTAttention,
+    DSALTTransformerBlock,
+    SwiGLUFFN,
+)
+
+from dsalt.model.dsalt_lm import DSALTLMHeadModel
 from dsalt.training.trainer import DSALTTrainer
 
 __all__ = [
     "DSALTTrainer",
+    "dsalt_triton_attention",
     "RMSENorm",
     "compute_window_sizes",
     "build_local_window_mask",
@@ -36,11 +41,9 @@ __all__ = [
     "build_rope_cache",
     "compute_hybrid_scores",
     "select_landmarks",
-    "build_landmark_mask",
     "HybridEnergyLandmarkSelector",
     "sparse_attention_forward",
     "sparse_attention_forward_packed",
-    "merge_window_landmark_mask",
     "DSALTAttention",
     "DSALTTransformerBlock",
     "SwiGLUFFN",
