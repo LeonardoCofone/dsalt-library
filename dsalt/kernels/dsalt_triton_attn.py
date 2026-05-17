@@ -162,6 +162,21 @@ def _dsalt_fwd_kernel(
     tl.store(out_ptrs, out_val.to(Out.dtype.element_ty), mask=valid_m[:, None])
 
 
+def _compute_seq_offsets(
+    cu_seqlens: torch.Tensor,
+    total:      int,
+    device:     torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_seqs = cu_seqlens.shape[0] - 1
+    seq_ids  = torch.zeros(total, dtype=torch.long, device=device)
+    seq_off  = torch.zeros(total, dtype=torch.long, device=device)
+    for b in range(num_seqs):
+        s = int(cu_seqlens[b]); e = int(cu_seqlens[b + 1])
+        seq_ids[s:e] = b
+        seq_off[s:e] = torch.arange(e - s, device=device)
+    return seq_ids, seq_off
+
+
 def _compute_landmark_indices(
     x:          torch.Tensor,
     W_V:        torch.Tensor,
@@ -185,23 +200,25 @@ def _compute_landmark_indices(
     z_v   = (xwv   - mu_v)  / std_v
     scores = a_mean * z_v + (1.0 - a_mean) * z_x
 
-    pos    = torch.arange(total, device=device)
-    w_int  = w_sizes.long().clamp(min=1)
+    _, seq_off = _compute_seq_offsets(cu_seqlens, total, device)
+    w_int = w_sizes.long().clamp(min=1)
 
-    seq_ids = torch.zeros(total, dtype=torch.long, device=device)
-    seq_off = torch.zeros(total, dtype=torch.long, device=device)
+    # Un token j è "dentro almeno una window" sse esiste i >= j tale che
+    # seq_off[i] - w[i] + 1 <= seq_off[j] <= seq_off[i].
+    # Equivalente: min_lo_from_j_onward <= seq_off[j]
+    # dove min_lo[i] = seq_off[i] - w[i] + 1.
+    # Calcoliamo questo per sequenza con un cummin da destra: O(n).
+    lo = seq_off - w_int + 1
+
+    in_window_any = torch.zeros(total, dtype=torch.bool, device=device)
     for b in range(num_seqs):
         s = int(cu_seqlens[b]); e = int(cu_seqlens[b + 1])
-        seq_ids[s:e] = b
-        seq_off[s:e] = torch.arange(e - s, device=device)
-
-    lo         = (seq_off - w_int + 1).clamp(min=0)
-    col        = seq_off
-    same_seq   = seq_ids.unsqueeze(1) == seq_ids.unsqueeze(0)
-    diff       = col.unsqueeze(0) - col.unsqueeze(1)
-    lo_mat     = lo.unsqueeze(0).expand(total, total)
-    in_window  = same_seq & (diff >= 0) & (col.unsqueeze(0) >= lo_mat)
-    in_window_any = in_window.any(dim=0)
+        lo_b  = lo[s:e]
+        off_b = seq_off[s:e]
+        # cummin da destra: min_lo[j] = min(lo[j], lo[j+1], ..., lo[e-1])
+        min_lo_suffix = lo_b.flip(0).cummin(0).values.flip(0)
+        # j è coperto da almeno una window se min_lo_suffix[j] <= off_b[j]
+        in_window_any[s:e] = min_lo_suffix <= off_b
 
     masked_scores = scores.masked_fill(in_window_any, float("-inf"))
 
@@ -231,8 +248,8 @@ def _build_landmark_kv(
     num_seqs = cu_seqlens.shape[0] - 1
     device   = K.device
 
-    starts   = cu_seqlens[:-1].to(device)
-    abs_idx  = (starts.unsqueeze(1) + lmk_indices).view(-1)
+    starts  = cu_seqlens[:-1].to(device)
+    abs_idx = (starts.unsqueeze(1) + lmk_indices).view(-1)
 
     K_flat = K[abs_idx]
     V_flat = V[abs_idx]
