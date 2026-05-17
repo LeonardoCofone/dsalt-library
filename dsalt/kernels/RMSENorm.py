@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 
@@ -7,6 +8,19 @@ class RMSENorm(nn.Module):
         super().__init__()
         self.eps    = eps
         self.weight = nn.Parameter(torch.ones(d_model))
+        print(f"--- [RMSENorm] init | d_model={d_model} eps={eps}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
+        t0  = time.perf_counter()
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+        x_in_norm  = x.norm().item()
+        out        = x * rms * self.weight
+        x_out_norm = out.norm().item()
+
+        if x_out_norm > 1e4 or x_out_norm < 1e-4:
+            print(f"--- [RMSENorm] WARNING: norma anomala | in={x_in_norm:.4f} out={x_out_norm:.4f} | shape={tuple(x.shape)}")
+        else:
+            print(f"--- [RMSENorm] forward | shape={tuple(x.shape)} | in_norm={x_in_norm:.4f} out_norm={x_out_norm:.4f} | t={time.perf_counter()-t0:.5f}s")
+
+        return out

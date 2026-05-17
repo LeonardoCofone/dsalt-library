@@ -35,6 +35,9 @@ def compute_metrics(
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
 ) -> dict:
+    t0 = time.perf_counter()
+    print(f"--- [trainer] compute_metrics START | ids={tuple(ids.shape)} max_seqlen={max_seqlen}")
+
     m = _unwrap_model(model)
     m.eval()
 
@@ -42,10 +45,14 @@ def compute_metrics(
     total_len = ids.shape[0]
 
     x = m.embed_tokens(ids)
+    print(f"--- [trainer] compute_metrics | embed x={tuple(x.shape)}")
     layer_hiddens = [x.clone()]
-    for layer in m.layers:
+
+    for i, layer in enumerate(m.layers):
+        print(f"--- [trainer] compute_metrics | layer {i} forward")
         x = layer(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         layer_hiddens.append(x.clone())
+        print(f"--- [trainer] compute_metrics | layer {i} done | x_norm={x.norm().item():.4f}")
 
     last_attn = m.layers[-1].attn
     sigma2    = float("nan")
@@ -54,51 +61,65 @@ def compute_metrics(
     eff_rank_per_layer_attn = []
 
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
+        print(f"--- [trainer] compute_metrics | _last_P trovato su ultimo layer | shape={tuple(last_attn._last_P.shape)}")
         P     = last_attn._last_P.float()
         P_avg = P.mean(dim=0).detach().cpu()
         sv    = torch.linalg.svdvals(P_avg)
         sigma2   = sv[1].item() if sv.shape[0] > 1 else 0.0
         sv_norm  = sv / (sv.sum() + 1e-9)
         eff_rank = torch.exp(-(sv_norm * (sv_norm + 1e-9).log()).sum()).item()
+        print(f"--- [trainer] compute_metrics | sigma2={sigma2:.6f} eff_rank={eff_rank:.4f}")
+    else:
+        print(f"--- [trainer] compute_metrics | WARNING: _last_P non disponibile su ultimo layer (training mode o packed?)")
 
-    for layer in m.layers:
+    for li, layer in enumerate(m.layers):
         attn = layer.attn
         if hasattr(attn, "_last_P") and attn._last_P is not None:
             sv_l  = torch.linalg.svdvals(attn._last_P.float().mean(dim=0).detach().cpu())
             sigma2_per_layer.append(sv_l[1].item() if sv_l.shape[0] > 1 else 0.0)
             sv_ln = sv_l / (sv_l.sum() + 1e-9)
             eff_rank_per_layer_attn.append(torch.exp(-(sv_ln * (sv_ln + 1e-9).log()).sum()).item())
+            print(f"--- [trainer] compute_metrics | layer {li}: sigma2={sigma2_per_layer[-1]:.6f} eff_rank={eff_rank_per_layer_attn[-1]:.4f}")
         else:
             sigma2_per_layer.append(float("nan"))
             eff_rank_per_layer_attn.append(float("nan"))
+            print(f"--- [trainer] compute_metrics | layer {li}: _last_P non disponibile")
 
     eff_rank_per_layer = []
-    for h_l in layer_hiddens[1:]:
+    for li, h_l in enumerate(layer_hiddens[1:]):
         sv_h  = torch.linalg.svdvals(h_l.float().detach().cpu())
         sv_hn = sv_h / (sv_h.sum() + 1e-9)
-        eff_rank_per_layer.append(torch.exp(-(sv_hn * (sv_hn + 1e-9).log()).sum()).item())
+        er    = torch.exp(-(sv_hn * (sv_hn + 1e-9).log()).sum()).item()
+        eff_rank_per_layer.append(er)
+        print(f"--- [trainer] compute_metrics | hidden eff_rank layer {li}: {er:.4f}")
 
     h_final  = layer_hiddens[-1]
     h_mean   = h_final.mean(dim=0, keepdim=True)
     res_norm = ((h_final - h_mean).norm() / (layer_hiddens[0].norm() + 1e-9)).item()
+    print(f"--- [trainer] compute_metrics | res_norm={res_norm:.6f}")
 
     res_per_layer = []
     h0_norm       = layer_hiddens[0].norm().item()
-    for h_l in layer_hiddens[1:]:
-        xm = h_l.mean(dim=0, keepdim=True)
-        res_per_layer.append(((h_l - xm).norm() / (h0_norm + 1e-9)).item())
+    for li, h_l in enumerate(layer_hiddens[1:]):
+        xm  = h_l.mean(dim=0, keepdim=True)
+        rn  = ((h_l - xm).norm() / (h0_norm + 1e-9)).item()
+        res_per_layer.append(rn)
+        print(f"--- [trainer] compute_metrics | res_per_layer[{li}]={rn:.6f}")
 
     attn_entropy      = float("nan")
     entropy_per_layer = []
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
         P_safe       = last_attn._last_P.float().clamp(min=1e-9)
         attn_entropy = -(P_safe * P_safe.log()).sum(dim=-1).mean().item()
+        print(f"--- [trainer] compute_metrics | attn_entropy={attn_entropy:.6f}")
 
-    for layer in m.layers:
+    for li, layer in enumerate(m.layers):
         attn = layer.attn
         if hasattr(attn, "_last_P") and attn._last_P is not None:
             P_l = attn._last_P.float().clamp(min=1e-9)
-            entropy_per_layer.append(-(P_l * P_l.log()).sum(dim=-1).mean().item())
+            H   = -(P_l * P_l.log()).sum(dim=-1).mean().item()
+            entropy_per_layer.append(H)
+            print(f"--- [trainer] compute_metrics | entropy_per_layer[{li}]={H:.6f}")
         else:
             entropy_per_layer.append(float("nan"))
 
@@ -112,35 +133,46 @@ def compute_metrics(
         hi         = layer_hiddens[-1][pairs_i]
         hj         = layer_hiddens[-1][pairs_j]
         token_dist = (hi - hj).norm(dim=-1).mean().item()
-        for h_l in layer_hiddens[1:]:
+        print(f"--- [trainer] compute_metrics | token_dist={token_dist:.6f}")
+        for li, h_l in enumerate(layer_hiddens[1:]):
             hi_l = h_l[pairs_i]
             hj_l = h_l[pairs_j]
-            token_dist_per_layer.append((hi_l - hj_l).norm(dim=-1).mean().item())
+            td   = (hi_l - hj_l).norm(dim=-1).mean().item()
+            token_dist_per_layer.append(td)
+            print(f"--- [trainer] compute_metrics | token_dist_per_layer[{li}]={td:.6f}")
 
     noise_norm      = float("nan")
     noise_per_layer = []
     seq0_len        = (cu_seqlens[1] - cu_seqlens[0]).item()
+    print(f"--- [trainer] compute_metrics | seq0_len={seq0_len} (soglia perturbazione=128)")
+
     if seq0_len > 128:
         inject_pos = int(seq0_len // 4)
         ids_pert   = ids.clone()
         ids_pert[inject_pos] = torch.randint(0, m.vocab_size, (1,), device=device).item()
+        print(f"--- [trainer] compute_metrics | perturbazione al token {inject_pos}")
 
         x_pert             = m.embed_tokens(ids_pert)
         layer_hiddens_pert = [x_pert.clone()]
-        for layer in m.layers:
+        for i, layer in enumerate(m.layers):
             x_pert = layer(x_pert, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             layer_hiddens_pert.append(x_pert.clone())
+            print(f"--- [trainer] compute_metrics | perturb layer {i} done")
 
         far_start = inject_pos + 64
         far_end   = int(cu_seqlens[1].item())
+        print(f"--- [trainer] compute_metrics | noise window=[{far_start}, {far_end}]")
+
         if far_end > far_start:
             noise_norm = (
                 layer_hiddens_pert[-1][far_start:far_end] - layer_hiddens[-1][far_start:far_end]
             ).norm(dim=-1).mean().item()
-            for hl_orig, hl_pert in zip(layer_hiddens[1:], layer_hiddens_pert[1:]):
-                noise_per_layer.append(
-                    (hl_pert[far_start:far_end] - hl_orig[far_start:far_end]).norm(dim=-1).mean().item()
-                )
+            print(f"--- [trainer] compute_metrics | noise_norm={noise_norm:.6f}")
+
+            for li, (hl_orig, hl_pert) in enumerate(zip(layer_hiddens[1:], layer_hiddens_pert[1:])):
+                nl = (hl_pert[far_start:far_end] - hl_orig[far_start:far_end]).norm(dim=-1).mean().item()
+                noise_per_layer.append(nl)
+                print(f"--- [trainer] compute_metrics | noise_per_layer[{li}]={nl:.6f}")
 
     head_spec_std = float("nan")
     attn_sink     = float("nan")
@@ -149,15 +181,18 @@ def compute_metrics(
         entropy_heads = -(P * P.log()).sum(dim=-1).mean(dim=-1)
         head_spec_std = entropy_heads.std(correction=0).item() if entropy_heads.numel() > 0 else float("nan")
         attn_sink     = last_attn._last_P.float()[:, :, 0].mean().item()
+        print(f"--- [trainer] compute_metrics | head_spec_std={head_spec_std:.6f} attn_sink={attn_sink:.6f}")
 
     alpha_per_head = []
-    for layer in m.layers:
+    for li, layer in enumerate(m.layers):
         attn = layer.attn
         if hasattr(attn, "alpha_w"):
-            alpha_per_head.append(torch.sigmoid(attn.alpha_w).detach().cpu().tolist())
+            av = torch.sigmoid(attn.alpha_w).detach().cpu().tolist()
+            alpha_per_head.append(av)
+            print(f"--- [trainer] compute_metrics | alpha layer {li}: {[f'{a:.3f}' for a in av]}")
 
     oow_mass_per_layer = []
-    for layer in m.layers:
+    for li, layer in enumerate(m.layers):
         attn = layer.attn
         if hasattr(attn, "_last_P") and attn._last_P is not None and hasattr(attn, "n_min"):
             P_l       = attn._last_P.float()
@@ -167,10 +202,12 @@ def compute_metrics(
             in_window = (dist < attn.n_min).unsqueeze(0).unsqueeze(0)
             oow       = P_l.masked_fill(in_window, 0.0).sum(dim=-1).mean().item()
             oow_mass_per_layer.append(oow)
+            print(f"--- [trainer] compute_metrics | oow_mass layer {li}={oow:.6f}")
         else:
             oow_mass_per_layer.append(float("nan"))
 
     m.train()
+    print(f"--- [trainer] compute_metrics DONE | t={time.perf_counter()-t0:.4f}s")
 
     return {
         "sigma2":                sigma2,
@@ -242,6 +279,10 @@ class DSALTTrainer:
         self.logger = get_logger("dsalt.trainer", log_dir=str(self.save_dir))
         self.device = get_device(local_rank)
 
+        print(f"--- [trainer] DSALTTrainer init | rank={rank} local_rank={local_rank} world_size={world_size} | device={self.device}")
+        print(f"--- [trainer] lr={lr} wd={weight_decay} max_grad_norm={max_grad_norm} warmup={warmup_steps} total={total_steps}")
+        print(f"--- [trainer] grad_accum={grad_accum} amp={mixed_precision} gc={gradient_checkpointing} compile={compile_model}")
+
         self._amp_dtype = self._resolve_amp_dtype(mixed_precision)
         self._use_amp   = self._amp_dtype is not None
         self._scaler    = (
@@ -249,13 +290,23 @@ class DSALTTrainer:
             if self._use_amp and self._amp_dtype == torch.float16
             else None
         )
+        print(f"--- [trainer] AMP | _amp_dtype={self._amp_dtype} _use_amp={self._use_amp} scaler={'GradScaler' if self._scaler else 'None'}")
 
         if gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
+            print(f"--- [trainer] gradient_checkpointing_enable() chiamato")
 
+        print(f"--- [trainer] spostamento modello su {self.device}")
+        t_to = time.perf_counter()
         model = model.to(self.device)
+        print(f"--- [trainer] modello su device | t={time.perf_counter()-t_to:.2f}s")
+
+        if torch.cuda.is_available():
+            mem = torch.cuda.memory_allocated(self.device) / 1e9
+            print(f"--- [trainer] GPU mem dopo .to(device): {mem:.3f}GB")
 
         if world_size > 1:
+            print(f"--- [trainer] wrapping in DDP | backend={ddp_backend} device_ids=[{local_rank}]")
             model = DDP(
                 model,
                 device_ids=[local_rank],
@@ -263,11 +314,15 @@ class DSALTTrainer:
                 find_unused_parameters=True,
                 gradient_as_bucket_view=True,
             )
+            print(f"--- [trainer] DDP wrapping DONE")
 
         self.model = model
 
         if compile_model and hasattr(torch, "compile"):
+            print(f"--- [trainer] torch.compile() in corso...")
+            t_c = time.perf_counter()
             self.model = torch.compile(self.model)
+            print(f"--- [trainer] torch.compile() DONE | t={time.perf_counter()-t_c:.2f}s")
 
         self.train_loader = train_loader
         self.val_loader   = val_loader
@@ -290,12 +345,16 @@ class DSALTTrainer:
             "alpha_per_head", "oow_mass_per_layer",
             "val_ppl", "val_steps", "gpu_mem_gb", "it_s",
         ]}
+        print(f"--- [trainer] DSALTTrainer init DONE")
 
     def _resolve_amp_dtype(self, mixed_precision: str) -> torch.dtype | None:
         if mixed_precision == "bf16" and self.device.type == "cuda":
+            print(f"--- [trainer] AMP: bf16 selezionato")
             return torch.bfloat16
         if mixed_precision == "fp16" and self.device.type == "cuda":
+            print(f"--- [trainer] AMP: fp16 selezionato")
             return torch.float16
+        print(f"--- [trainer] AMP: disabilitato (mixed_precision='{mixed_precision}' device={self.device.type})")
         return None
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
@@ -312,7 +371,13 @@ class DSALTTrainer:
             else:
                 decay.append(p)
 
-        return torch.optim.AdamW(
+        n_decay    = sum(p.numel() for p in decay)
+        n_nodecay  = sum(p.numel() for p in nodecay)
+        n_dsalt    = sum(p.numel() for p in dsalt_params)
+        print(f"--- [trainer] _build_optimizer | decay={n_decay:,} nodecay={n_nodecay:,} dsalt_special={n_dsalt:,}")
+        print(f"--- [trainer] _build_optimizer | lr={self.lr:.2e} dsalt_lr={self.lr*2:.2e} wd={self.weight_decay}")
+
+        opt = torch.optim.AdamW(
             [
                 {"params": decay,        "weight_decay": self.weight_decay, "lr": self.lr},
                 {"params": nodecay,      "weight_decay": 0.0,               "lr": self.lr},
@@ -322,6 +387,8 @@ class DSALTTrainer:
             eps=1e-8,
             fused=self.device.type == "cuda",
         )
+        print(f"--- [trainer] AdamW costruito | fused={self.device.type == 'cuda'}")
+        return opt
 
     def _build_scheduler(self, optimizer: torch.optim.Optimizer):
         def lr_lambda(step: int) -> float:
@@ -329,24 +396,34 @@ class DSALTTrainer:
                 return float(step) / max(1, self.warmup_steps)
             progress = float(step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
             return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        print(f"--- [trainer] LambdaLR scheduler costruito | warmup={self.warmup_steps} total={self.total_steps}")
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     def _extract_batch(self, batch):
         ids, labels, cu_seqlens, max_seqlen = batch
-        return (
-            ids.to(self.device, non_blocking=True),
-            labels.to(self.device, non_blocking=True),
-            cu_seqlens.to(self.device, non_blocking=True),
-            int(max_seqlen),
-        )
+        ids        = ids.to(self.device, non_blocking=True)
+        labels     = labels.to(self.device, non_blocking=True)
+        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        max_seqlen = int(max_seqlen)
+        print(f"--- [trainer] _extract_batch | ids={tuple(ids.shape)} labels={tuple(labels.shape)} cu_seqlens={tuple(cu_seqlens.shape)} max_seqlen={max_seqlen}")
+        n_valid = (labels != -100).sum().item()
+        print(f"--- [trainer] _extract_batch | token validi={n_valid}/{labels.numel()} | cu_seqlens={cu_seqlens.tolist()}")
+        return ids, labels, cu_seqlens, max_seqlen
 
     def _forward_step(self, batch) -> torch.Tensor:
+        t0 = time.perf_counter()
         ids, labels, cu_seqlens, max_seqlen = self._extract_batch(batch)
         self._tokens_per_batch = ids.numel()
         self._last_ids         = ids
         self._last_cu_seqlens  = cu_seqlens
         self._last_max_seqlen  = max_seqlen
 
+        if torch.cuda.is_available():
+            mem_pre = torch.cuda.memory_allocated(self.device) / 1e9
+            mem_res = torch.cuda.memory_reserved(self.device) / 1e9
+            print(f"--- [trainer] _forward_step PRE-autocast | GPU alloc={mem_pre:.3f}GB reserved={mem_res:.3f}GB")
+
+        print(f"--- [trainer] _forward_step | lancio forward con amp={self._use_amp} dtype={self._amp_dtype}")
         with torch.autocast(device_type=self.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
             out  = self.model(
                 ids,
@@ -356,16 +433,30 @@ class DSALTTrainer:
                 gradient_checkpointing=self.gradient_checkpointing,
             )
             loss = out["loss"]
+
+        print(f"--- [trainer] _forward_step | loss={loss.item():.4f} | t={time.perf_counter()-t0:.4f}s")
+
+        if torch.cuda.is_available():
+            mem_post = torch.cuda.memory_allocated(self.device) / 1e9
+            print(f"--- [trainer] _forward_step POST-forward | GPU alloc={mem_post:.3f}GB")
+
+        if not math.isfinite(loss.item()):
+            print(f"--- [trainer] CRITICAL: loss non finita! loss={loss.item()} - step={self.global_step}")
+
         return loss
 
     @torch.no_grad()
     def _validate(self) -> float:
+        t0 = time.perf_counter()
+        print(f"--- [trainer] _validate START | step={self.global_step}")
         self.model.eval()
         total_loss, total_tokens = 0.0, 0
 
-        for batch in self.val_loader:
+        for vi, batch in enumerate(self.val_loader):
             ids, labels, cu_seqlens, max_seqlen = self._extract_batch(batch)
             valid_tokens  = (labels != -100).sum().item()
+            print(f"--- [trainer] _validate batch {vi} | valid_tokens={valid_tokens}")
+
             out           = self.model(
                 ids,
                 cu_seqlens=cu_seqlens,
@@ -373,22 +464,29 @@ class DSALTTrainer:
                 labels=labels,
                 gradient_checkpointing=False,
             )
-            total_loss   += out["loss"].item() * valid_tokens
+            batch_loss = out["loss"].item()
+            print(f"--- [trainer] _validate batch {vi} | loss={batch_loss:.4f}")
+            total_loss   += batch_loss * valid_tokens
             total_tokens += valid_tokens
 
         self.model.train()
 
         if self.world_size > 1:
+            print(f"--- [trainer] _validate all_reduce | world_size={self.world_size}")
             t = torch.tensor([total_loss, float(total_tokens)], device=self.device)
             torch.distributed.all_reduce(t)
             total_loss, total_tokens = t[0].item(), t[1].item()
 
         avg_loss = total_loss / max(total_tokens, 1)
-        return math.exp(min(avg_loss, 20.0))
+        val_ppl  = math.exp(min(avg_loss, 20.0))
+        print(f"--- [trainer] _validate DONE | avg_loss={avg_loss:.4f} val_ppl={val_ppl:.4f} | t={time.perf_counter()-t0:.4f}s")
+        return val_ppl
 
     def _save_checkpoint(self, tag: str) -> None:
         if not self.is_main:
+            print(f"--- [trainer] _save_checkpoint skip (non main rank={self.rank})")
             return
+        print(f"--- [trainer] _save_checkpoint | tag={tag} step={self.global_step}")
         ckpt = {
             "step":                 self.global_step,
             "model_state_dict":     _unwrap_model(self.model).state_dict(),
@@ -398,10 +496,13 @@ class DSALTTrainer:
             "history":              self.history,
         }
         path = self.save_dir / f"checkpoint_{tag}.pt"
+        t0   = time.perf_counter()
         torch.save(ckpt, path)
+        print(f"--- [trainer] checkpoint salvato → {path} | t={time.perf_counter()-t0:.2f}s")
         self.logger.info(f"checkpoint salvato → {path}")
 
     def load_checkpoint(self, path: str):
+        print(f"--- [trainer] load_checkpoint | path={path}")
         ckpt = torch.load(path, map_location=self.device)
         _unwrap_model(self.model).load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -409,6 +510,7 @@ class DSALTTrainer:
         self.global_step  = ckpt["step"]
         self.best_val_ppl = ckpt.get("best_val_ppl", float("inf"))
         self.history      = ckpt.get("history", self.history)
+        print(f"--- [trainer] load_checkpoint DONE | step={self.global_step} best_val_ppl={self.best_val_ppl:.4f}")
         if self.is_main:
             self.logger.info(f"checkpoint ripreso dallo step {self.global_step}")
 
@@ -416,21 +518,26 @@ class DSALTTrainer:
         if not self.is_main:
             return
 
+        t0     = time.perf_counter()
         stats  = self._timer.stop()
         it_s   = stats.get("it_s", 0.0)
         mem_gb = 0.0
         if self.device.type == "cuda":
             mem_gb = get_gpu_memory_stats(self.device).get("allocated_gb", 0.0)
 
-        lr_now   = self.scheduler.get_last_lr()[0]
+        lr_now    = self.scheduler.get_last_lr()[0]
         train_ppl = math.exp(min(accum_loss, 20.0))
 
+        print(f"--- [trainer] _log_step step={self.global_step} | loss={accum_loss:.4f} ppl={train_ppl:.4f} lr={lr_now:.2e} it/s={it_s:.2f} GPU={mem_gb:.3f}GB")
+
+        print(f"--- [trainer] _log_step | compute_metrics START")
         metrics = compute_metrics(
             _unwrap_model(self.model),
             self._last_ids,
             self._last_cu_seqlens,
             self._last_max_seqlen,
         )
+        print(f"--- [trainer] _log_step | compute_metrics DONE | t={time.perf_counter()-t0:.4f}s")
 
         def _fs(v) -> str:
             return f"{v:.6f}" if math.isfinite(v) else "nan"
@@ -448,6 +555,7 @@ class DSALTTrainer:
             f"sink={_fs(metrics['attn_sink'])} | "
             f"head_std={_fs(metrics['head_spec_std'])}"
         )
+        print(f"--- [trainer] _log_step | {msg}")
 
         self.logger.info(msg, extra={"it_s": it_s, "mem_gb": mem_gb})
 
@@ -469,7 +577,6 @@ class DSALTTrainer:
         self.optimizer.zero_grad()
         data_iter  = iter(self.train_loader)
         accum_loss = 0.0
-        step_loss = 0.0
 
         if self.is_main:
             n_params = sum(p.numel() for p in _unwrap_model(self.model).parameters() if p.requires_grad)
@@ -483,54 +590,77 @@ class DSALTTrainer:
                 f"amp={self._amp_dtype} | gc={self.gradient_checkpointing} | "
                 f"params={n_params:,}"
             )
+            print(f"--- [trainer] train() START | mode={mode} steps={self.total_steps} params={n_params:,}")
 
         self._timer.start()
 
         while self.global_step < self.total_steps:
-            step_loss = 0.0
-            for _ in range(self.grad_accum):
+            print(f"--- [trainer] === STEP {self.global_step} START ===")
+            t_step = time.perf_counter()
+
+            for accum_i in range(self.grad_accum):
+                print(f"--- [trainer] step={self.global_step} accum {accum_i+1}/{self.grad_accum}")
                 try:
                     batch = next(data_iter)
                 except StopIteration:
+                    print(f"--- [trainer] DataLoader esaurito, ricreo iteratore")
                     if isinstance(self.train_loader.sampler, DistributedSampler):
                         self.train_loader.sampler.set_epoch(self.global_step)
                     data_iter = iter(self.train_loader)
                     batch     = next(data_iter)
 
-                loss        = self._forward_step(batch) / self.grad_accum
+                t_fwd = time.perf_counter()
+                loss  = self._forward_step(batch) / self.grad_accum
                 accum_loss += loss.item()
+                print(f"--- [trainer] step={self.global_step} accum {accum_i+1}: loss={loss.item():.4f} | t_fwd={time.perf_counter()-t_fwd:.4f}s")
 
+                t_bwd = time.perf_counter()
                 if self._scaler is not None:
                     self._scaler.scale(loss).backward()
                 else:
                     loss.backward()
+                print(f"--- [trainer] step={self.global_step} backward DONE | t_bwd={time.perf_counter()-t_bwd:.4f}s")
 
+                if torch.cuda.is_available():
+                    mem = torch.cuda.memory_allocated(self.device) / 1e9
+                    print(f"--- [trainer] step={self.global_step} GPU mem post-backward: {mem:.3f}GB")
+
+            t_opt = time.perf_counter()
             if self._scaler is not None:
                 if self.max_grad_norm > 0:
                     self._scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    print(f"--- [trainer] step={self.global_step} grad_norm (pre-clip)={grad_norm:.6f} max={self.max_grad_norm}")
                 self._scaler.step(self.optimizer)
                 self._scaler.update()
+                print(f"--- [trainer] step={self.global_step} scaler.step + update DONE | scale={self._scaler.get_scale():.1f}")
             else:
                 if self.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    print(f"--- [trainer] step={self.global_step} grad_norm (pre-clip)={grad_norm:.6f} max={self.max_grad_norm}")
                 self.optimizer.step()
+                print(f"--- [trainer] step={self.global_step} optimizer.step DONE")
 
             self.scheduler.step()
             self.optimizer.zero_grad()
             self.global_step += 1
+            print(f"--- [trainer] step={self.global_step-1} optimizer+scheduler DONE | t_opt={time.perf_counter()-t_opt:.4f}s | t_step={time.perf_counter()-t_step:.4f}s")
 
             if self.global_step % self.log_every == 0:
-                self._log_step(accum_loss / self.log_every)
+                avg_loss = accum_loss / self.log_every
+                print(f"--- [trainer] log_step trigger | avg_loss={avg_loss:.4f}")
+                self._log_step(avg_loss)
                 accum_loss = 0.0
 
             if self.global_step % self.val_every == 0:
+                print(f"--- [trainer] val_step trigger | step={self.global_step}")
                 barrier(self.rank, self.world_size)
                 val_ppl = self._validate()
                 if self.is_main:
                     self.history["val_ppl"].append(val_ppl)
                     self.history["val_steps"].append(self.global_step)
                     is_best = val_ppl < self.best_val_ppl
+                    print(f"--- [trainer] val_ppl={val_ppl:.4f} | best={self.best_val_ppl:.4f} | is_best={is_best}")
                     self.logger.info(
                         f"step={self.global_step} | val_ppl={val_ppl:.4f}"
                         + (" ← best" if is_best else "")
@@ -540,9 +670,11 @@ class DSALTTrainer:
                     self._save_checkpoint("best")
 
             if self.global_step % self.save_every == 0:
+                print(f"--- [trainer] save_step trigger | step={self.global_step}")
                 self._save_checkpoint(f"step_{self.global_step}")
 
             if self.global_step >= self.total_steps:
+                print(f"--- [trainer] raggiunto total_steps={self.total_steps}, uscita loop")
                 break
 
             self._timer.start()
@@ -550,5 +682,6 @@ class DSALTTrainer:
         self._save_checkpoint("final")
         if self.is_main:
             self.logger.info(f"done | best_val_ppl={self.best_val_ppl:.4f}")
+            print(f"--- [trainer] train() DONE | best_val_ppl={self.best_val_ppl:.4f}")
 
         cleanup_ddp()
