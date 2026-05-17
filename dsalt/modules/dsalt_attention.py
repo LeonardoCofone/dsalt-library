@@ -97,7 +97,6 @@ class DSALTAttention(nn.Module):
 
         self.attn_dropout = nn.Dropout(dropout)
         self._last_P:     torch.Tensor | None = None
-        self._window_aux: torch.Tensor | None = None
 
         cos, sin = build_rope_cache(
             seq_len=max_seq_len, head_dim=self.head_dim,
@@ -114,8 +113,8 @@ class DSALTAttention(nn.Module):
     def _alpha_sigmoid(self) -> torch.Tensor:
         return torch.sigmoid(self.alpha_w)
 
-    def _window_alpha_aux(self, w_sizes: torch.Tensor, attn_out: torch.Tensor) -> torch.Tensor:
-        return attn_out + w_sizes.mean() * 0.0 + self._alpha_sigmoid().mean() * 0.0
+    def _get_W_V_detached(self) -> torch.Tensor:
+        return self.v_proj.weight.detach()
 
     def _build_full_attn_mask(
         self,
@@ -125,16 +124,15 @@ class DSALTAttention(nn.Module):
         device:  torch.device,
     ) -> torch.Tensor:
         window_mask = build_local_window_mask(seq_len=seq_len, window_sizes=w_sizes, device=device, causal=True)
-        W_V         = self.v_proj.weight.detach()
+        W_V         = self._get_W_V_detached()
         alpha       = self._alpha_sigmoid().detach()
-        x_2d        = x.view(-1, self.d_model) if x.dim() == 3 else x
-        scores      = _hybrid_scores_all_heads(x_2d, W_V, alpha, self.head_dim)
+        scores      = _hybrid_scores_all_heads(x, W_V, alpha, self.head_dim)
         in_window   = window_mask.any(dim=0)
         scores      = scores.masked_fill(in_window, float("-inf"))
         k_act       = min(self.k_lmk, int((scores != float("-inf")).sum()))
         lmk_mask    = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
         if k_act > 0:
-            _, idx       = torch.topk(scores, k_act, sorted=False)
+            _, idx           = torch.topk(scores, k_act, sorted=False)
             lmk_mask[:, idx] = True
         return window_mask | lmk_mask
 
@@ -147,60 +145,53 @@ class DSALTAttention(nn.Module):
         device:     torch.device,
     ) -> torch.Tensor:
         num_seqs    = cu_seqlens.shape[0] - 1
-        lens        = cu_seqlens[1:] - cu_seqlens[:-1]
+        lens        = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
         window_mask = build_local_window_mask_packed(
             cu_seqlens=cu_seqlens, window_sizes=w_sizes, total_len=total_len, device=device,
         )
 
-        W_V    = self.v_proj.weight.detach()
+        W_V    = self._get_W_V_detached()
         alpha  = self._alpha_sigmoid().detach()
         scores = _hybrid_scores_all_heads(x, W_V, alpha, self.head_dim)
 
-        max_len    = int(lens.max())
-        seq_ids    = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
-        seq_off    = torch.arange(total_len, device=device) - cu_seqlens[:-1].repeat_interleave(lens)
-        starts     = cu_seqlens[:-1].to(device)
+        max_len  = int(lens.max())
+        seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+        seq_off  = torch.arange(total_len, device=device) - cu_seqlens[:-1].to(device)[seq_ids]
+        starts   = cu_seqlens[:-1].to(device)
 
-        score_pad  = torch.full((num_seqs, max_len), float("-inf"), device=device)
-        win_any    = torch.zeros(num_seqs, max_len, dtype=torch.bool, device=device)
+        # exclude tokens already covered by their own window
+        in_window = window_mask.any(dim=0)  # [total_len]
+        scores    = scores.masked_fill(in_window, float("-inf"))
+
+        score_pad = torch.full((num_seqs, max_len), float("-inf"), device=device)
         score_pad[seq_ids, seq_off] = scores
-        win_any[seq_ids, seq_off]   = window_mask[torch.arange(total_len, device=device),
-                                                   (starts[seq_ids] + seq_off).clamp(max=total_len - 1)].any(dim=0) if False else \
-                                      self._window_any_packed(window_mask, seq_ids, seq_off, total_len, device)
 
-        score_pad  = score_pad.masked_fill(win_any, float("-inf"))
         k_eff      = min(self.k_lmk, max_len)
         _, top_loc = torch.topk(score_pad, k_eff, dim=1, sorted=False)
 
-        abs_lmk    = (starts.unsqueeze(1) + top_loc).clamp(max=total_len - 1)
-        valid_lmk  = score_pad.gather(1, top_loc) != float("-inf")
+        # valid only where score != -inf
+        valid_lmk = score_pad.gather(1, top_loc) != float("-inf")  # [num_seqs, k_eff]
 
-        lmk_row    = seq_ids.unsqueeze(1).expand(num_seqs, k_eff)
-        lmk_col    = top_loc
+        # absolute column indices for landmarks
+        abs_lmk = (starts.unsqueeze(1) + top_loc).clamp(max=total_len - 1)  # [num_seqs, k_eff]
 
+        # vectorised: for every row in [s:e], set landmark columns True
+        # build row ranges per sequence
+        row_starts = starts                          # [num_seqs]
+        row_ends   = cu_seqlens[1:].to(device)       # [num_seqs]
+
+        # expand landmark cols: [total_len] row -> which seq
+        # Use scatter on the flat [total, total] mask
         for b in range(num_seqs):
-            s  = int(cu_seqlens[b]); e = int(cu_seqlens[b + 1])
             vl = valid_lmk[b]
-            if vl.any():
-                idx = abs_lmk[b][vl]
-                window_mask[s:e, idx] = True
+            if not vl.any():
+                continue
+            s   = int(row_starts[b])
+            e   = int(row_ends[b])
+            idx = abs_lmk[b][vl]               # [n_valid]
+            window_mask[s:e, idx] = True
 
         return window_mask
-
-    @staticmethod
-    def _window_any_packed(
-        window_mask: torch.Tensor,
-        seq_ids:     torch.Tensor,
-        seq_off:     torch.Tensor,
-        total_len:   int,
-        device:      torch.device,
-    ) -> torch.Tensor:
-        num_seqs = seq_ids.max().item() + 1
-        max_len  = int(seq_off.max().item()) + 1
-        result   = torch.zeros(num_seqs, max_len, dtype=torch.bool, device=device)
-        col_any  = window_mask.any(dim=0)
-        result[seq_ids, seq_off] = col_any
-        return result
 
     def forward(
         self,
@@ -229,9 +220,12 @@ class DSALTAttention(nn.Module):
         cos, sin = self._get_rope(T, device)
         q, k     = apply_rotary_emb(q, k, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0))
 
+        # Use per-token window sizes, not mean over batch (which was wrong)
         with torch.no_grad():
-            w_sizes   = compute_window_sizes(x.mean(dim=0), self.window_proj, self.n_min, self.n_max)
-            attn_mask = self._build_full_attn_mask(x.mean(dim=0), w_sizes, T, device)
+            # x is [B, T, d] — use first batch item or mean over B, NOT mean over T
+            x_2d      = x.view(B * T, self.d_model)
+            w_sizes   = compute_window_sizes(x_2d, self.window_proj, self.n_min, self.n_max)[:T]
+            attn_mask = self._build_full_attn_mask(x_2d[:T], w_sizes, T, device)
 
         out = sparse_attention_forward(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout, training=self.training)
 
@@ -242,7 +236,9 @@ class DSALTAttention(nn.Module):
             self._last_P = None
 
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
-        return self._window_alpha_aux(w_sizes, self.out_proj(out))
+        # keep gradient path for alpha and w_sizes via a zero-multiply trick
+        aux = self._alpha_sigmoid().mean() * 0.0 + w_sizes.mean() * 0.0
+        return self.out_proj(out) + aux
 
     def _forward_packed(
         self,
@@ -264,7 +260,7 @@ class DSALTAttention(nn.Module):
         attn_mask = None
 
         if _TRITON_OK and self.training and device.type == "cuda":
-            W_V   = self.v_proj.weight.detach()
+            W_V   = self._get_W_V_detached()
             alpha = self._alpha_sigmoid().detach()
             out   = dsalt_triton_attention(q, k, v, x, W_V, alpha, w_sizes, cu_seqlens, self.k_lmk)
         else:
@@ -283,7 +279,8 @@ class DSALTAttention(nn.Module):
             with torch.no_grad():
                 if attn_mask is None:
                     attn_mask = self._build_packed_attn_mask(x, w_sizes, cu_seqlens, total_len, device)
-                s = int(cu_seqlens[0]); e = int(cu_seqlens[1])
+                s = int(cu_seqlens[0])
+                e = int(cu_seqlens[1])
                 self._last_P = _compute_attn_weights(
                     q[s:e].transpose(0, 1).detach(),
                     k[s:e].transpose(0, 1).detach(),
@@ -293,5 +290,5 @@ class DSALTAttention(nn.Module):
         else:
             self._last_P = None
 
-        out = self.out_proj(out.contiguous().view(total_len, self.d_model))
-        return self._window_alpha_aux(w_sizes, out)
+        aux = self._alpha_sigmoid().mean() * 0.0 + w_sizes.mean() * 0.0
+        return self.out_proj(out.contiguous().view(total_len, self.d_model)) + aux

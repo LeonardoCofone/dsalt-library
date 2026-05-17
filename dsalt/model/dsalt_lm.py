@@ -8,26 +8,38 @@ from ..modules.dsalt_transformer import DSALTTransformerBlock
 
 
 def _chunked_cross_entropy(
-    x:          torch.Tensor,
-    weight:     torch.Tensor,
-    labels:     torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
     chunk_size: int = 1024,
 ) -> torch.Tensor:
-    total  = x.shape[0]
-    loss   = torch.tensor(0.0, device=x.device, dtype=torch.float32)
-    n_valid = (labels != -100).sum().clamp(min=1)
+    total_tokens = x.shape[0]
 
-    for start in range(0, total, chunk_size):
-        end      = min(start + chunk_size, total)
-        logits_c = F.linear(x[start:end], weight)
-        loss    += F.cross_entropy(
-            logits_c.float(),
-            labels[start:end],
+    loss_sum = torch.tensor(0.0, device=x.device, dtype=torch.float32)
+    denom    = torch.tensor(0,   device=x.device, dtype=torch.long)
+
+    for start in range(0, total_tokens, chunk_size):
+        end = min(start + chunk_size, total_tokens)
+
+        x_c = x[start:end]
+        y_c = labels[start:end]
+
+        logits = F.linear(x_c, weight)
+
+        loss = F.cross_entropy(
+            logits.float(),
+            y_c,
             ignore_index=-100,
             reduction="sum",
         )
 
-    return loss / n_valid
+        loss_sum = loss_sum + loss
+        denom    = denom + (y_c != -100).sum()
+
+        del logits, loss, x_c, y_c
+
+    denom = denom.clamp(min=1)
+    return loss_sum / denom.float()
 
 
 class DSALTLMHeadModel(nn.Module):

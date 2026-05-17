@@ -30,26 +30,26 @@ def sparse_attention_forward_packed(
     dropout_p:  float = 0.0,
     training:   bool = False,
 ) -> torch.Tensor:
-    num_seqs = cu_seqlens.shape[0] - 1
-    outputs  = [None] * num_seqs
-    dp       = dropout_p if training else 0.0
+    # q/k/v: [total, n_heads, head_dim]
+    # attn_mask: [total, total] bool
+    # We do a single batched SDPA over the full packed sequence.
+    # The mask already encodes both causal + cross-sequence blocking,
+    # so no loop is needed.
+    total_len, n_heads, head_dim = q.shape
+    dp = dropout_p if training else 0.0
 
-    for i in range(num_seqs):
-        s = int(cu_seqlens[i])
-        e = int(cu_seqlens[i + 1])
+    # [1, n_heads, total, head_dim]
+    q_ = q.transpose(0, 1).unsqueeze(0)
+    k_ = k.transpose(0, 1).unsqueeze(0)
+    v_ = v.transpose(0, 1).unsqueeze(0)
 
-        qi = q[s:e].transpose(0, 1).unsqueeze(0)
-        ki = k[s:e].transpose(0, 1).unsqueeze(0)
-        vi = v[s:e].transpose(0, 1).unsqueeze(0)
+    # additive mask: [1, 1, total, total]
+    additive = attn_mask.to(dtype=q.dtype).masked_fill(~attn_mask, float("-inf"))
+    additive = additive.unsqueeze(0).unsqueeze(0)
 
-        mask_i     = attn_mask[s:e, s:e]
-        additive_i = mask_i.to(dtype=qi.dtype).masked_fill(~mask_i, float("-inf")).unsqueeze(0).unsqueeze(0)
-
-        outputs[i] = F.scaled_dot_product_attention(
-            qi, ki, vi, attn_mask=additive_i, dropout_p=dp
-        ).squeeze(0).transpose(0, 1)
-
-    return torch.cat(outputs, dim=0)
+    out = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=additive, dropout_p=dp)
+    # [total, n_heads, head_dim]
+    return out.squeeze(0).transpose(0, 1)
 
 
 def merge_window_landmark_mask(
