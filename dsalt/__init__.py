@@ -19,6 +19,7 @@ from dsalt.kernels import (
     HybridEnergyLandmarkSelector,
     sparse_attention_forward,
     sparse_attention_forward_packed,
+    LigerFusedLinearCrossEntropyFunction,
 )
 
 from dsalt.modules import (
@@ -31,6 +32,7 @@ from dsalt.model.dsalt_lm import DSALTLMHeadModel
 from dsalt.training.trainer import DSALTTrainer
 
 __all__ = [
+    "LigerFusedLinearCrossEntropyFunction",
     "DSALTTrainer",
     "dsalt_triton_attention",
     "RMSENorm",

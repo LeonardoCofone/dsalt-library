@@ -122,15 +122,30 @@ def _build_mask_packed(
     print(f"--- [dsalt_attention] _build_mask_packed | max_len={max_len} | lens={lens.tolist()}")
 
     t1   = time.perf_counter()
-    mask = build_local_window_mask_packed(cu_seqlens, w_sizes, total_len, device)
+    mask = build_local_window_mask_packed(
+        cu_seqlens,
+        w_sizes,
+        total_len,
+        device
+    )
     print(f"--- [dsalt_attention] window mask packed costruita | t={time.perf_counter()-t1:.4f}s")
 
     scores = _hybrid_scores(x, v_weight, alpha, dh)
     print(f"--- [dsalt_attention] hybrid scores calcolati | t={time.perf_counter()-t0:.4f}s")
 
-    in_win   = mask.any(dim=0)
-    s_masked = scores.masked_fill(in_win, float("-inf"))
-    print(f"--- [dsalt_attention] tokens in window={in_win.sum().item()}/{total_len}")
+    num_seqs = cu_seqlens.shape[0] - 1
+    lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+    starts   = cu_seqlens[:-1].to(device)
+    seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+
+    in_win_global = torch.zeros(total_len, dtype=torch.bool, device=device)
+    for b in range(num_seqs):
+        s = cu_seqlens[b]
+        e = cu_seqlens[b+1]
+        in_win_global[s:e] = mask[s:e, s:e].any(dim=0)
+
+    s_masked = scores.masked_fill(in_win_global, float("-inf"))
+    print(f"--- [dsalt_attention] in_win_global={in_win_global}")
 
     score_pad = torch.full((num_seqs, max_len), float("-inf"), device=device)
     score_pad[seq_ids, seq_off] = s_masked
@@ -207,15 +222,20 @@ class DSALTAttention(nn.Module):
         return a
 
     @torch.no_grad()
-    def _rope(self, n: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _rope(self, n: int, device: torch.device):
         t0 = time.perf_counter()
-        if n <= self.rope_cos.shape[0]:
+
+        max_n = self.rope_cos.shape[0]
+
+        if n <= max_n:
             cos = self.rope_cos[:n].to(device)
             sin = self.rope_sin[:n].to(device)
         else:
-            print(f"--- [DSALTAttention] layer={self.layer_idx} rope cache miss: n={n} > max={self.rope_cos.shape[0]}, ricalcolo")
-            cos, sin = build_rope_cache(n, self.head_dim, device, scale=self.yarn_scale)
-        print(f"--- [DSALTAttention] layer={self.layer_idx} _rope | n={n} | t={time.perf_counter()-t0:.4f}s")
+            print(f"--- rope overflow: n={n} > max={max_n}, clamping")
+            cos = self.rope_cos.to(device)
+            sin = self.rope_sin.to(device)
+
+        print(f"--- _rope | n={n} | t={time.perf_counter()-t0:.4f}s")
         return cos, sin
 
     def forward(
@@ -286,8 +306,16 @@ class DSALTAttention(nn.Module):
         v = self.v_proj(x).view(total_len, self.n_heads, self.head_dim)
         print(f"--- [DSALTAttention] layer={self.layer_idx} QKV proj packed | q={tuple(q.shape)} | t={time.perf_counter()-t1:.4f}s")
 
-        cos, sin = self._rope(total_len, device)
-        q, k     = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
+        num_seqs = cu_seqlens.shape[0] - 1
+        lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+        starts   = cu_seqlens[:-1].to(device)
+        seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+        pos_ids  = torch.arange(total_len, device=device) - starts[seq_ids] 
+
+        cos = self.rope_cos[pos_ids].to(device)
+        sin = self.rope_sin[pos_ids].to(device)
+
+        q, k = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
 
         w_sizes = compute_window_sizes(x, self.window_proj, self.n_min, self.n_max).detach()
         print(f"--- [DSALTAttention] layer={self.layer_idx} w_sizes computed | mean={w_sizes.mean().item():.1f}")

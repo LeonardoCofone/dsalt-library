@@ -45,46 +45,42 @@ def build_local_window_mask_packed(
     device:       torch.device,
 ) -> torch.Tensor:
     t0 = time.perf_counter()
-    num_seqs = cu_seqlens.shape[0] - 1
-    print(f"--- [window_utils] build_local_window_mask_packed START | total_len={total_len} | num_seqs={num_seqs} | device={device}")
 
-    lens    = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
-    starts  = cu_seqlens[:-1].to(device)
+    num_seqs = cu_seqlens.shape[0] - 1
+
+    lens   = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+    starts = cu_seqlens[:-1].to(device)
+
     seq_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
     seq_off = torch.arange(total_len, device=device) - starts[seq_ids]
 
-    w      = window_sizes.clamp(min=1).long()
-    abs_lo = (starts[seq_ids] + (seq_off - w + 1).clamp(min=0))
+    w = window_sizes.clamp(min=1).long()
 
-    print(f"--- [window_utils] build_local_window_mask_packed | w_mean={w.float().mean().item():.1f} | abs_lo computed OK")
+    lo = (seq_off - w + 1).clamp(min=0)
+    hi = seq_off
 
-    mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
+    abs_lo = starts[seq_ids] + lo
+    abs_hi = starts[seq_ids] + hi
 
-    ones  = torch.ones(total_len, 1, dtype=torch.int8, device=device)
-    delta = torch.zeros(total_len, total_len + 1, dtype=torch.int8, device=device)
-    abs_hi_excl = torch.arange(total_len, device=device) + 1
+    idx = torch.arange(total_len, device=device)
 
-    delta.scatter_add_(1, abs_lo.unsqueeze(1), ones)
-    delta.scatter_add_(1, abs_hi_excl.unsqueeze(1), -ones)
-    window_raw = delta[:, :total_len].cumsum(dim=1).bool()
+    mask = torch.zeros((total_len, total_len), device=device, dtype=torch.bool)
 
-    same_seq_start = starts[seq_ids]
-    same_seq_end   = starts[seq_ids] + lens[seq_ids]
-    j = torch.arange(total_len, device=device)
+    for i in range(total_len):
+        s = seq_ids[i].item()
+        start = starts[s].item()
+        end = start + lens[s].item()
 
-    row_seq_start = same_seq_start.unsqueeze(1)
-    row_seq_end   = same_seq_end.unsqueeze(1)
-    j_broad       = j.unsqueeze(0)
+        li = abs_lo[i].item()
+        hi_i = abs_hi[i].item()
 
-    in_same_seq = (j_broad >= row_seq_start) & (j_broad < row_seq_end)
-    mask = window_raw & in_same_seq
+        li = max(li, start)
+        hi_i = min(hi_i, end - 1)
 
-    mem_mb = mask.numel() * mask.element_size() / 1e6
-    nz_frac = mask.float().mean().item()
-    print(f"--- [window_utils] build_local_window_mask_packed DONE | mask={tuple(mask.shape)} | mem={mem_mb:.2f}MB | nonzero_frac={nz_frac:.6f} | t={time.perf_counter()-t0:.4f}s")
+        if li <= hi_i:
+            mask[i, li:hi_i + 1] = True
 
-    if mem_mb > 100:
-        print(f"--- [window_utils] WARNING: mask occupa {mem_mb:.1f}MB - considera di ridurre la seq_len o usare il kernel Triton!")
+    print(f"--- [window_utils] packed_window DONE | t={time.perf_counter()-t0:.4f}s")
 
     return mask
 
