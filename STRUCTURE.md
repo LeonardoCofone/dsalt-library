@@ -9,7 +9,8 @@
         │    ├── RMSENorm.py          # Implementazione della Root Mean Square Layer Normalization (stabilità)
         │    ├── sparse_attn.py       # Funzioni atomiche per il calcolo dell'attenzione sparsa (logica core)
         │    ├── window_utils.py      # Utility per gestire la sliding window (masking, padding, indici relativi)  
-        │    ├── dsalt_triton_attn.py      #triton
+        │    ├── dsalt_triton_attn.py      #triton  
+        │    ├── cross_entropy.py      #cross entropy fused da: # https://github.com/linkedin/Liger-Kernel
         │
         ├── 📁model
         │    ├── __init__.py          # Inizializzazione del namespace del modello

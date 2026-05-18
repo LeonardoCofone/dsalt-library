@@ -139,7 +139,7 @@ def _build_seq_block_map(
     block_m:    int,
     device:     torch.device,
 ) -> tuple[torch.Tensor, int]:
-    t0 = time.perf_counter()
+    t0         = time.perf_counter()
     lens       = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu()
     blocks_per = (lens + block_m - 1) // block_m
     total_blks = int(blocks_per.sum())
@@ -161,11 +161,11 @@ def _compute_landmark_indices(
     cu_seqlens: torch.Tensor,
     k_lmk:      int,
 ) -> torch.Tensor:
-    t0 = time.perf_counter()
+    t0       = time.perf_counter()
     device   = x.device
     total    = x.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
-    lens     = cu_seqlens[1:] - cu_seqlens[:-1]
+    lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
     starts   = cu_seqlens[:-1].to(device)
     seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
     seq_off  = torch.arange(total, device=device) - starts[seq_ids]
@@ -173,7 +173,7 @@ def _compute_landmark_indices(
 
     print(f"--- [triton] _compute_landmark_indices START | total={total} num_seqs={num_seqs} k_lmk={k_lmk} max_len={max_len}")
 
-    t1 = time.perf_counter()
+    t1          = time.perf_counter()
     x_norm      = x.norm(dim=-1)
     xwv         = (x @ W_V.T).norm(dim=-1)
     mu_x, std_x = x_norm.mean(), x_norm.std().clamp(min=1e-6)
@@ -183,19 +183,23 @@ def _compute_landmark_indices(
     print(f"--- [triton] scores calcolati | mu_x={mu_x.item():.4f} std_x={std_x.item():.4f} mu_v={mu_v.item():.4f} alpha={a.item():.4f} | t={time.perf_counter()-t1:.4f}s")
 
     w_int = w_sizes.long().clamp(min=1)
-    lo    = (seq_off - w_int + 1).clamp(min=0)
+    lo    = seq_off - w_int + 1             
 
     lo_pad = torch.full((num_seqs, max_len), max_len, device=device, dtype=torch.long)
     lo_pad[seq_ids, seq_off] = lo
 
-    min_lo_suffix = lo_pad.flip(1).cummin(dim=1).values.flip(1)
-    covered       = min_lo_suffix[seq_ids, seq_off] <= seq_off
+    suffix_min = lo_pad.flip(1).cummin(dim=1).values.flip(1) 
+
+    pos_range  = torch.arange(max_len, device=device).unsqueeze(0).expand(num_seqs, -1)
+    covered_2d = suffix_min <= pos_range                 
+
+    covered = covered_2d[seq_ids, seq_off]
+
+    n_covered = covered.sum().item()
+    print(f"--- [triton] covered (in-window) tokens={n_covered}/{total} | non-covered disponibili per landmark={total - n_covered}")
 
     score_pad = torch.full((num_seqs, max_len), float("-inf"), device=device)
     score_pad[seq_ids, seq_off] = scores.masked_fill(covered, float("-inf"))
-
-    n_covered = covered.sum().item()
-    print(f"--- [triton] covered (in-window) tokens={n_covered}/{total} | non-covered disponibili per landmark={total-n_covered}")
 
     k_eff        = min(k_lmk, max_len)
     _, top_local = torch.topk(score_pad, k_eff, dim=1, sorted=False)
@@ -220,7 +224,7 @@ def _build_landmark_kv(
     n_heads:     int,
     head_dim:    int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    t0 = time.perf_counter()
+    t0       = time.perf_counter()
     starts   = cu_seqlens[:-1].to(K.device)
     num_seqs = cu_seqlens.shape[0] - 1
     abs_idx  = (starts.unsqueeze(1) + lmk_indices).reshape(-1)
@@ -247,11 +251,11 @@ def dsalt_triton_attention(
     cu_seqlens: torch.Tensor,
     k_lmk:      int,
 ) -> torch.Tensor:
-    t0 = time.perf_counter()
+    t0                      = time.perf_counter()
     total_len, n_heads, head_dim = q.shape
-    device     = q.device
-    scale      = 1.0 / math.sqrt(head_dim)
-    HEAD_DIM_C = triton.next_power_of_2(head_dim)
+    device                  = q.device
+    scale                   = 1.0 / math.sqrt(head_dim)
+    HEAD_DIM_C              = triton.next_power_of_2(head_dim)
 
     print(f"--- [triton] dsalt_triton_attention START | total_len={total_len} n_heads={n_heads} head_dim={head_dim} HEAD_DIM_C={HEAD_DIM_C} k_lmk={k_lmk}")
     print(f"--- [triton] scale={scale:.6f} | device={device} | q.dtype={q.dtype}")
@@ -305,7 +309,7 @@ def dsalt_triton_attention(
         mem_post = torch.cuda.memory_allocated(device) / 1e9
         print(f"--- [triton] GPU mem POST kernel: {mem_post:.3f}GB | delta={mem_post-mem_pre:.3f}GB")
 
-    out_f = out.float()
+    out_f    = out.float()
     out_norm = out_f.norm().item()
     print(f"--- [triton] output | out_norm={out_norm:.4f} | t_total={time.perf_counter()-t0:.4f}s")
 
