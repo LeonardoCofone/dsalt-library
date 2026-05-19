@@ -55,7 +55,7 @@ def _dsalt_fwd_kernel(
 
     w_sizes     = tl.load(W_sizes + seq_start + m_start + offs_m, mask=valid_m, other=1).to(tl.int32)
     w_sizes     = tl.maximum(w_sizes, 1)
-    w_max_block = tl.max(w_sizes, axis=0)
+    w_max_block = tl.min(w_sizes, axis=0)
     i_abs       = m_start + offs_m
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
@@ -103,21 +103,20 @@ def _dsalt_fwd_kernel(
         m_i     = m_new
         n_start += BLOCK_N
 
-    for lk in range(0, K_LMK):
-        lk_k = tl.load(
-            Lmk_K + pid_h * stride_lkh + seq_id * stride_lkb + lk * stride_lks + offs_d * stride_lkd
-        ).to(tl.float32)
-        lk_v = tl.load(
-            Lmk_V + pid_h * stride_lvh + seq_id * stride_lvb + lk * stride_lvs + offs_d * stride_lvd
-        ).to(tl.float32)
-
-        qk_lk  = tl.where(valid_m, tl.sum(q * lk_k[None, :], axis=1) * scale, float("-inf"))
-        m_new  = tl.maximum(m_i, qk_lk)
-        p_lk   = tl.where(valid_m, tl.exp(qk_lk - m_new), 0.0)
-        l_corr = tl.exp(m_i - m_new)
-        l_i    = l_i * l_corr + p_lk
-        acc    = acc * l_corr[:, None] + p_lk[:, None] * lk_v[None, :]
-        m_i    = m_new
+    offs_lk = tl.arange(0, K_LMK)
+    lk_k = tl.load(
+        Lmk_K + pid_h*stride_lkh + seq_id*stride_lkb + offs_lk[None,:]*stride_lks + offs_d[:,None]*stride_lkd
+    ).to(tl.float32)
+    lk_v = tl.load(
+        Lmk_V + pid_h*stride_lvh + seq_id*stride_lvb + offs_lk[None,:]*stride_lvs + offs_d[:,None]*stride_lvd
+    ).to(tl.float32)
+    qk_lmk = tl.dot(q, lk_k) * scale
+    m_new   = tl.maximum(m_i, tl.max(qk_lmk, axis=1))
+    p_lmk   = tl.exp(qk_lmk - m_new[:,None])
+    l_corr  = tl.exp(m_i - m_new)
+    l_i     = l_i * l_corr + tl.sum(p_lmk, axis=1)
+    acc     = acc * l_corr[:,None] + tl.dot(p_lmk.to(tl.float16), tl.trans(lk_v).to(tl.float16)).to(tl.float32)
+    m_i     = m_new
 
     out_val = tl.where(
         l_i[:, None] > 1e-9,
@@ -172,17 +171,17 @@ def _compute_landmark_indices(
     seq_off  = torch.arange(total, device=device) - starts[seq_ids]
     max_len  = int(lens.max())
 
-    #print(f"--- [triton] _compute_landmark_indices START | total={total} num_seqs={num_seqs} k_lmk={k_lmk} max_len={max_len}")
-
-    t1          = time.perf_counter()
+    n_heads, dh = alpha.shape[0], W_V.shape[0] // alpha.shape[0]
     x_norm      = x.norm(dim=-1)
-    xwv         = (x @ W_V.T).norm(dim=-1)
+    W_V_h       = W_V.view(n_heads, dh, W_V.shape[1])
+    xwv_h       = torch.einsum("td,hkd->th", x, W_V_h).norm(dim=-1)
     mu_x, std_x = x_norm.mean(), x_norm.std().clamp(min=1e-6)
-    mu_v, std_v = xwv.mean(),    xwv.std().clamp(min=1e-6)
-    a           = alpha.mean()
-    scores      = a * (xwv - mu_v) / std_v + (1.0 - a) * (x_norm - mu_x) / std_x
-    #print(f"--- [triton] scores calcolati | mu_x={mu_x.item():.4f} std_x={std_x.item():.4f} mu_v={mu_v.item():.4f} alpha={a.item():.4f} | t={time.perf_counter()-t1:.4f}s")
-
+    mu_v        = xwv_h.mean(0, keepdim=True)
+    std_v       = xwv_h.std(0, keepdim=True).clamp(min=1e-6)
+    z_x         = (x_norm - mu_x) / std_x
+    z_v         = (xwv_h - mu_v) / std_v
+    scores      = (alpha.unsqueeze(0) * z_v + (1 - alpha.unsqueeze(0)) * z_x.unsqueeze(1)).mean(1)
+    
     last_off  = lens - 1
     threshold = (last_off[seq_ids] - n_min + 1).clamp(min=0)
     covered   = seq_off >= threshold

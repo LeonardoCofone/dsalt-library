@@ -279,10 +279,6 @@ class DSALTTrainer:
         self.logger = get_logger("dsalt.trainer", log_dir=str(self.save_dir))
         self.device = get_device(local_rank)
 
-        #print(f"--- [trainer] DSALTTrainer init | rank={rank} local_rank={local_rank} world_size={world_size} | device={self.device}")
-        #print(f"--- [trainer] lr={lr} wd={weight_decay} max_grad_norm={max_grad_norm} warmup={warmup_steps} total={total_steps}")
-        #print(f"--- [trainer] grad_accum={grad_accum} amp={mixed_precision} gc={gradient_checkpointing} compile={compile_model}")
-
         self._amp_dtype = self._resolve_amp_dtype(mixed_precision)
         self._use_amp   = self._amp_dtype is not None
         self._scaler    = (
@@ -319,10 +315,7 @@ class DSALTTrainer:
         self.model = model
 
         if compile_model and hasattr(torch, "compile"):
-            #print(f"--- [trainer] torch.compile() in corso...")
-            t_c = time.perf_counter()
             self.model = torch.compile(self.model)
-            #print(f"--- [trainer] torch.compile() DONE | t={time.perf_counter()-t_c:.2f}s")
 
         self.train_loader = train_loader
         self.val_loader   = val_loader
