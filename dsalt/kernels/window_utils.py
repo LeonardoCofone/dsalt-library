@@ -11,7 +11,7 @@ def compute_window_sizes(
 ) -> torch.Tensor:
     t0 = time.perf_counter()
     out = n_min + torch.sigmoid(proj(x_prev).squeeze(-1)) * (n_max - n_min)
-    print(f"--- [window_utils] compute_window_sizes | shape_in={tuple(x_prev.shape)} | n_min={n_min} n_max={n_max} | w_mean={out.mean().item():.2f} w_std={out.std().item():.2f} | t={time.perf_counter()-t0:.4f}s")
+    #print(f"--- [window_utils] compute_window_sizes | shape_in={tuple(x_prev.shape)} | n_min={n_min} n_max={n_max} | w_mean={out.mean().item():.2f} w_std={out.std().item():.2f} | t={time.perf_counter()-t0:.4f}s")
     return out
 
 
@@ -21,7 +21,7 @@ def build_local_window_mask(
     device:       torch.device,
 ) -> torch.Tensor:
     t0 = time.perf_counter()
-    print(f"--- [window_utils] build_local_window_mask START | seq_len={seq_len} | device={device}")
+    #print(f"--- [window_utils] build_local_window_mask START | seq_len={seq_len} | device={device}")
 
     rows = torch.arange(seq_len, device=device)
     w    = window_sizes.clamp(min=1, max=seq_len).long()
@@ -34,7 +34,7 @@ def build_local_window_mask(
     mask = delta[:, :seq_len].cumsum(dim=1).bool()
 
     mem_mb = mask.numel() * mask.element_size() / 1e6
-    print(f"--- [window_utils] build_local_window_mask DONE | mask={tuple(mask.shape)} | mem={mem_mb:.2f}MB | nonzero_frac={mask.float().mean().item():.4f} | t={time.perf_counter()-t0:.4f}s")
+    #print(f"--- [window_utils] build_local_window_mask DONE | mask={tuple(mask.shape)} | mem={mem_mb:.2f}MB | nonzero_frac={mask.float().mean().item():.4f} | t={time.perf_counter()-t0:.4f}s")
     return mask
 
 
@@ -80,7 +80,7 @@ def build_local_window_mask_packed(
         if li <= hi_i:
             mask[i, li:hi_i + 1] = True
 
-    print(f"--- [window_utils] packed_window DONE | t={time.perf_counter()-t0:.4f}s")
+    #print(f"--- [window_utils] packed_window DONE | t={time.perf_counter()-t0:.4f}s")
 
     return mask
 
@@ -97,7 +97,7 @@ def apply_rotary_emb(
         return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
     q_out = q * cos + _rot(q) * sin
     k_out = k * cos + _rot(k) * sin
-    print(f"--- [window_utils] apply_rotary_emb | q={tuple(q.shape)} | t={time.perf_counter()-t0:.4f}s")
+    #print(f"--- [window_utils] apply_rotary_emb | q={tuple(q.shape)} | t={time.perf_counter()-t0:.4f}s")
     return q_out, k_out
 
 
@@ -114,5 +114,5 @@ def build_rope_cache(
     positions = torch.arange(seq_len, device=device, dtype=dtype) / scale
     emb       = torch.cat([torch.outer(positions, theta)] * 2, dim=-1)
     cos, sin  = emb.cos(), emb.sin()
-    print(f"--- [window_utils] build_rope_cache | seq_len={seq_len} head_dim={head_dim} scale={scale} | t={time.perf_counter()-t0:.4f}s")
+    #print(f"--- [window_utils] build_rope_cache | seq_len={seq_len} head_dim={head_dim} scale={scale} | t={time.perf_counter()-t0:.4f}s")
     return cos, sin

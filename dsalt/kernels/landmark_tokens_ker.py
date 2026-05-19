@@ -14,7 +14,7 @@ def compute_hybrid_scores(
     mu_x, std_x = x_norm.mean(), x_norm.std().clamp(min=1e-6)
     mu_v, std_v = xwv.mean(),    xwv.std().clamp(min=1e-6)
     scores      = alpha * (xwv - mu_v) / std_v + (1.0 - alpha) * (x_norm - mu_x) / std_x
-    print(f"--- [landmark] compute_hybrid_scores | scores={tuple(scores.shape)} mean={scores.mean().item():.4f} | t={time.perf_counter()-t0:.4f}s")
+    #print(f"--- [landmark] compute_hybrid_scores | scores={tuple(scores.shape)} mean={scores.mean().item():.4f} | t={time.perf_counter()-t0:.4f}s")
     return scores
 
 
@@ -31,11 +31,11 @@ def select_landmarks(
     k_actual = min(k, n_valid)
 
     if k_actual == 0:
-        print(f"--- [landmark] WARNING: k_actual=0, nessun landmark selezionato!")
+        print(f"--- [landmark] WARNING: k_actual=0, no landmarks selected!")
         return torch.empty(0, dtype=torch.long, device=scores.device)
 
     _, indices = torch.topk(scores, k=k_actual, dim=-1, sorted=False)
-    print(f"--- [landmark] select_landmarks | n_valid={n_valid} k_actual={k_actual} | t={time.perf_counter()-t0:.4f}s")
+    #print(f"--- [landmark] select_landmarks | n_valid={n_valid} k_actual={k_actual} | t={time.perf_counter()-t0:.4f}s")
     return indices
 
 
@@ -45,7 +45,7 @@ class HybridEnergyLandmarkSelector(nn.Module):
         self.alpha = nn.Parameter(
             torch.full((n_layers, n_heads), torch.logit(torch.tensor(0.6)).item())
         )
-        print(f"--- [landmark] HybridEnergyLandmarkSelector init | n_layers={n_layers} n_heads={n_heads}")
+        #print(f"--- [landmark] HybridEnergyLandmarkSelector init | n_layers={n_layers} n_heads={n_heads}")
 
     def forward(
         self,

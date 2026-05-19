@@ -8,7 +8,7 @@ class RMSENorm(nn.Module):
         super().__init__()
         self.eps    = eps
         self.weight = nn.Parameter(torch.ones(d_model))
-        print(f"--- [RMSENorm] init | d_model={d_model} eps={eps}")
+        #print(f"--- [RMSENorm] init | d_model={d_model} eps={eps}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t0  = time.perf_counter()
@@ -19,8 +19,6 @@ class RMSENorm(nn.Module):
         x_out_norm = out.norm().item()
 
         if x_out_norm > 1e4 or x_out_norm < 1e-4:
-            print(f"--- [RMSENorm] WARNING: norma anomala | in={x_in_norm:.4f} out={x_out_norm:.4f} | shape={tuple(x.shape)}")
-        else:
-            print(f"--- [RMSENorm] forward | shape={tuple(x.shape)} | in_norm={x_in_norm:.4f} out_norm={x_out_norm:.4f} | t={time.perf_counter()-t0:.5f}s")
+            print(f"--- [RMSENorm] WARNING: high norm | in={x_in_norm:.4f} out={x_out_norm:.4f} | shape={tuple(x.shape)}")
 
         return out
