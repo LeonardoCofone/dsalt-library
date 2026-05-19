@@ -46,8 +46,7 @@ def _hybrid_scores(
     std_v = xwv.std(0, keepdim=True).clamp(min=1e-6)
     z_v   = (xwv - mu_v) / std_v                            # [T, H]
 
-    # weighted combination across heads, then mean → [T]
-    scores = (alpha.unsqueeze(0) * z_v + (1.0 - alpha.unsqueeze(0)) * z_x.unsqueeze(1)).mean(dim=1)
+    scores = (alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)).mean(1)
     return scores
 
 
