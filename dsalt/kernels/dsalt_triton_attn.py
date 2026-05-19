@@ -160,6 +160,7 @@ def _compute_landmark_indices(
     w_sizes:    torch.Tensor,
     cu_seqlens: torch.Tensor,
     k_lmk:      int,
+    n_min:      int,
 ) -> torch.Tensor:
     t0       = time.perf_counter()
     device   = x.device
@@ -182,18 +183,9 @@ def _compute_landmark_indices(
     scores      = a * (xwv - mu_v) / std_v + (1.0 - a) * (x_norm - mu_x) / std_x
     print(f"--- [triton] scores calcolati | mu_x={mu_x.item():.4f} std_x={std_x.item():.4f} mu_v={mu_v.item():.4f} alpha={a.item():.4f} | t={time.perf_counter()-t1:.4f}s")
 
-    w_int = w_sizes.long().clamp(min=1)
-    lo    = seq_off - w_int + 1             
-
-    lo_pad = torch.full((num_seqs, max_len), max_len, device=device, dtype=torch.long)
-    lo_pad[seq_ids, seq_off] = lo
-
-    suffix_min = lo_pad.flip(1).cummin(dim=1).values.flip(1) 
-
-    pos_range  = torch.arange(max_len, device=device).unsqueeze(0).expand(num_seqs, -1)
-    covered_2d = suffix_min <= pos_range                 
-
-    covered = covered_2d[seq_ids, seq_off]
+    last_off  = lens - 1
+    threshold = (last_off[seq_ids] - n_min + 1).clamp(min=0)
+    covered   = seq_off >= threshold
 
     n_covered = covered.sum().item()
     print(f"--- [triton] covered (in-window) tokens={n_covered}/{total} | non-covered disponibili per landmark={total - n_covered}")
@@ -250,6 +242,7 @@ def dsalt_triton_attention(
     w_sizes:    torch.Tensor,
     cu_seqlens: torch.Tensor,
     k_lmk:      int,
+    n_min:      int,
 ) -> torch.Tensor:
     t0                      = time.perf_counter()
     total_len, n_heads, head_dim = q.shape
@@ -271,7 +264,7 @@ def dsalt_triton_attention(
     with torch.no_grad():
         t1 = time.perf_counter()
         lmk_indices = _compute_landmark_indices(
-            x.float(), W_V.float(), alpha.float(), w_sizes.float(), cu_seqlens, k_lmk
+            x.float(), W_V.float(), alpha.float(), w_sizes.float(), cu_seqlens, k_lmk, n_min
         )
         print(f"--- [triton] lmk_indices shape={tuple(lmk_indices.shape)} | t={time.perf_counter()-t1:.4f}s")
 

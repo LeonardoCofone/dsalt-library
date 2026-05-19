@@ -108,6 +108,7 @@ def _build_mask_packed(
     total_len:   int,
     k_lmk:      int,
     dh:          int,
+    n_min:       int, 
     device:      torch.device,
 ) -> torch.Tensor:
     t0 = time.perf_counter()
@@ -138,11 +139,10 @@ def _build_mask_packed(
     starts   = cu_seqlens[:-1].to(device)
     seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
 
-    in_win_global = torch.zeros(total_len, dtype=torch.bool, device=device)
-    for b in range(num_seqs):
-        s = cu_seqlens[b]
-        e = cu_seqlens[b+1]
-        in_win_global[s:e] = mask[s:e, s:e].any(dim=0)
+    w_int = w_sizes.long().clamp(min=1)
+    last_off  = lens - 1
+    threshold = (last_off[seq_ids] - n_min + 1).clamp(min=0)
+    in_win_global = seq_off >= threshold
 
     s_masked = scores.masked_fill(in_win_global, float("-inf"))
     print(f"--- [dsalt_attention] in_win_global={in_win_global}")
@@ -330,6 +330,7 @@ class DSALTAttention(nn.Module):
                 w_sizes,
                 cu_seqlens,
                 self.k_lmk,
+                self.n_min,
             )
             print(f"--- [DSALTAttention] layer={self.layer_idx} Triton DONE | t={time.perf_counter()-t2:.4f}s")
             self._last_P = None
@@ -342,7 +343,7 @@ class DSALTAttention(nn.Module):
         attn_mask = _build_mask_packed(
             x, w_sizes, self.window_proj, self.v_proj.weight.detach(),
             self._alpha().detach(), cu_seqlens, total_len,
-            self.k_lmk, self.head_dim, device,
+            self.k_lmk, self.head_dim, self.n_min, device,
         )
         print(f"--- [DSALTAttention] layer={self.layer_idx} mask packed costruita | t={time.perf_counter()-t2:.4f}s")
 
