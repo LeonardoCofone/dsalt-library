@@ -180,7 +180,7 @@ def _compute_landmark_indices(
     std_v       = xwv_h.std(0, keepdim=True).clamp(min=1e-6)
     z_x         = (x_norm - mu_x) / std_x
     z_v         = (xwv_h - mu_v) / std_v
-    scores      = (alpha.unsqueeze(0) * z_v + (1 - alpha.unsqueeze(0)) * z_x.unsqueeze(1)).mean(1)
+    scores = (alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)).mean(1)
     
     last_off  = lens - 1
     threshold = (last_off[seq_ids] - n_min + 1).clamp(min=0)
