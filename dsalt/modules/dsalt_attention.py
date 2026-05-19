@@ -43,10 +43,10 @@ def _hybrid_scores(
     z_x    = (x_norm - mu_x) / std_x
     #print(f"--- [dsalt_attention] z_x calcolato | mu_x={mu_x.item():.4f} std_x={std_x.item():.4f}")
 
-    W_V_h = W_V.view(n_heads, dh, -1)
+    W_V_h = W_V.view(n_heads, dh, d)   # [H, dh, d_model]
     #print(f"--- [dsalt_attention] W_V_h={tuple(W_V_h.shape)} - lancio einsum td,hde->the")
     t1  = time.perf_counter()
-    xwv = torch.einsum("td,hde->the", x, W_V_h).norm(dim=-1)
+    xwv = torch.einsum("td,hkd->thk", x, W_V_h).norm(dim=-1)
     #print(f"--- [dsalt_attention] einsum DONE | xwv={tuple(xwv.shape)} | t_einsum={time.perf_counter()-t1:.4f}s")
 
     mu_v  = xwv.mean(0, keepdim=True)
@@ -56,7 +56,6 @@ def _hybrid_scores(
     scores = (alpha.unsqueeze(0) * z_v + (1.0 - alpha.unsqueeze(0)) * z_x.unsqueeze(1)).mean(dim=1)
     #print(f"--- [dsalt_attention] _hybrid_scores DONE | scores={tuple(scores.shape)} mean={scores.mean().item():.4f} | t={time.perf_counter()-t0:.4f}s")
     return scores
-
 
 @torch.no_grad()
 def _build_mask_batched(
