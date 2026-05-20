@@ -46,7 +46,7 @@ def _hybrid_scores(
     std_v = xwv.std(0, keepdim=True).clamp(min=1e-6)
     z_v   = (xwv - mu_v) / std_v                            # [T, H]
 
-    scores = (alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)).mean(1)
+    scores = alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)
     return scores
 
 
@@ -62,22 +62,33 @@ def _build_mask_batched(
     T:           int,
     device:      torch.device,
 ) -> torch.Tensor:
-    w_sizes     = compute_window_sizes(x, window_proj, n_min, n_max)
-    window_mask = build_local_window_mask(T, w_sizes, device)
+    n_heads = alpha.shape[0]
+    dh      = v_weight.shape[0] // n_heads
 
-    dh            = v_weight.shape[0] // alpha.shape[0]
-    scores        = _hybrid_scores(x, v_weight, alpha, dh)
-    in_window     = window_mask.any(dim=0)
-    scores_fil    = scores.masked_fill(in_window, float("-inf"))
-    k_act         = min(k_lmk, int((scores_fil > float("-inf")).sum()))
+    w_sizes     = compute_window_sizes(x, window_proj, n_min, n_max)
+    window_mask = build_local_window_mask(T, w_sizes, device)          # [T, T]
+
+    scores   = _hybrid_scores(x, v_weight, alpha, dh)                  # [T, H]  ← no .mean(1)
+    in_window = window_mask.any(dim=0)                                  # [T]
+
+    # broadcast in_window su tutte le teste
+    scores_fil = scores.masked_fill(in_window.unsqueeze(1), float("-inf"))  # [T, H]
+
+    # topk su dim=0 (token), per ogni testa in parallelo
+    k_act = min(k_lmk, int((scores_fil > float("-inf")).sum(dim=0).min().item()))
+
+    landmark_mask = window_mask.unsqueeze(0).expand(n_heads, -1, -1).clone()  # [H, T, T]
 
     if k_act > 0:
-        _, idx = torch.topk(scores_fil, k_act, sorted=False)
-        window_mask[:, idx] = True
+        _, idx = torch.topk(scores_fil, k_act, dim=0, sorted=False)   # [k_act, H]
+        # idx[k, h] = token selezionato per la testa h → scatter su dim=-1
+        # landmark_mask[h, :, idx[:, h]] = True  ← vectorizzato:
+        idx_exp = idx.T.unsqueeze(1).expand(n_heads, T, k_act)        # [H, T, k_act]
+        landmark_mask.scatter_(2, idx_exp, True)
     else:
         print("[DSALT] WARNING: no landmark added (k_act=0)")
 
-    return window_mask
+    return landmark_mask  # [H, T, T]
 
 
 @torch.no_grad()
@@ -256,7 +267,7 @@ class DSALTAttention(nn.Module):
             return self.out_proj(out.contiguous().view(total_len, self.d_model))
 
         t0        = time.perf_counter()
-        
+
         attn_mask = _build_mask_packed(
             x, w_sizes.detach(), self.window_proj, self.v_proj.weight.detach(),
             self._alpha().detach(), cu_seqlens, total_len,

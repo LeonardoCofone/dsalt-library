@@ -189,7 +189,6 @@ def _compute_landmark_indices(
     std_v       = xwv_h.std(0, keepdim=True).clamp(min=1e-6)
     z_x         = (x_norm - mu_x) / std_x                
     z_v         = (xwv_h - mu_v) / std_v          
-    scores = (alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)).mean(1) 
     
     w_sizes_pad = torch.full((num_seqs, max_len), float("inf"), device=device)
     w_sizes_pad[seq_ids, seq_off] = w_sizes.float()
@@ -202,46 +201,39 @@ def _compute_landmark_indices(
     n_covered = covered.sum().item()
     #print(f"--- [triton] covered (in-window) tokens={n_covered}/{total} | non-covered disponibili per landmark={total - n_covered}")
 
-    score_pad = torch.full((num_seqs, max_len), float("-inf"), device=device)
-    score_pad[seq_ids, seq_off] = scores.masked_fill(covered, float("-inf"))
+    # DOPO
+    scores = alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)  # [T, H]
+
+    covered_h = covered.unsqueeze(1).expand(-1, n_heads)    # [T, H]
+    scores_fil = scores.masked_fill(covered_h, float("-inf"))  # [T, H]
+
+    score_pad = torch.full((n_heads, num_seqs, max_len), float("-inf"), device=device)
+    score_pad[:, seq_ids, seq_off] = scores_fil.T            # [H, num_seqs, max_len]
 
     k_eff        = min(k_lmk, max_len)
-    _, top_local = torch.topk(score_pad, k_eff, dim=1, sorted=False)
-    #print(f"--- [triton] topk DONE | k_eff={k_eff}")
-
-    if k_eff >= k_lmk:
-        #print(f"--- [triton] _compute_landmark_indices DONE | shape={tuple(top_local.shape)} | t={time.perf_counter()-t0:.4f}s")
-        return top_local
-
-    fill   = top_local[:, :1].expand(num_seqs, k_lmk - k_eff)
-    result = torch.cat([top_local, fill], dim=1)
-    #print(f"--- [triton] _compute_landmark_indices DONE (con fill) | shape={tuple(result.shape)} | t={time.perf_counter()-t0:.4f}s")
-    return result
+    _, top_local = torch.topk(score_pad, k_eff, dim=2, sorted=False)
+    return top_local  # [H, num_seqs, k_lmk]
 
 
+# DOPO (corretto)
 def _build_landmark_kv(
-    K:           torch.Tensor,
-    V:           torch.Tensor,
-    lmk_indices: torch.Tensor,
-    cu_seqlens:  torch.Tensor,
-    k_lmk:       int,
-    n_heads:     int,
-    head_dim:    int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    t0       = time.perf_counter()
+    K, V, lmk_indices, cu_seqlens, k_lmk, n_heads, head_dim
+):
+    # lmk_indices: [H, num_seqs, k_lmk]
     starts   = cu_seqlens[:-1].to(K.device)
     num_seqs = cu_seqlens.shape[0] - 1
-    abs_idx  = (starts.unsqueeze(1) + lmk_indices).reshape(-1)
 
-    #print(f"--- [triton] _build_landmark_kv START | num_seqs={num_seqs} k_lmk={k_lmk} n_heads={n_heads} head_dim={head_dim}")
-    #print(f"--- [triton] abs_idx range=[{abs_idx.min().item()}, {abs_idx.max().item()}] shape={tuple(abs_idx.shape)}")
+    abs_idx = starts.unsqueeze(1) + lmk_indices           # [H, num_seqs, k_lmk]
 
-    lmk_K = K[abs_idx].view(num_seqs, k_lmk, n_heads, head_dim).permute(2, 0, 1, 3).contiguous()
-    lmk_V = V[abs_idx].view(num_seqs, k_lmk, n_heads, head_dim).permute(2, 0, 1, 3).contiguous()
+    # K: [T, H, head_dim] → per ogni testa h prendi abs_idx[h] righe, colonna h
+    # advanced indexing: K[abs_idx[h], h, :] per ogni h
+    h_idx = torch.arange(n_heads, device=K.device)        # [H]
+    h_idx = h_idx[:, None, None].expand(n_heads, num_seqs, k_lmk)  # [H, num_seqs, k_lmk]
 
-    lmk_mem_mb = (lmk_K.numel() + lmk_V.numel()) * lmk_K.element_size() / 1e6
-    #print(f"--- [triton] _build_landmark_kv DONE | lmk_K={tuple(lmk_K.shape)} lmk_V={tuple(lmk_V.shape)} | mem={lmk_mem_mb:.2f}MB | t={time.perf_counter()-t0:.4f}s")
-    return lmk_K, lmk_V
+    lmk_K = K[abs_idx, h_idx, :]                          # [H, num_seqs, k_lmk, head_dim]
+    lmk_V = V[abs_idx, h_idx, :]                          # [H, num_seqs, k_lmk, head_dim]
+
+    return lmk_K.contiguous(), lmk_V.contiguous()
 
 
 def dsalt_triton_attention(

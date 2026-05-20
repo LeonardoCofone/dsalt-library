@@ -10,17 +10,15 @@ def sparse_attention_forward(
     dropout_p: float = 0.0,
     training:  bool  = False,
 ) -> torch.Tensor:
-    # attn_mask: [T, T] bool  →  additive float mask broadcastable to [B, H, T, T]
     additive = torch.zeros(attn_mask.shape, dtype=q.dtype, device=q.device)
     additive.masked_fill_(~attn_mask, float("-inf"))
-    while additive.dim() < 4:
+    if additive.dim() == 3:
         additive = additive.unsqueeze(0)
     return F.scaled_dot_product_attention(
         q, k, v,
         attn_mask=additive,
         dropout_p=dropout_p if training else 0.0,
     )
-
 
 def sparse_attention_forward_packed(
     q:         torch.Tensor,
