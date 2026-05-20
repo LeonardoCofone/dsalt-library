@@ -30,9 +30,7 @@ def sparse_attention_forward_packed(
     dropout_p: float = 0.0,
     training:  bool  = False,
 ) -> torch.Tensor:
-    # q/k/v: [T, H, D]   attn_mask: [T, T] bool
-    # Reshape to [1, H, T, D] for SDPA — avoids allocating a dense T×T float matrix
-    # Instead we build a float mask lazily in fp16/bf16 matching q dtype
+
     T = q.shape[0]
 
     q_ = q.transpose(0, 1).unsqueeze(0)   # [1, H, T, D]

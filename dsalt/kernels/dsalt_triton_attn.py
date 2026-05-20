@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .window_utils import build_local_window_mask_packed
+
 
 @triton.autotune(
     configs=[
@@ -17,7 +19,7 @@ import triton.language as tl
 @triton.jit
 def _dsalt_fwd_kernel(
     Q, K, V, Out,
-    W_sizes, Lmk_K, Lmk_V, Cu_seqlens, Seq_block_map,
+    W_sizes, Lmk_K, Lmk_V, Lmk_pos, Cu_seqlens, Seq_block_map,
     stride_qt, stride_qh, stride_qd,
     stride_kt, stride_kh, stride_kd,
     stride_vt, stride_vh, stride_vd,
@@ -110,9 +112,15 @@ def _dsalt_fwd_kernel(
     lk_v = tl.load(
         Lmk_V + pid_h*stride_lvh + seq_id*stride_lvb + offs_lk[None,:]*stride_lvs + offs_d[:,None]*stride_lvd
     ).to(tl.float32)
+
+    lmk_pos = tl.load(Lmk_pos + seq_id * K_LMK + offs_lk)  # [K_LMK]  posizioni assolute in-seq
+    causal_lmk = lmk_pos[None, :] <= (m_start + offs_m[:, None])  # [BLOCK_M, K_LMK]
+
     qk_lmk = tl.dot(q, lk_k) * scale
+    qk_lmk = tl.where(causal_lmk & valid_m[:, None], qk_lmk, float("-inf"))
+
     m_new   = tl.maximum(m_i, tl.max(qk_lmk, axis=1))
-    p_lmk   = tl.exp(qk_lmk - m_new[:,None])
+    p_lmk   = tl.where(causal_lmk & valid_m[:, None], tl.exp(qk_lmk - m_new[:,None]), 0.0)
     l_corr  = tl.exp(m_i - m_new)
     l_i     = l_i * l_corr + tl.sum(p_lmk, axis=1)
     acc     = acc * l_corr[:,None] + tl.dot(p_lmk.to(tl.float16), tl.trans(lk_v).to(tl.float16)).to(tl.float32)
@@ -160,6 +168,7 @@ def _compute_landmark_indices(
     cu_seqlens: torch.Tensor,
     k_lmk:      int,
     n_min:      int,
+    total_len:  int,
 ) -> torch.Tensor:
     t0       = time.perf_counter()
     device   = x.device
@@ -174,17 +183,21 @@ def _compute_landmark_indices(
     n_heads, dh = alpha.shape[0], W_V.shape[0] // alpha.shape[0]
     x_norm      = x.norm(dim=-1)
     W_V_h       = W_V.view(n_heads, dh, W_V.shape[1])
-    xwv_h       = torch.einsum("td,hkd->th", x, W_V_h).norm(dim=-1)
+    xwv_h       = torch.einsum("td,hkd->thk", x, W_V_h).norm(dim=-1)
     mu_x, std_x = x_norm.mean(), x_norm.std().clamp(min=1e-6)
-    mu_v        = xwv_h.mean(0, keepdim=True)
+    mu_v        = xwv_h.mean(0, keepdim=True) 
     std_v       = xwv_h.std(0, keepdim=True).clamp(min=1e-6)
-    z_x         = (x_norm - mu_x) / std_x
-    z_v         = (xwv_h - mu_v) / std_v
-    scores = alpha.mean() * z_v + (1 - alpha.mean()) * z_x
+    z_x         = (x_norm - mu_x) / std_x                
+    z_v         = (xwv_h - mu_v) / std_v          
+    scores = (alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)).mean(1) 
     
+    w_sizes_pad = torch.full((num_seqs, max_len), float("inf"), device=device)
+    w_sizes_pad[seq_ids, seq_off] = w_sizes.float()
     last_off  = lens - 1
     threshold = (last_off[seq_ids] - n_min + 1).clamp(min=0)
-    covered   = seq_off >= threshold
+    # più corretto: usa la window_mask reale costruita dai w_sizes
+    window_mask_full = build_local_window_mask_packed(cu_seqlens, w_sizes, total_len, device)
+    covered = window_mask_full.any(dim=0)  # [T] token raggiungibili come KEY da almeno 1 query
 
     n_covered = covered.sum().item()
     #print(f"--- [triton] covered (in-window) tokens={n_covered}/{total} | non-covered disponibili per landmark={total - n_covered}")
@@ -263,7 +276,7 @@ def dsalt_triton_attention(
     with torch.no_grad():
         t1 = time.perf_counter()
         lmk_indices = _compute_landmark_indices(
-            x.float(), W_V.float(), alpha.float(), w_sizes.float(), cu_seqlens, k_lmk, n_min
+            x.float(), W_V.float(), alpha.float(), w_sizes.float(), cu_seqlens, k_lmk, n_min, total_len
         )
         #print(f"--- [triton] lmk_indices shape={tuple(lmk_indices.shape)} | t={time.perf_counter()-t1:.4f}s")
 
@@ -282,10 +295,10 @@ def dsalt_triton_attention(
         #print(f"--- [triton] GPU mem PRE kernel: {mem_pre:.3f}GB")
 
     t4 = time.perf_counter()
-    #print(f"--- [triton] lancio _dsalt_fwd_kernel | grid=({total_blk}, {n_heads})")
+    lmk_pos_tensor = lmk_indices.to(torch.int32).contiguous()  # [num_seqs, K_LMK] posizioni locali in-seq
     _dsalt_fwd_kernel[lambda meta: (total_blk, n_heads)](
         q_c, k_c, v_c, out,
-        w_int, lmk_K, lmk_V, cu_int, seq_block_map,
+        w_int, lmk_K, lmk_V, lmk_pos_tensor, cu_int, seq_block_map,
         q_c.stride(0), q_c.stride(1), q_c.stride(2),
         k_c.stride(0), k_c.stride(1), k_c.stride(2),
         v_c.stride(0), v_c.stride(1), v_c.stride(2),

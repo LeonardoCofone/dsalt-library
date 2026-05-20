@@ -242,24 +242,29 @@ class DSALTAttention(nn.Module):
         sin = self.rope_sin[pos_ids].to(device)
         q, k = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
 
-        w_sizes = compute_window_sizes(x, self.window_proj, self.n_min, self.n_max).detach()
+        w_sizes = compute_window_sizes(x, self.window_proj, self.n_min, self.n_max)
 
         if _TRITON_OK and self.training and device.type == "cuda":
             out = dsalt_triton_attention(
                 q, k, v, x,
                 self.v_proj.weight.detach(),
                 self._alpha().detach(),
-                w_sizes, cu_seqlens, self.k_lmk, self.n_min,
+                w_sizes.detach(), 
+                cu_seqlens, self.k_lmk, self.n_min,
             )
             self._last_P = None
             return self.out_proj(out.contiguous().view(total_len, self.d_model))
 
         t0        = time.perf_counter()
+        
         attn_mask = _build_mask_packed(
-            x, w_sizes, self.window_proj, self.v_proj.weight.detach(),
+            x, w_sizes.detach(), self.window_proj, self.v_proj.weight.detach(),
             self._alpha().detach(), cu_seqlens, total_len,
             self.k_lmk, self.head_dim, self.n_min, device,
         )
+
+        
+
         if self.layer_idx == 0 and self.training:
             print(f"[DSALT] mask_build layer={self.layer_idx} t={time.perf_counter()-t0:.3f}s "
                   f"sparsity={1-attn_mask.float().mean().item():.3f}")
