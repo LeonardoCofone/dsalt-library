@@ -117,8 +117,7 @@ def _build_mask_packed(
 
     last_off      = lens - 1
     threshold     = (last_off[seq_ids] - n_min + 1).clamp(min=0)
-    in_win_global = seq_off >= threshold
-
+    in_win_global = (seq_off >= threshold).unsqueeze(1)
     s_masked  = scores.masked_fill(in_win_global, float("-inf"))
     score_pad = torch.full((num_seqs, max_len), float("-inf"), device=device)
     score_pad[seq_ids, seq_off] = s_masked
