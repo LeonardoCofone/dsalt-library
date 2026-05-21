@@ -15,7 +15,6 @@ class SwiGLUFFN(nn.Module):
         self.up_proj   = nn.Linear(d_model, d_ff, bias=False)
         self.down_proj = nn.Linear(d_ff, d_model, bias=False)
         self.drop      = nn.Dropout(dropout)
-        #print(f"--- [SwiGLUFFN] init | d_model={d_model} d_ff={d_ff} dropout={dropout}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.drop(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
@@ -45,7 +44,6 @@ class DSALTTransformerBlock(nn.Module):
             yarn_scale=yarn_scale, layer_idx=layer_idx,
         )
         self.ffn = SwiGLUFFN(d_model=d_model, d_ff=d_ff, dropout=dropout)
-        #print(f"--- [DSALTTransformerBlock] init | layer={layer_idx} d_model={d_model} n_heads={n_heads} d_ff={d_ff}")
 
     def forward(
         self,
@@ -55,30 +53,36 @@ class DSALTTransformerBlock(nn.Module):
         gradient_checkpointing: bool                = False,
     ) -> torch.Tensor:
         if gradient_checkpointing and self.training:
-            #print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} usando gradient_checkpointing per attn")
-            t1 = time.perf_counter()
-            x = x + torch.utils.checkpoint.checkpoint(
-                lambda h: self.attn(self.attn_norm(h), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen),
-                x, use_reentrant=False,
-            )
-            #print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} attn (gc) DONE | t={time.perf_counter()-t1:.4f}s | out_norm={x.norm().item():.4f}")
+            def custom_attn(h):
+                attn_out, layer_aux = self.attn(h, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                nonlocal aux
+                aux = layer_aux
+                return attn_out
 
-            #print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} usando gradient_checkpointing per ffn")
-            t2 = time.perf_counter()
-            x = x + torch.utils.checkpoint.checkpoint(
-                lambda h: self.ffn(self.ffn_norm(h)),
-                x, use_reentrant=False,
+            aux = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            
+            attn_normed = self.attn_norm(x)
+            x_attn = torch.utils.checkpoint.checkpoint(
+                custom_attn,
+                attn_normed,
+                use_reentrant=False,
             )
-            #print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} ffn (gc) DONE | t={time.perf_counter()-t2:.4f}s | out_norm={x.norm().item():.4f}")
+            x = x + x_attn
+
+            ffn_normed = self.ffn_norm(x)
+            x_ffn = torch.utils.checkpoint.checkpoint(
+                self.ffn,
+                ffn_normed,
+                use_reentrant=False,
+            )
+            x = x + x_ffn
         else:
             t1 = time.perf_counter()
-            x_attn = self.attn(self.attn_norm(x), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-            x      = x + x_attn
-            #print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} attn residual DONE | out_norm={x.norm().item():.4f} | t={time.perf_counter()-t1:.4f}s")
+            x_attn, aux = self.attn(self.attn_norm(x), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x = x + x_attn
 
             t2 = time.perf_counter()
             x_ffn = self.ffn(self.ffn_norm(x))
-            x     = x + x_ffn
-            #print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} ffn residual DONE | out_norm={x.norm().item():.4f} | t={time.perf_counter()-t2:.4f}s")
+            x = x + x_ffn
 
-        return x
+        return x, aux

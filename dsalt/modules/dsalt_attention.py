@@ -35,7 +35,7 @@ def _hybrid_scores(
     x_norm = x.norm(dim=-1)
     z_x    = (x_norm - x_norm.mean()) / x_norm.std().clamp(min=1e-6)
 
-    xwv  = (x @ W_V.T).view(T, n_heads, dh).norm(dim=-1)
+    xwv   = (x @ W_V.T).view(T, n_heads, dh).norm(dim=-1)
     mu_v  = xwv.mean(0, keepdim=True)
     std_v = xwv.std(0, keepdim=True).clamp(min=1e-6)
     z_v   = (xwv - mu_v) / std_v
@@ -46,7 +46,7 @@ def _hybrid_scores(
 @torch.no_grad()
 def _build_mask_batched(
     x:           torch.Tensor,
-    window_proj: nn.Linear,
+    w_sizes:     torch.Tensor,
     v_weight:    torch.Tensor,
     alpha:       torch.Tensor,
     n_min:       int,
@@ -58,7 +58,6 @@ def _build_mask_batched(
     n_heads = alpha.shape[0]
     dh      = v_weight.shape[0] // n_heads
 
-    w_sizes       = compute_window_sizes(x, window_proj, n_min, n_max)
     window_mask   = build_local_window_mask(T, w_sizes, device)
     scores        = _hybrid_scores(x, v_weight, alpha, dh)
     in_window     = window_mask.any(dim=0)
@@ -78,7 +77,6 @@ def _build_mask_batched(
 def _build_mask_packed(
     x:           torch.Tensor,
     w_sizes:     torch.Tensor,
-    window_proj: nn.Linear,
     v_weight:    torch.Tensor,
     alpha:       torch.Tensor,
     cu_seqlens:  torch.Tensor,
@@ -107,12 +105,8 @@ def _build_mask_packed(
     vals, top = torch.topk(score_pad, k_eff, dim=1, sorted=False)
     valid     = vals > float("-inf")
 
-    n_heads   = alpha.shape[0]
-    abs_lmk   = (starts[:, None, None] + top).clamp(max=total_len - 1)
+    abs_lmk = (starts[:, None, None] + top).clamp(max=total_len - 1)
 
-    seq_starts_exp = torch.repeat_interleave(
-        torch.arange(num_seqs, device=device), (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
-    )
     for b in range(num_seqs):
         if not valid[b].any():
             continue
@@ -174,6 +168,9 @@ class DSALTAttention(nn.Module):
             return self.rope_cos[:n].to(device), self.rope_sin[:n].to(device)
         return self.rope_cos.to(device), self.rope_sin.to(device)
 
+    def _window_aux(self, w_sizes_soft: torch.Tensor) -> torch.Tensor:
+        return (w_sizes_soft - w_sizes_soft.detach()).mean() + self._alpha().mean() * 0.0
+
     @torch.no_grad()
     def warmup(self, device: torch.device) -> None:
         dummy_T = max(self.n_min * 2, 16)
@@ -190,13 +187,13 @@ class DSALTAttention(nn.Module):
         x:          torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None          = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if cu_seqlens is not None:
             return self._packed(x, cu_seqlens, x.shape[0], x.device)
         B, T, _ = x.shape
         return self._batched(x, B, T, x.device)
 
-    def _batched(self, x: torch.Tensor, B: int, T: int, device: torch.device) -> torch.Tensor:
+    def _batched(self, x: torch.Tensor, B: int, T: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
@@ -204,10 +201,14 @@ class DSALTAttention(nn.Module):
         cos, sin = self._rope(T, device)
         q, k     = apply_rotary_emb(q, k, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0))
 
-        x_1b      = x[0] if B > 1 else x.squeeze(0)
+        x_1b         = x[0] if B > 1 else x.squeeze(0)
+        w_sizes_soft = compute_window_sizes(x_1b, self.window_proj, self.n_min, self.n_max)
+        alpha        = self._alpha()
+        aux          = self._window_aux(w_sizes_soft) + (alpha - alpha.detach()).mean() * 0.0
+
         attn_mask = _build_mask_batched(
-            x_1b, self.window_proj, self.v_proj.weight.detach(),
-            self._alpha().detach(), self.n_min, self.n_max, self.k_lmk, T, device,
+            x_1b, w_sizes_soft.detach(), self.v_proj.weight.detach(),
+            alpha.detach(), self.n_min, self.n_max, self.k_lmk, T, device,
         )
 
         out = sparse_attention_forward(q, k, v, attn_mask, self.dropout, self.training)
@@ -220,9 +221,9 @@ class DSALTAttention(nn.Module):
         else:
             self._last_P = None
 
-        return self.out_proj(out.transpose(1, 2).contiguous().view(B, T, self.d_model))
+        return self.out_proj(out.transpose(1, 2).contiguous().view(B, T, self.d_model)), aux
 
-    def _packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, total_len: int, device: torch.device) -> torch.Tensor:
+    def _packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, total_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         q = self.q_proj(x).view(total_len, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(total_len, self.n_heads, self.head_dim)
         v = self.v_proj(x).view(total_len, self.n_heads, self.head_dim)
@@ -237,13 +238,15 @@ class DSALTAttention(nn.Module):
         sin = self.rope_sin[pos_ids].to(device)
         q, k = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
 
-        w_sizes = compute_window_sizes(x, self.window_proj, self.n_min, self.n_max)
+        w_sizes_soft = compute_window_sizes(x, self.window_proj, self.n_min, self.n_max)
+        alpha        = self._alpha()
+        aux          = self._window_aux(w_sizes_soft) + (alpha - alpha.detach()).mean() * 0.0
 
         out = dsalt_triton_attention(
             q, k, v, x,
             self.v_proj.weight.detach(),
-            self._alpha().detach(),
-            w_sizes.detach(),
+            alpha.detach(),
+            w_sizes_soft.detach(),
             cu_seqlens, self.k_lmk, self.n_min,
         )
 
@@ -254,7 +257,7 @@ class DSALTAttention(nn.Module):
             k0    = k[s0:e0].transpose(0, 1)
             scale = 1.0 / math.sqrt(self.head_dim)
             sc    = torch.matmul(q0, k0.transpose(-2, -1)) * scale
-            w0    = w_sizes[s0:e0].long()
+            w0    = w_sizes_soft[s0:e0].detach().long()
             T0    = e0 - s0
             rows  = torch.arange(T0, device=device)
             cols  = torch.arange(T0, device=device)
@@ -265,4 +268,4 @@ class DSALTAttention(nn.Module):
         else:
             self._last_P = None
 
-        return self.out_proj(out.view(total_len, self.d_model))
+        return self.out_proj(out.view(total_len, self.d_model)), aux

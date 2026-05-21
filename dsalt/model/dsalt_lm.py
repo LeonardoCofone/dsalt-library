@@ -14,7 +14,7 @@ def _chunked_cross_entropy(
     labels:     torch.Tensor,
     chunk_size: int = 512,
 ) -> torch.Tensor:
-    total        = x.shape[0]
+    total         = x.shape[0]
     n_valid_total = (labels != -100).sum().item()
 
     if n_valid_total == 0:
@@ -28,11 +28,11 @@ def _chunked_cross_entropy(
         y_c  = labels[start:end]
         if not (y_c != -100).any():
             continue
-        x_chunk     = x[start:end].float()
-        logits      = F.linear(x_chunk, weight.float())
-        loss        = F.cross_entropy(logits, y_c, ignore_index=-100, reduction="sum")
-        loss_acc   += loss.float()
-        valid_acc  += (y_c != -100).sum()
+        x_chunk    = x[start:end].float()
+        logits     = F.linear(x_chunk, weight.float())
+        loss       = F.cross_entropy(logits, y_c, ignore_index=-100, reduction="sum")
+        loss_acc  += loss.float()
+        valid_acc += (y_c != -100).sum()
         del logits, loss, x_chunk
 
     return loss_acc / valid_acc.clamp(min=1).float()
@@ -75,6 +75,7 @@ class DSALTLMHeadModel(nn.Module):
         padding_idx:        int | None = None,
         lm_head_chunk_size: int        = 512,
         loss_fn:            str        = "liger",
+        aux_loss_weight:    float      = 1e-4,
     ):
         super().__init__()
         assert loss_fn in _LOSS_FN, f"loss_fn must be one of {list(_LOSS_FN)}"
@@ -84,6 +85,7 @@ class DSALTLMHeadModel(nn.Module):
         self.vocab_size         = vocab_size
         self.lm_head_chunk_size = lm_head_chunk_size
         self.loss_fn            = loss_fn
+        self.aux_loss_weight    = aux_loss_weight
 
         if d_ff is None:
             hidden_dim  = int(8 / 3 * d_model)
@@ -139,22 +141,26 @@ class DSALTLMHeadModel(nn.Module):
         if max_seqlen is None:
             max_seqlen = input_ids.shape[-1]
 
-        x = self.embed_dropout(self.embed_tokens(input_ids))
+        x        = self.embed_dropout(self.embed_tokens(input_ids))
+        aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
 
         for layer in self.layers:
-            x = layer(
+            x, layer_aux = layer(
                 x,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 gradient_checkpointing=gradient_checkpointing,
             )
+            aux_loss = aux_loss + layer_aux
 
         x = self.final_norm(x)
 
         if labels is not None:
-            return {"loss": self._compute_loss(x, labels), "logits": None}
+            main_loss = self._compute_loss(x, labels)
+            loss      = main_loss + self.aux_loss_weight * aux_loss
+            return {"loss": loss, "logits": None, "aux_loss": aux_loss.detach()}
 
-        return {"loss": None, "logits": self.lm_head(x)}
+        return {"loss": None, "logits": self.lm_head(x), "aux_loss": None}
 
     def num_parameters(self, trainable_only: bool = True) -> int:
         if trainable_only:
