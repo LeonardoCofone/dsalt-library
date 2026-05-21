@@ -1,9 +1,7 @@
 import math
-import time
 import warnings
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from ..kernels.window_utils import (
     compute_window_sizes,
@@ -26,28 +24,23 @@ except Exception:
 
 @torch.no_grad()
 def _hybrid_scores(
-    x:     torch.Tensor,   # [T, d_model]
-    W_V:   torch.Tensor,   # [d_model, d_model]  (nn.Linear weight convention: [out, in])
-    alpha: torch.Tensor,   # [n_heads]
+    x:     torch.Tensor,
+    W_V:   torch.Tensor,
+    alpha: torch.Tensor,
     dh:    int,
 ) -> torch.Tensor:
     T, d    = x.shape
     n_heads = alpha.shape[0]
 
-    x_norm = x.norm(dim=-1)                                  # [T]
+    x_norm = x.norm(dim=-1)
     z_x    = (x_norm - x_norm.mean()) / x_norm.std().clamp(min=1e-6)
 
-    # W_V layout from nn.Linear: [d_out, d_in] = [d_model, d_model]
-    # reshape to [n_heads, dh, d_model] so einsum contracts over d_model
-    W_V_h = W_V.view(n_heads, dh, d)                        # [H, dh, d_model]
-    xwv   = torch.einsum("td,hkd->thk", x, W_V_h).norm(dim=-1)  # [T, H]
-
+    xwv  = (x @ W_V.T).view(T, n_heads, dh).norm(dim=-1)
     mu_v  = xwv.mean(0, keepdim=True)
     std_v = xwv.std(0, keepdim=True).clamp(min=1e-6)
-    z_v   = (xwv - mu_v) / std_v                            # [T, H]
+    z_v   = (xwv - mu_v) / std_v
 
-    scores = alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)
-    return scores
+    return alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)
 
 
 @torch.no_grad()
@@ -65,30 +58,20 @@ def _build_mask_batched(
     n_heads = alpha.shape[0]
     dh      = v_weight.shape[0] // n_heads
 
-    w_sizes     = compute_window_sizes(x, window_proj, n_min, n_max)
-    window_mask = build_local_window_mask(T, w_sizes, device)          # [T, T]
-
-    scores   = _hybrid_scores(x, v_weight, alpha, dh)                  # [T, H]  ← no .mean(1)
-    in_window = window_mask.any(dim=0)                                  # [T]
-
-    # broadcast in_window su tutte le teste
-    scores_fil = scores.masked_fill(in_window.unsqueeze(1), float("-inf"))  # [T, H]
-
-    # topk su dim=0 (token), per ogni testa in parallelo
-    k_act = min(k_lmk, int((scores_fil > float("-inf")).sum(dim=0).min().item()))
-
-    landmark_mask = window_mask.unsqueeze(0).expand(n_heads, -1, -1).clone()  # [H, T, T]
+    w_sizes       = compute_window_sizes(x, window_proj, n_min, n_max)
+    window_mask   = build_local_window_mask(T, w_sizes, device)
+    scores        = _hybrid_scores(x, v_weight, alpha, dh)
+    in_window     = window_mask.any(dim=0)
+    scores_fil    = scores.masked_fill(in_window.unsqueeze(1), float("-inf"))
+    k_act         = min(k_lmk, int((scores_fil > float("-inf")).sum(dim=0).min().item()))
+    landmark_mask = window_mask.unsqueeze(0).expand(n_heads, -1, -1).clone()
 
     if k_act > 0:
-        _, idx = torch.topk(scores_fil, k_act, dim=0, sorted=False)   # [k_act, H]
-        # idx[k, h] = token selezionato per la testa h → scatter su dim=-1
-        # landmark_mask[h, :, idx[:, h]] = True  ← vectorizzato:
-        idx_exp = idx.T.unsqueeze(1).expand(n_heads, T, k_act)        # [H, T, k_act]
+        _, idx  = torch.topk(scores_fil, k_act, dim=0, sorted=False)
+        idx_exp = idx.T.unsqueeze(1).expand(n_heads, T, k_act)
         landmark_mask.scatter_(2, idx_exp, True)
-    else:
-        print("[DSALT] WARNING: no landmark added (k_act=0)")
 
-    return landmark_mask  # [H, T, T]
+    return landmark_mask
 
 
 @torch.no_grad()
@@ -115,24 +98,27 @@ def _build_mask_packed(
     seq_off  = torch.arange(total_len, device=device) - starts[seq_ids]
     max_len  = int(lens.max())
 
-    last_off      = lens - 1
-    threshold     = (last_off[seq_ids] - n_min + 1).clamp(min=0)
-    in_win_global = (seq_off >= threshold).unsqueeze(1)
-    s_masked  = scores.masked_fill(in_win_global, float("-inf"))
-    score_pad = torch.full((num_seqs, max_len, alpha.shape[0]), float("-inf"), device=device)
+    in_win_global = (seq_off < w_sizes.long()).unsqueeze(1)
+    s_masked      = scores.masked_fill(in_win_global, float("-inf"))
+    score_pad     = torch.full((num_seqs, max_len, alpha.shape[0]), float("-inf"), device=device)
     score_pad[seq_ids, seq_off] = s_masked
 
     k_eff     = min(k_lmk, max_len)
     vals, top = torch.topk(score_pad, k_eff, dim=1, sorted=False)
     valid     = vals > float("-inf")
-    abs_lmk   = (starts.unsqueeze(1).unsqueeze(2) + top).clamp(max=total_len - 1)
 
+    n_heads   = alpha.shape[0]
+    abs_lmk   = (starts[:, None, None] + top).clamp(max=total_len - 1)
+
+    seq_starts_exp = torch.repeat_interleave(
+        torch.arange(num_seqs, device=device), (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+    )
     for b in range(num_seqs):
         if not valid[b].any():
             continue
         s   = int(cu_seqlens[b])
         e   = int(cu_seqlens[b + 1])
-        idx = abs_lmk[b][valid[b]].unique()
+        idx = abs_lmk[b][valid[b]].reshape(-1).unique()
         mask[s:e, idx] = True
 
     return mask
@@ -225,14 +211,7 @@ class DSALTAttention(nn.Module):
         )
 
         out = sparse_attention_forward(q, k, v, attn_mask, self.dropout, self.training)
-
-        if not self.training:
-            scale    = math.sqrt(self.head_dim)
-            sc       = torch.matmul(q[0], k[0].transpose(-2, -1)) / scale
-            additive = sc.new_zeros(sc.shape).masked_fill_(~attn_mask.unsqueeze(0).expand_as(sc), float("-inf"))
-            self._last_P = torch.softmax(sc + additive, dim=-1).detach()
-        else:
-            self._last_P = None
+        self._last_P = None
 
         return self.out_proj(out.transpose(1, 2).contiguous().view(B, T, self.d_model))
 
@@ -253,41 +232,12 @@ class DSALTAttention(nn.Module):
 
         w_sizes = compute_window_sizes(x, self.window_proj, self.n_min, self.n_max)
 
-        if _TRITON_OK and self.training and device.type == "cuda":
-            out = dsalt_triton_attention(
-                q, k, v, x,
-                self.v_proj.weight.detach(),
-                self._alpha().detach(),
-                w_sizes.detach(), 
-                cu_seqlens, self.k_lmk, self.n_min,
-            )
-            self._last_P = None
-            return self.out_proj(out.contiguous().view(total_len, self.d_model))
-
-        t0        = time.perf_counter()
-
-        attn_mask = _build_mask_packed(
-            x, w_sizes.detach(), self.window_proj, self.v_proj.weight.detach(),
-            self._alpha().detach(), cu_seqlens, total_len,
-            self.k_lmk, self.head_dim, self.n_min, device,
+        out = dsalt_triton_attention(
+            q, k, v, x,
+            self.v_proj.weight.detach(),
+            self._alpha().detach(),
+            w_sizes.detach(),
+            cu_seqlens, self.k_lmk, self.n_min,
         )
-
-        
-
-        if self.layer_idx == 0 and self.training:
-            print(f"[DSALT] mask_build layer={self.layer_idx} t={time.perf_counter()-t0:.3f}s "
-                  f"sparsity={1-attn_mask.float().mean().item():.3f}")
-
-        out = sparse_attention_forward_packed(q, k, v, attn_mask, self.dropout, self.training)
-
-        if not self.training:
-            scale = math.sqrt(self.head_dim)
-            with torch.no_grad():
-                s  = int(cu_seqlens[0]); e = int(cu_seqlens[1])
-                sc = torch.matmul(q[s:e].transpose(0, 1), k[s:e].transpose(0, 1).transpose(-2, -1)) / scale
-                ad = sc.new_zeros(sc.shape).masked_fill_(~attn_mask[s:e, s:e].unsqueeze(0).expand_as(sc), float("-inf"))
-                self._last_P = torch.softmax(sc + ad, dim=-1).detach()
-        else:
-            self._last_P = None
-
-        return self.out_proj(out.contiguous().view(total_len, self.d_model))
+        self._last_P = None
+        return self.out_proj(out.view(total_len, self.d_model))

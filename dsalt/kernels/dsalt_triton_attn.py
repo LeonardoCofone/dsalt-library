@@ -1,10 +1,10 @@
 import math
-import time
 import torch
 import triton
 import triton.language as tl
 
-from .window_utils import build_local_window_mask_packed
+
+_SEQ_BLOCK_MAP_CACHE: dict = {}
 
 
 @triton.autotune(
@@ -113,8 +113,8 @@ def _dsalt_fwd_kernel(
         Lmk_V + pid_h*stride_lvh + seq_id*stride_lvb + offs_lk[None,:]*stride_lvs + offs_d[:,None]*stride_lvd
     ).to(tl.float32)
 
-    lmk_pos = tl.load(Lmk_pos + seq_id * K_LMK + offs_lk)  # [K_LMK]  posizioni assolute in-seq
-    causal_lmk = lmk_pos[None, :] <= (m_start + offs_m[:, None])  # [BLOCK_M, K_LMK]
+    lmk_pos    = tl.load(Lmk_pos + seq_id * K_LMK + offs_lk)
+    causal_lmk = lmk_pos[None, :] <= (m_start + offs_m[:, None])
 
     qk_lmk = tl.dot(q, lk_k) * scale
     qk_lmk = tl.where(causal_lmk & valid_m[:, None], qk_lmk, float("-inf"))
@@ -146,7 +146,11 @@ def _build_seq_block_map(
     block_m:    int,
     device:     torch.device,
 ) -> tuple[torch.Tensor, int]:
-    t0         = time.perf_counter()
+    key = (tuple(cu_seqlens.tolist()), block_m)
+    if key in _SEQ_BLOCK_MAP_CACHE:
+        cached_map, total_blks = _SEQ_BLOCK_MAP_CACHE[key]
+        return cached_map.to(device), total_blks
+
     lens       = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu()
     blocks_per = (lens + block_m - 1) // block_m
     total_blks = int(blocks_per.sum())
@@ -155,9 +159,9 @@ def _build_seq_block_map(
         torch.arange(total_blks, dtype=torch.int32)
         - torch.repeat_interleave(blocks_per.cumsum(0) - blocks_per, blocks_per).int()
     )
-    result = torch.stack([seq_col, blk_col], dim=1).to(device).contiguous(), total_blks
-    #print(f"--- [triton] _build_seq_block_map | total_blks={total_blks} block_m={block_m} | t={time.perf_counter()-t0:.4f}s")
-    return result
+    result = torch.stack([seq_col, blk_col], dim=1).contiguous()
+    _SEQ_BLOCK_MAP_CACHE[key] = (result, total_blks)
+    return result.to(device), total_blks
 
 
 def _compute_landmark_indices(
@@ -170,7 +174,6 @@ def _compute_landmark_indices(
     n_min:      int,
     total_len:  int,
 ) -> torch.Tensor:
-    t0       = time.perf_counter()
     device   = x.device
     total    = x.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
@@ -180,59 +183,46 @@ def _compute_landmark_indices(
     seq_off  = torch.arange(total, device=device) - starts[seq_ids]
     max_len  = int(lens.max())
 
-    n_heads, dh = alpha.shape[0], W_V.shape[0] // alpha.shape[0]
+    n_heads = alpha.shape[0]
+    dh      = W_V.shape[0] // n_heads
+
     x_norm      = x.norm(dim=-1)
-    W_V_h       = W_V.view(n_heads, dh, W_V.shape[1])
-    xwv_h       = torch.einsum("td,hkd->thk", x, W_V_h).norm(dim=-1)
     mu_x, std_x = x_norm.mean(), x_norm.std().clamp(min=1e-6)
-    mu_v        = xwv_h.mean(0, keepdim=True) 
-    std_v       = xwv_h.std(0, keepdim=True).clamp(min=1e-6)
-    z_x         = (x_norm - mu_x) / std_x                
-    z_v         = (xwv_h - mu_v) / std_v          
-    
-    w_sizes_pad = torch.full((num_seqs, max_len), float("inf"), device=device)
-    w_sizes_pad[seq_ids, seq_off] = w_sizes.float()
-    last_off  = lens - 1
-    threshold = (last_off[seq_ids] - n_min + 1).clamp(min=0)
-    # più corretto: usa la window_mask reale costruita dai w_sizes
-    window_mask_full = build_local_window_mask_packed(cu_seqlens, w_sizes, total_len, device)
-    covered = window_mask_full.any(dim=0)  # [T] token raggiungibili come KEY da almeno 1 query
+    z_x         = (x_norm - mu_x) / std_x
 
-    n_covered = covered.sum().item()
-    #print(f"--- [triton] covered (in-window) tokens={n_covered}/{total} | non-covered disponibili per landmark={total - n_covered}")
+    xwv_h    = (x @ W_V.T).view(total, n_heads, dh).norm(dim=-1)
+    mu_v     = xwv_h.mean(0, keepdim=True)
+    std_v    = xwv_h.std(0, keepdim=True).clamp(min=1e-6)
+    z_v      = (xwv_h - mu_v) / std_v
 
-    # DOPO
-    scores = alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)  # [T, H]
+    scores = alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)
 
-    covered_h = covered.unsqueeze(1).expand(-1, n_heads)    # [T, H]
-    scores_fil = scores.masked_fill(covered_h, float("-inf"))  # [T, H]
+    covered    = seq_off < w_sizes.long()
+    covered_h  = covered.unsqueeze(1).expand(-1, n_heads)
+    scores_fil = scores.masked_fill(covered_h, float("-inf"))
 
     score_pad = torch.full((n_heads, num_seqs, max_len), float("-inf"), device=device)
-    score_pad[:, seq_ids, seq_off] = scores_fil.T            # [H, num_seqs, max_len]
+    score_pad[:, seq_ids, seq_off] = scores_fil.T
 
     k_eff        = min(k_lmk, max_len)
     _, top_local = torch.topk(score_pad, k_eff, dim=2, sorted=False)
-    return top_local  # [H, num_seqs, k_lmk]
+    return top_local
 
 
-# DOPO (corretto)
 def _build_landmark_kv(
-    K, V, lmk_indices, cu_seqlens, k_lmk, n_heads, head_dim
-):
-    # lmk_indices: [H, num_seqs, k_lmk]
-    starts   = cu_seqlens[:-1].to(K.device)
-    num_seqs = cu_seqlens.shape[0] - 1
-
-    abs_idx = starts.unsqueeze(1) + lmk_indices           # [H, num_seqs, k_lmk]
-
-    # K: [T, H, head_dim] → per ogni testa h prendi abs_idx[h] righe, colonna h
-    # advanced indexing: K[abs_idx[h], h, :] per ogni h
-    h_idx = torch.arange(n_heads, device=K.device)        # [H]
-    h_idx = h_idx[:, None, None].expand(n_heads, num_seqs, k_lmk)  # [H, num_seqs, k_lmk]
-
-    lmk_K = K[abs_idx, h_idx, :]                          # [H, num_seqs, k_lmk, head_dim]
-    lmk_V = V[abs_idx, h_idx, :]                          # [H, num_seqs, k_lmk, head_dim]
-
+    K:           torch.Tensor,
+    V:           torch.Tensor,
+    lmk_indices: torch.Tensor,
+    cu_seqlens:  torch.Tensor,
+    k_lmk:       int,
+    n_heads:      int,
+    head_dim:     int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    starts  = cu_seqlens[:-1].to(K.device)
+    abs_idx = starts[None, :, None] + lmk_indices
+    h_idx   = torch.arange(n_heads, device=K.device)[:, None, None].expand_as(abs_idx)
+    lmk_K   = K[abs_idx, h_idx, :]
+    lmk_V   = V[abs_idx, h_idx, :]
     return lmk_K.contiguous(), lmk_V.contiguous()
 
 
@@ -248,14 +238,10 @@ def dsalt_triton_attention(
     k_lmk:      int,
     n_min:      int,
 ) -> torch.Tensor:
-    t0                      = time.perf_counter()
     total_len, n_heads, head_dim = q.shape
-    device                  = q.device
-    scale                   = 1.0 / math.sqrt(head_dim)
-    HEAD_DIM_C              = triton.next_power_of_2(head_dim)
-
-    #print(f"--- [triton] dsalt_triton_attention START | total_len={total_len} n_heads={n_heads} head_dim={head_dim} HEAD_DIM_C={HEAD_DIM_C} k_lmk={k_lmk}")
-    #print(f"--- [triton] scale={scale:.6f} | device={device} | q.dtype={q.dtype}")
+    device                       = q.device
+    scale                        = 1.0 / math.sqrt(head_dim)
+    HEAD_DIM_C                   = triton.next_power_of_2(head_dim)
 
     q_c = q.contiguous().to(torch.float16)
     k_c = k.contiguous().to(torch.float16)
@@ -263,31 +249,17 @@ def dsalt_triton_attention(
     out = torch.zeros_like(q_c)
 
     w_int = w_sizes.clamp(min=1).long().contiguous()
-    #print(f"--- [triton] w_int stats | min={w_int.min().item()} max={w_int.max().item()} mean={w_int.float().mean().item():.1f}")
 
     with torch.no_grad():
-        t1 = time.perf_counter()
         lmk_indices = _compute_landmark_indices(
             x.float(), W_V.float(), alpha.float(), w_sizes.float(), cu_seqlens, k_lmk, n_min, total_len
         )
-        #print(f"--- [triton] lmk_indices shape={tuple(lmk_indices.shape)} | t={time.perf_counter()-t1:.4f}s")
-
-        t2 = time.perf_counter()
         lmk_K, lmk_V = _build_landmark_kv(k_c, v_c, lmk_indices, cu_seqlens, k_lmk, n_heads, head_dim)
-        #print(f"--- [triton] landmark KV costruiti | t={time.perf_counter()-t2:.4f}s")
-
-        t3 = time.perf_counter()
         seq_block_map, total_blk = _build_seq_block_map(cu_seqlens, 64, device)
-        #print(f"--- [triton] seq_block_map={tuple(seq_block_map.shape)} total_blk={total_blk} | t={time.perf_counter()-t3:.4f}s")
 
-    cu_int = cu_seqlens.to(torch.int32).contiguous()
+    cu_int         = cu_seqlens.to(torch.int32).contiguous()
+    lmk_pos_tensor = lmk_indices.to(torch.int32).contiguous()
 
-    if torch.cuda.is_available():
-        mem_pre = torch.cuda.memory_allocated(device) / 1e9
-        #print(f"--- [triton] GPU mem PRE kernel: {mem_pre:.3f}GB")
-
-    t4 = time.perf_counter()
-    lmk_pos_tensor = lmk_indices.to(torch.int32).contiguous()  # [num_seqs, K_LMK] posizioni locali in-seq
     _dsalt_fwd_kernel[lambda meta: (total_blk, n_heads)](
         q_c, k_c, v_c, out,
         w_int, lmk_K, lmk_V, lmk_pos_tensor, cu_int, seq_block_map,
@@ -299,18 +271,5 @@ def dsalt_triton_attention(
         lmk_V.stride(0), lmk_V.stride(1), lmk_V.stride(2), lmk_V.stride(3),
         scale=scale, HEAD_DIM=HEAD_DIM_C, K_LMK=k_lmk,
     )
-    torch.cuda.synchronize()
-    #print(f"--- [triton] _dsalt_fwd_kernel DONE | t_kernel={time.perf_counter()-t4:.4f}s")
 
-    if torch.cuda.is_available():
-        mem_post = torch.cuda.memory_allocated(device) / 1e9
-        #print(f"--- [triton] GPU mem POST kernel: {mem_post:.3f}GB | delta={mem_post-mem_pre:.3f}GB")
-
-    out_f    = out.float()
-    out_norm = out_f.norm().item()
-    #print(f"--- [triton] output | out_norm={out_norm:.4f} | t_total={time.perf_counter()-t0:.4f}s")
-
-    if not math.isfinite(out_norm):
-        print(f"--- [triton] CRITICAL: in the output there are NaN/Inf! out_norm={out_norm}")
-
-    return out_f
+    return out.float()
