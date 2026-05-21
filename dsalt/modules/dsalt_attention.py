@@ -119,21 +119,20 @@ def _build_mask_packed(
     threshold     = (last_off[seq_ids] - n_min + 1).clamp(min=0)
     in_win_global = (seq_off >= threshold).unsqueeze(1)
     s_masked  = scores.masked_fill(in_win_global, float("-inf"))
-    score_pad = torch.full((num_seqs, max_len), float("-inf"), device=device)
+    score_pad = torch.full((num_seqs, max_len, alpha.shape[0]), float("-inf"), device=device)
     score_pad[seq_ids, seq_off] = s_masked
 
-    k_eff        = min(k_lmk, max_len)
-    vals, top    = torch.topk(score_pad, k_eff, dim=1, sorted=False)
-    valid        = vals > float("-inf")
-    abs_lmk      = (starts.unsqueeze(1) + top).clamp(max=total_len - 1)
+    k_eff     = min(k_lmk, max_len)
+    vals, top = torch.topk(score_pad, k_eff, dim=1, sorted=False)
+    valid     = vals > float("-inf")
+    abs_lmk   = (starts.unsqueeze(1).unsqueeze(2) + top).clamp(max=total_len - 1)
 
-    # vectorized landmark injection: scatter True into mask
     for b in range(num_seqs):
         if not valid[b].any():
             continue
         s   = int(cu_seqlens[b])
         e   = int(cu_seqlens[b + 1])
-        idx = abs_lmk[b][valid[b]]
+        idx = abs_lmk[b][valid[b]].unique()
         mask[s:e, idx] = True
 
     return mask
