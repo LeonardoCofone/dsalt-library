@@ -226,6 +226,163 @@ def _build_landmark_kv(
     return lmk_K.contiguous(), lmk_V.contiguous()
 
 
+def _sparse_attn_backward(
+    grad_out:    torch.Tensor,
+    q:           torch.Tensor,
+    k:           torch.Tensor,
+    v:           torch.Tensor,
+    lmk_K:      torch.Tensor,
+    lmk_V:      torch.Tensor,
+    lmk_pos:    torch.Tensor,
+    w_sizes:    torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale:      float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    total_len, n_heads, head_dim = q.shape
+    device   = q.device
+    num_seqs = cu_seqlens.shape[0] - 1
+    k_lmk   = lmk_pos.shape[2]
+
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+
+    for s in range(num_seqs):
+        s_start = int(cu_seqlens[s].item())
+        s_end   = int(cu_seqlens[s + 1].item())
+        slen    = s_end - s_start
+
+        q_s  = q[s_start:s_end]
+        k_s  = k[s_start:s_end]
+        v_s  = v[s_start:s_end]
+        go_s = grad_out[s_start:s_end]
+        ws_s = w_sizes[s_start:s_end].long()
+
+        i_idx = torch.arange(slen, device=device)
+        j_idx = torch.arange(slen, device=device)
+
+        win_mask = (
+            (j_idx[None, :] >= (i_idx[:, None] - ws_s[:, None] + 1)) &
+            (j_idx[None, :] <= i_idx[:, None])
+        )
+
+        lpos_s = lmk_pos[:, s, :]
+
+        for h in range(n_heads):
+            q_h  = q_s[:, h, :]
+            k_h  = k_s[:, h, :]
+            v_h  = v_s[:, h, :]
+            go_h = go_s[:, h, :]
+            lk_h = lmk_K[h, s, :, :]
+            lv_h = lmk_V[h, s, :, :]
+            lp_h = lpos_s[h, :]
+
+            causal_lmk = lp_h[None, :] <= i_idx[:, None]
+
+            qk_win = (q_h @ k_h.T) * scale
+            qk_win = qk_win.masked_fill(~win_mask, float("-inf"))
+
+            qk_lmk = (q_h @ lk_h.T) * scale
+            qk_lmk = qk_lmk.masked_fill(~causal_lmk, float("-inf"))
+
+            qk_all  = torch.cat([qk_win, qk_lmk], dim=1)
+            p_all   = torch.softmax(qk_all, dim=1)
+            p_win   = p_all[:, :slen]
+            p_lmk_w = p_all[:, slen:]
+
+            dv_h = p_win.T @ go_h
+            dv[s_start:s_end, h, :] += dv_h
+
+            dp_win  = go_h @ v_h.T
+            dp_lmk  = go_h @ lv_h.T
+            dp_all  = torch.cat([dp_win, dp_lmk], dim=1)
+
+            ds_all  = p_all * (dp_all - (dp_all * p_all).sum(dim=1, keepdim=True))
+            ds_win  = ds_all[:, :slen] * scale
+            ds_lmk  = ds_all[:, slen:] * scale
+
+            dq[s_start:s_end, h, :] += ds_win @ k_h + ds_lmk @ lk_h
+            dk[s_start:s_end, h, :] += ds_win.T @ q_h
+
+    return dq, dk, dv
+
+
+class DSALTAttentionFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q, k, v, x, W_V, alpha, w_sizes, cu_seqlens, k_lmk, n_min,
+    ):
+        total_len, n_heads, head_dim = q.shape
+        device     = q.device
+        scale      = 1.0 / math.sqrt(head_dim)
+        HEAD_DIM_C = triton.next_power_of_2(head_dim)
+
+        q_c   = q.contiguous().to(torch.float16)
+        k_c   = k.contiguous().to(torch.float16)
+        v_c   = v.contiguous().to(torch.float16)
+        out   = torch.zeros_like(q_c)
+        w_int = w_sizes.clamp(min=1).long().contiguous()
+
+        with torch.no_grad():
+            lmk_indices   = _compute_landmark_indices(
+                x.float(), W_V.float(), alpha.detach().float(),
+                w_sizes.float(), cu_seqlens, k_lmk, n_min, total_len,
+            )
+            lmk_K, lmk_V = _build_landmark_kv(
+                k_c, v_c, lmk_indices, cu_seqlens, k_lmk, n_heads, head_dim,
+            )
+            seq_block_map, total_blk = _build_seq_block_map(cu_seqlens, 64, device)
+
+        cu_int         = cu_seqlens.to(torch.int32).contiguous()
+        lmk_pos_tensor = lmk_indices.to(torch.int32).contiguous()
+
+        _dsalt_fwd_kernel[lambda meta: (total_blk, n_heads)](
+            q_c, k_c, v_c, out,
+            w_int, lmk_K, lmk_V, lmk_pos_tensor, cu_int, seq_block_map,
+            q_c.stride(0), q_c.stride(1), q_c.stride(2),
+            k_c.stride(0), k_c.stride(1), k_c.stride(2),
+            v_c.stride(0), v_c.stride(1), v_c.stride(2),
+            out.stride(0), out.stride(1), out.stride(2),
+            lmk_K.stride(0), lmk_K.stride(1), lmk_K.stride(2), lmk_K.stride(3),
+            lmk_V.stride(0), lmk_V.stride(1), lmk_V.stride(2), lmk_V.stride(3),
+            scale=scale, HEAD_DIM=HEAD_DIM_C, K_LMK=k_lmk,
+        )
+
+        ctx.save_for_backward(
+            q.float(), k.float(), v.float(),
+            lmk_K.float(), lmk_V.float(),
+            lmk_pos_tensor, w_sizes, cu_seqlens,
+        )
+        ctx.scale = scale
+
+        return out.float()
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, k, v, lmk_K, lmk_V, lmk_pos, w_sizes, cu_seqlens = ctx.saved_tensors
+        scale = ctx.scale
+
+        dq, dk, dv = _sparse_attn_backward(
+            grad_out.float(), q, k, v,
+            lmk_K, lmk_V, lmk_pos,
+            w_sizes, cu_seqlens, scale,
+        )
+
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def dsalt_triton_attention(
     q:          torch.Tensor,
     k:          torch.Tensor,
@@ -238,38 +395,6 @@ def dsalt_triton_attention(
     k_lmk:      int,
     n_min:      int,
 ) -> torch.Tensor:
-    total_len, n_heads, head_dim = q.shape
-    device                       = q.device
-    scale                        = 1.0 / math.sqrt(head_dim)
-    HEAD_DIM_C                   = triton.next_power_of_2(head_dim)
-
-    q_c = q.contiguous().to(torch.float16)
-    k_c = k.contiguous().to(torch.float16)
-    v_c = v.contiguous().to(torch.float16)
-    out = torch.zeros_like(q_c)
-
-    w_int = w_sizes.clamp(min=1).long().contiguous()
-
-    with torch.no_grad():
-        lmk_indices = _compute_landmark_indices(
-            x.float(), W_V.float(), alpha.float(), w_sizes.float(), cu_seqlens, k_lmk, n_min, total_len
-        )
-        lmk_K, lmk_V = _build_landmark_kv(k_c, v_c, lmk_indices, cu_seqlens, k_lmk, n_heads, head_dim)
-        seq_block_map, total_blk = _build_seq_block_map(cu_seqlens, 64, device)
-
-    cu_int         = cu_seqlens.to(torch.int32).contiguous()
-    lmk_pos_tensor = lmk_indices.to(torch.int32).contiguous()
-
-    _dsalt_fwd_kernel[lambda meta: (total_blk, n_heads)](
-        q_c, k_c, v_c, out,
-        w_int, lmk_K, lmk_V, lmk_pos_tensor, cu_int, seq_block_map,
-        q_c.stride(0), q_c.stride(1), q_c.stride(2),
-        k_c.stride(0), k_c.stride(1), k_c.stride(2),
-        v_c.stride(0), v_c.stride(1), v_c.stride(2),
-        out.stride(0), out.stride(1), out.stride(2),
-        lmk_K.stride(0), lmk_K.stride(1), lmk_K.stride(2), lmk_K.stride(3),
-        lmk_V.stride(0), lmk_V.stride(1), lmk_V.stride(2), lmk_V.stride(3),
-        scale=scale, HEAD_DIM=HEAD_DIM_C, K_LMK=k_lmk,
+    return DSALTAttentionFunction.apply(
+        q, k, v, x, W_V, alpha, w_sizes, cu_seqlens, k_lmk, n_min,
     )
-
-    return out.float()
