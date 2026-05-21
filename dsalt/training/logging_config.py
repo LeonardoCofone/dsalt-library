@@ -227,15 +227,11 @@ class StepTimer:
         self._device = device
 
     def start(self) -> None:
-        if self._device and self._device.type == "cuda":
-            torch.cuda.synchronize(self._device)
         self._t0 = time.perf_counter()
 
     def stop(self, total_tokens: int = 0) -> dict:
         if self._t0 is None:
             return {}
-        if self._device and self._device.type == "cuda":
-            torch.cuda.synchronize(self._device)
         elapsed = time.perf_counter() - self._t0
         self._times.append(elapsed)
         if len(self._times) > self._window:

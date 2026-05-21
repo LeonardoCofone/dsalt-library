@@ -404,19 +404,12 @@ class DSALTTrainer:
         return ids, labels, cu_seqlens, max_seqlen
 
     def _forward_step(self, batch) -> torch.Tensor:
-        t0 = time.perf_counter()
         ids, labels, cu_seqlens, max_seqlen = self._extract_batch(batch)
         self._tokens_per_batch = ids.numel()
         self._last_ids         = ids
         self._last_cu_seqlens  = cu_seqlens
         self._last_max_seqlen  = max_seqlen
 
-        if torch.cuda.is_available():
-            mem_pre = torch.cuda.memory_allocated(self.device) / 1e9
-            mem_res = torch.cuda.memory_reserved(self.device) / 1e9
-            #print(f"--- [trainer] _forward_step PRE-autocast | GPU alloc={mem_pre:.3f}GB reserved={mem_res:.3f}GB")
-
-        #print(f"--- [trainer] _forward_step | lancio forward con amp={self._use_amp} dtype={self._amp_dtype}")
         with torch.autocast(device_type=self.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
             out  = self.model(
                 ids,
@@ -426,12 +419,6 @@ class DSALTTrainer:
                 gradient_checkpointing=self.gradient_checkpointing,
             )
             loss = out["loss"]
-
-        #print(f"--- [trainer] _forward_step | loss={loss.item():.4f} | t={time.perf_counter()-t0:.4f}s")
-
-        if torch.cuda.is_available():
-            mem_post = torch.cuda.memory_allocated(self.device) / 1e9
-            #print(f"--- [trainer] _forward_step POST-forward | GPU alloc={mem_post:.3f}GB")
 
         if not math.isfinite(loss.item()):
             print(f"--- [trainer] CRITICAL: loss not finished! loss={loss.item()} - step={self.global_step}")
@@ -511,7 +498,6 @@ class DSALTTrainer:
         if not self.is_main:
             return
 
-        t0     = time.perf_counter()
         stats  = self._timer.stop()
         it_s   = stats.get("it_s", 0.0)
         mem_gb = 0.0
@@ -521,9 +507,9 @@ class DSALTTrainer:
         lr_now    = self.scheduler.get_last_lr()[0]
         train_ppl = math.exp(min(accum_loss, 20.0))
 
-        #print(f"--- [trainer] _log_step step={self.global_step} | loss={accum_loss:.4f} ppl={train_ppl:.4f} lr={lr_now:.2e} it/s={it_s:.2f} GPU={mem_gb:.3f}GB")
+        self._timer.start()
+        self._timer.start()
 
-        #print(f"--- [trainer] _log_step | compute_metrics START")
         metrics = compute_metrics(
             _unwrap_model(self.model),
             self._last_ids,
@@ -562,8 +548,6 @@ class DSALTTrainer:
                   "eff_rank_per_layer", "res_per_layer", "token_dist_per_layer",
                   "alpha_per_head", "oow_mass_per_layer"]:
             self.history[k].append(metrics[k])
-
-        self._timer.start()
 
     def train(self):
         self.model.train()

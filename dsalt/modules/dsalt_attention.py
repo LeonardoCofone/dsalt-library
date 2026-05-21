@@ -211,7 +211,14 @@ class DSALTAttention(nn.Module):
         )
 
         out = sparse_attention_forward(q, k, v, attn_mask, self.dropout, self.training)
-        self._last_P = None
+
+        if not self.training:
+            scale    = 1.0 / math.sqrt(self.head_dim)
+            sc       = torch.matmul(q[0], k[0].transpose(-2, -1)) * scale
+            additive = sc.new_full(sc.shape, float("-inf")).masked_fill_(attn_mask[0], 0.0)
+            self._last_P = torch.softmax(sc + additive, dim=-1).detach()
+        else:
+            self._last_P = None
 
         return self.out_proj(out.transpose(1, 2).contiguous().view(B, T, self.d_model))
 
@@ -239,5 +246,23 @@ class DSALTAttention(nn.Module):
             w_sizes.detach(),
             cu_seqlens, self.k_lmk, self.n_min,
         )
-        self._last_P = None
+
+        if not self.training:
+            s0    = int(cu_seqlens[0])
+            e0    = int(cu_seqlens[1])
+            q0    = q[s0:e0].transpose(0, 1)
+            k0    = k[s0:e0].transpose(0, 1)
+            scale = 1.0 / math.sqrt(self.head_dim)
+            sc    = torch.matmul(q0, k0.transpose(-2, -1)) * scale
+            w0    = w_sizes[s0:e0].long()
+            T0    = e0 - s0
+            rows  = torch.arange(T0, device=device)
+            cols  = torch.arange(T0, device=device)
+            in_win = (cols.unsqueeze(0) >= (rows.unsqueeze(1) - w0.unsqueeze(1) + 1)) & \
+                     (cols.unsqueeze(0) <= rows.unsqueeze(1))
+            additive = sc.new_full((T0, T0), float("-inf")).masked_fill_(in_win, 0.0)
+            self._last_P = torch.softmax(sc + additive.unsqueeze(0), dim=-1).detach()
+        else:
+            self._last_P = None
+
         return self.out_proj(out.view(total_len, self.d_model))
