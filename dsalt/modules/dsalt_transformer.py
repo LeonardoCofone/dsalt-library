@@ -1,8 +1,8 @@
-import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import time
 
 from ..kernels.RMSENorm  import RMSENorm
 from .dsalt_attention    import DSALTAttention
@@ -18,14 +18,7 @@ class SwiGLUFFN(nn.Module):
         #print(f"--- [SwiGLUFFN] init | d_model={d_model} d_ff={d_ff} dropout={dropout}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        t0 = time.perf_counter()
-        #print(f"--- [SwiGLUFFN] forward | x={tuple(x.shape)}")
-        gate = F.silu(self.gate_proj(x))
-        up   = self.up_proj(x)
-        #print(f"--- [SwiGLUFFN] gate={tuple(gate.shape)} up={tuple(up.shape)} | gate_norm={gate.norm().item():.4f} up_norm={up.norm().item():.4f}")
-        out  = self.drop(self.down_proj(gate * up))
-        #print(f"--- [SwiGLUFFN] forward DONE | out={tuple(out.shape)} | t={time.perf_counter()-t0:.4f}s")
-        return out
+        return self.drop(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
 class DSALTTransformerBlock(nn.Module):
@@ -61,11 +54,6 @@ class DSALTTransformerBlock(nn.Module):
         max_seqlen:             int | None          = None,
         gradient_checkpointing: bool                = False,
     ) -> torch.Tensor:
-        t0 = time.perf_counter()
-        #print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} forward START | x={tuple(x.shape)} gc={gradient_checkpointing}")
-
-        x_norm_pre_attn = x.norm().item()
-
         if gradient_checkpointing and self.training:
             #print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} usando gradient_checkpointing per attn")
             t1 = time.perf_counter()
@@ -93,9 +81,4 @@ class DSALTTransformerBlock(nn.Module):
             x     = x + x_ffn
             #print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} ffn residual DONE | out_norm={x.norm().item():.4f} | t={time.perf_counter()-t2:.4f}s")
 
-        residual_growth = x.norm().item() / (x_norm_pre_attn + 1e-9)
-        if residual_growth > 10.0:
-            print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} WARNING: residual grown x{residual_growth:.2f} (instability detected)")
-
-        #print(f"--- [DSALTTransformerBlock] layer={self.layer_idx} forward DONE | t_total={time.perf_counter()-t0:.4f}s")
         return x

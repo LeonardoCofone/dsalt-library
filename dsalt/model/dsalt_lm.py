@@ -123,13 +123,9 @@ class DSALTLMHeadModel(nn.Module):
     def _compute_loss(self, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         flat_x      = x.view(-1, self.d_model)
         flat_labels = labels.view(-1)
-
         if self.loss_fn == "liger":
-            with torch.autocast(x.device.type, enabled=False):
-                return _liger_cross_entropy(flat_x, self.lm_head.weight, flat_labels)
-
-        with torch.autocast(x.device.type, enabled=False):
-            return _chunked_cross_entropy(flat_x, self.lm_head.weight, flat_labels, self.lm_head_chunk_size)
+            return _liger_cross_entropy(flat_x, self.lm_head.weight, flat_labels)
+        return _chunked_cross_entropy(flat_x, self.lm_head.weight, flat_labels, self.lm_head_chunk_size)
 
     def forward(
         self,

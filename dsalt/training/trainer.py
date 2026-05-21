@@ -307,7 +307,7 @@ class DSALTTrainer:
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=True,
+                find_unused_parameters=False,
                 gradient_as_bucket_view=True,
             )
             #print(f"--- [trainer] DDP wrapping DONE")
