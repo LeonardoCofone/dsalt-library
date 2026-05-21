@@ -34,154 +34,133 @@ def compute_metrics(
     ids: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
-) -> dict:
+    ) -> dict:
     t0 = time.perf_counter()
-    #print(f"--- [trainer] compute_metrics START | ids={tuple(ids.shape)} max_seqlen={max_seqlen}")
-
     m = _unwrap_model(model)
     m.eval()
 
-    device    = ids.device
+    device = ids.device
     total_len = ids.shape[0]
 
     x = m.embed_tokens(ids)
-    #print(f"--- [trainer] compute_metrics | embed x={tuple(x.shape)}")
     layer_hiddens = [x.clone()]
 
     for i, layer in enumerate(m.layers):
-        #print(f"--- [trainer] compute_metrics | layer {i} forward")
-        x = layer(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        out = layer(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        x = out[0] if isinstance(out, tuple) else out
         layer_hiddens.append(x.clone())
-        #print(f"--- [trainer] compute_metrics | layer {i} done | x_norm={x.norm().item():.4f}")
 
     last_attn = m.layers[-1].attn
-    sigma2    = float("nan")
-    eff_rank  = float("nan")
-    sigma2_per_layer        = []
+    sigma2 = float("nan")
+    eff_rank = float("nan")
+    sigma2_per_layer = []
     eff_rank_per_layer_attn = []
 
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
-        #print(f"--- [trainer] compute_metrics | _last_P trovato su ultimo layer | shape={tuple(last_attn._last_P.shape)}")
-        P     = last_attn._last_P.float()
+        P = last_attn._last_P.float()
         P_avg = P.mean(dim=0).detach().cpu()
-        sv    = torch.linalg.svdvals(P_avg)
-        sigma2   = sv[1].item() if sv.shape[0] > 1 else 0.0
-        sv_norm  = sv / (sv.sum() + 1e-9)
+        sv = torch.linalg.svdvals(P_avg)
+        sigma2 = sv[1].item() if sv.shape[0] > 1 else 0.0
+        sv_norm = sv / (sv.sum() + 1e-9)
         eff_rank = torch.exp(-(sv_norm * (sv_norm + 1e-9).log()).sum()).item()
-        #print(f"--- [trainer] compute_metrics | sigma2={sigma2:.6f} eff_rank={eff_rank:.4f}")
     else:
         print(f"--- [trainer] compute_metrics | WARNING: _last_P not available (training mode or packed?)")
 
     for li, layer in enumerate(m.layers):
         attn = layer.attn
         if hasattr(attn, "_last_P") and attn._last_P is not None:
-            sv_l  = torch.linalg.svdvals(attn._last_P.float().mean(dim=0).detach().cpu())
+            sv_l = torch.linalg.svdvals(attn._last_P.float().mean(dim=0).detach().cpu())
             sigma2_per_layer.append(sv_l[1].item() if sv_l.shape[0] > 1 else 0.0)
             sv_ln = sv_l / (sv_l.sum() + 1e-9)
             eff_rank_per_layer_attn.append(torch.exp(-(sv_ln * (sv_ln + 1e-9).log()).sum()).item())
-            #print(f"--- [trainer] compute_metrics | layer {li}: sigma2={sigma2_per_layer[-1]:.6f} eff_rank={eff_rank_per_layer_attn[-1]:.4f}")
         else:
             sigma2_per_layer.append(float("nan"))
             eff_rank_per_layer_attn.append(float("nan"))
-            #print(f"--- [trainer] compute_metrics | layer {li}: _last_P non disponibile")
 
     eff_rank_per_layer = []
     for li, h_l in enumerate(layer_hiddens[1:]):
-        sv_h  = torch.linalg.svdvals(h_l.float().detach().cpu())
+        sv_h = torch.linalg.svdvals(h_l.float().detach().cpu())
         sv_hn = sv_h / (sv_h.sum() + 1e-9)
-        er    = torch.exp(-(sv_hn * (sv_hn + 1e-9).log()).sum()).item()
+        er = torch.exp(-(sv_hn * (sv_hn + 1e-9).log()).sum()).item()
         eff_rank_per_layer.append(er)
-        #print(f"--- [trainer] compute_metrics | hidden eff_rank layer {li}: {er:.4f}")
 
-    h_final  = layer_hiddens[-1]
-    h_mean   = h_final.mean(dim=0, keepdim=True)
+    h_final = layer_hiddens[-1]
+    h_mean = h_final.mean(dim=0, keepdim=True)
     res_norm = ((h_final - h_mean).norm() / (layer_hiddens[0].norm() + 1e-9)).item()
-    #print(f"--- [trainer] compute_metrics | res_norm={res_norm:.6f}")
 
     res_per_layer = []
-    h0_norm       = layer_hiddens[0].norm().item()
+    h0_norm = layer_hiddens[0].norm().item()
     for li, h_l in enumerate(layer_hiddens[1:]):
-        xm  = h_l.mean(dim=0, keepdim=True)
-        rn  = ((h_l - xm).norm() / (h0_norm + 1e-9)).item()
+        xm = h_l.mean(dim=0, keepdim=True)
+        rn = ((h_l - xm).norm() / (h0_norm + 1e-9)).item()
         res_per_layer.append(rn)
-        #print(f"--- [trainer] compute_metrics | res_per_layer[{li}]={rn:.6f}")
 
-    attn_entropy      = float("nan")
+    attn_entropy = float("nan")
     entropy_per_layer = []
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
-        P_safe       = last_attn._last_P.float().clamp(min=1e-9)
+        P_safe = last_attn._last_P.float().clamp(min=1e-9)
         attn_entropy = -(P_safe * P_safe.log()).sum(dim=-1).mean().item()
-        #print(f"--- [trainer] compute_metrics | attn_entropy={attn_entropy:.6f}")
 
     for li, layer in enumerate(m.layers):
         attn = layer.attn
         if hasattr(attn, "_last_P") and attn._last_P is not None:
             P_l = attn._last_P.float().clamp(min=1e-9)
-            H   = -(P_l * P_l.log()).sum(dim=-1).mean().item()
+            H = -(P_l * P_l.log()).sum(dim=-1).mean().item()
             entropy_per_layer.append(H)
-            #print(f"--- [trainer] compute_metrics | entropy_per_layer[{li}]={H:.6f}")
         else:
             entropy_per_layer.append(float("nan"))
 
-    min_dist             = 64
-    n_pairs              = min(64, total_len - min_dist)
-    token_dist           = float("nan")
+    min_dist = 64
+    n_pairs = min(64, total_len - min_dist)
+    token_dist = float("nan")
     token_dist_per_layer = []
     if n_pairs > 0:
-        pairs_i    = torch.randint(min_dist, total_len, (n_pairs,), device=device)
-        pairs_j    = pairs_i - min_dist
-        hi         = layer_hiddens[-1][pairs_i]
-        hj         = layer_hiddens[-1][pairs_j]
+        pairs_i = torch.randint(min_dist, total_len, (n_pairs,), device=device)
+        pairs_j = pairs_i - min_dist
+        hi = layer_hiddens[-1][pairs_i]
+        hj = layer_hiddens[-1][pairs_j]
         token_dist = (hi - hj).norm(dim=-1).mean().item()
-        #print(f"--- [trainer] compute_metrics | token_dist={token_dist:.6f}")
         for li, h_l in enumerate(layer_hiddens[1:]):
             hi_l = h_l[pairs_i]
             hj_l = h_l[pairs_j]
-            td   = (hi_l - hj_l).norm(dim=-1).mean().item()
+            td = (hi_l - hj_l).norm(dim=-1).mean().item()
             token_dist_per_layer.append(td)
-            #print(f"--- [trainer] compute_metrics | token_dist_per_layer[{li}]={td:.6f}")
 
-    noise_norm      = float("nan")
+    noise_norm = float("nan")
     noise_per_layer = []
-    seq0_len        = (cu_seqlens[1] - cu_seqlens[0]).item()
-    #print(f"--- [trainer] compute_metrics | seq0_len={seq0_len} (soglia perturbazione=128)")
+    seq0_len = (cu_seqlens[1] - cu_seqlens[0]).item()
 
     if seq0_len > 128:
         inject_pos = int(seq0_len // 4)
-        ids_pert   = ids.clone()
+        ids_pert = ids.clone()
         ids_pert[inject_pos] = torch.randint(0, m.vocab_size, (1,), device=device).item()
-        #print(f"--- [trainer] compute_metrics | perturbazione al token {inject_pos}")
 
-        x_pert             = m.embed_tokens(ids_pert)
+        x_pert = m.embed_tokens(ids_pert)
         layer_hiddens_pert = [x_pert.clone()]
         for i, layer in enumerate(m.layers):
-            x_pert = layer(x_pert, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            out_pert = layer(x_pert, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x_pert = out_pert[0] if isinstance(out_pert, tuple) else out_pert
             layer_hiddens_pert.append(x_pert.clone())
-            #print(f"--- [trainer] compute_metrics | perturb layer {i} done")
 
         far_start = inject_pos + 64
-        far_end   = int(cu_seqlens[1].item())
-        #print(f"--- [trainer] compute_metrics | noise window=[{far_start}, {far_end}]")
+        far_end = int(cu_seqlens[1].item())
 
         if far_end > far_start:
             noise_norm = (
                 layer_hiddens_pert[-1][far_start:far_end] - layer_hiddens[-1][far_start:far_end]
             ).norm(dim=-1).mean().item()
-            #print(f"--- [trainer] compute_metrics | noise_norm={noise_norm:.6f}")
 
             for li, (hl_orig, hl_pert) in enumerate(zip(layer_hiddens[1:], layer_hiddens_pert[1:])):
                 nl = (hl_pert[far_start:far_end] - hl_orig[far_start:far_end]).norm(dim=-1).mean().item()
                 noise_per_layer.append(nl)
-                #print(f"--- [trainer] compute_metrics | noise_per_layer[{li}]={nl:.6f}")
 
     head_spec_std = float("nan")
-    attn_sink     = float("nan")
+    attn_sink = float("nan")
     if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
-        P             = last_attn._last_P.float().clamp(min=1e-9)
+        P = last_attn._last_P.float().clamp(min=1e-9)
         entropy_heads = -(P * P.log()).sum(dim=-1).mean(dim=-1)
         head_spec_std = entropy_heads.std(correction=0).item() if entropy_heads.numel() > 0 else float("nan")
-        attn_sink     = last_attn._last_P.float()[:, :, 0].mean().item()
-        #print(f"--- [trainer] compute_metrics | head_spec_std={head_spec_std:.6f} attn_sink={attn_sink:.6f}")
+        attn_sink = last_attn._last_P.float()[:, :, 0].mean().item()
 
     alpha_per_head = []
     for li, layer in enumerate(m.layers):
@@ -189,43 +168,40 @@ def compute_metrics(
         if hasattr(attn, "alpha_w"):
             av = torch.sigmoid(attn.alpha_w).detach().cpu().tolist()
             alpha_per_head.append(av)
-            #print(f"--- [trainer] compute_metrics | alpha layer {li}: {[f'{a:.3f}' for a in av]}")
 
     oow_mass_per_layer = []
     for li, layer in enumerate(m.layers):
         attn = layer.attn
         if hasattr(attn, "_last_P") and attn._last_P is not None and hasattr(attn, "n_min"):
-            P_l       = attn._last_P.float()
-            T_l       = P_l.shape[-1]
+            P_l = attn._last_P.float()
+            T_l = P_l.shape[-1]
             positions = torch.arange(T_l, device=P_l.device).float()
-            dist      = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()
+            dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()
             in_window = (dist < attn.n_min).unsqueeze(0).unsqueeze(0)
-            oow       = P_l.masked_fill(in_window, 0.0).sum(dim=-1).mean().item()
+            oow = P_l.masked_fill(in_window, 0.0).sum(dim=-1).mean().item()
             oow_mass_per_layer.append(oow)
-            #print(f"--- [trainer] compute_metrics | oow_mass layer {li}={oow:.6f}")
         else:
             oow_mass_per_layer.append(float("nan"))
 
     m.train()
-    #print(f"--- [trainer] compute_metrics DONE | t={time.perf_counter()-t0:.4f}s")
 
     return {
-        "sigma2":                sigma2,
-        "eff_rank":              eff_rank,
-        "res_norm":              res_norm,
-        "attn_entropy":          attn_entropy,
-        "noise_norm":            noise_norm,
-        "token_dist":            token_dist,
-        "head_spec_std":         head_spec_std,
-        "attn_sink":             attn_sink,
-        "sigma2_per_layer":      sigma2_per_layer,
-        "entropy_per_layer":     entropy_per_layer,
-        "noise_per_layer":       noise_per_layer,
-        "eff_rank_per_layer":    eff_rank_per_layer,
-        "res_per_layer":         res_per_layer,
-        "token_dist_per_layer":  token_dist_per_layer,
-        "alpha_per_head":        alpha_per_head,
-        "oow_mass_per_layer":    oow_mass_per_layer,
+        "sigma2": sigma2,
+        "eff_rank": eff_rank,
+        "res_norm": res_norm,
+        "attn_entropy": attn_entropy,
+        "noise_norm": noise_norm,
+        "token_dist": token_dist,
+        "head_spec_std": head_spec_std,
+        "attn_sink": attn_sink,
+        "sigma2_per_layer": sigma2_per_layer,
+        "entropy_per_layer": entropy_per_layer,
+        "noise_per_layer": noise_per_layer,
+        "eff_rank_per_layer": eff_rank_per_layer,
+        "res_per_layer": res_per_layer,
+        "token_dist_per_layer": token_dist_per_layer,
+        "alpha_per_head": alpha_per_head,
+        "oow_mass_per_layer": oow_mass_per_layer,
     }
 
 
