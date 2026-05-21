@@ -169,7 +169,8 @@ class DSALTAttention(nn.Module):
         return self.rope_cos.to(device), self.rope_sin.to(device)
 
     def _window_aux(self, w_sizes_soft: torch.Tensor) -> torch.Tensor:
-        return (w_sizes_soft - w_sizes_soft.detach()).mean() + self._alpha().mean() * 0.0
+        return w_sizes_soft.mean() + torch.sigmoid(self.alpha_w).sum() * 0.0
+
 
     @torch.no_grad()
     def warmup(self, device: torch.device) -> None:
