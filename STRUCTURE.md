@@ -47,10 +47,10 @@
 
 
 
-FILES USATI:
+COME SONO USATI I FILES IN KERNELS?:
 window_utils.py -> usato in dsalt_attention.py
 sparse_attn.py -> usato in dsalt_attention.py
-landmark_tokens_ker.py -> NON USATO 
+landmark_tokens_ker.py -> NON USATO (boh)
 cross_entropy.py -> dsalt_lm.py
 dsalt_triton_attn.py -> dsalt_attention.py
 RMSENorm.py -> dsalt_transformer.py e dsalt_lm.py
