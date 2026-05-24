@@ -143,11 +143,22 @@ def _dsalt_fwd_kernel(
 
 
 def _pick_block_m(head_dim: int) -> int:
-    return 128 if head_dim <= 64 else 64
+    if head_dim <= 64:
+        return 64
+    if head_dim <= 96:
+        return 32
+    return 16
 
 
 def _pick_block_n(head_dim: int) -> int:
-    return 128 if head_dim <= 64 else 64
+    if head_dim <= 64:
+        return 64
+    elif head_dim <= 96:
+        return 32
+    elif head_dim <= 128:
+        return 16
+    else:
+        return 8
 
 
 def _build_seq_block_map(
@@ -330,10 +341,10 @@ class DSALTAttentionFunction(torch.autograd.Function):
         total_len, n_heads, head_dim = q.shape
         device     = q.device
         scale      = 1.0 / math.sqrt(head_dim)
-        HEAD_DIM_C = triton.next_power_of_2(head_dim)
+        HEAD_DIM_C = min(triton.next_power_of_2(head_dim), 64)
         BLOCK_M    = _pick_block_m(head_dim)
         BLOCK_N    = _pick_block_n(head_dim)
-        num_warps  = 8 if BLOCK_M == 128 else 4
+        num_warps = 4 if head_dim <= 64 else 2
 
         q_c   = q.contiguous().to(torch.float16)
         k_c   = k.contiguous().to(torch.float16)
