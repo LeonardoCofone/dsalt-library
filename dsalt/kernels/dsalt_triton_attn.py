@@ -372,7 +372,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             num_warps=num_warps,
-            num_stages=2,
+            num_stages=1,
         )
 
         ctx.save_for_backward(
