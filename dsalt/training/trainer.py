@@ -538,7 +538,7 @@ class DSALTTrainer:
                 if self.world_size > 1 else "1×GPU"
             )
             self.logger.info(
-                f"training start | mode={mode} | steps={self.total_steps} | "
+                f"mode={mode} | steps={self.total_steps} | "
                 f"grad_accum={self.grad_accum} | device={self.device} | "
                 f"amp={self._amp_dtype} | gc={self.gradient_checkpointing} | "
                 f"params={n_params:,}"
