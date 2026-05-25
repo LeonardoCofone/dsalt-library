@@ -60,11 +60,10 @@ def _dsalt_fwd_kernel(
     window_start = tl.maximum(0, m_start - w_max_block + 1)
     window_end   = m_start + BLOCK_M
     n_start      = window_start - (window_start % BLOCK_N)
+    n_start = tl.maximum(n_start, 0)
 
-    # Compute a static maximum number of iterations for the window loop
-    max_iters = (BLOCK_M + MAX_WIN + BLOCK_N - 1) // BLOCK_N
+    max_iters = (MAX_WIN + BLOCK_N - 1) // BLOCK_N
     for _ in range(max_iters):
-        # Guard: skip iterations outside the actual window
         if not (n_start < window_end and n_start + BLOCK_N > window_start):
             n_start += BLOCK_N
             continue
@@ -87,15 +86,21 @@ def _dsalt_fwd_kernel(
 
         qk    = tl.dot(q, k_blk) * scale
         j_abs = n_start + offs_n
-        in_win = (
-            (j_abs[None, :] >= i_abs[:, None] - w_sizes[:, None] + 1) &
-            (j_abs[None, :] <= i_abs[:, None])
-        )
-        final  = in_win & valid_n[None, :] & valid_m[:, None]
-        qk     = tl.where(final, qk, float("-inf"))
+        w = tl.minimum(w_sizes[:, None], BLOCK_M)
+        left  = i_abs[:, None] - w + 1
+        right = i_abs[:, None]
 
-        m_new  = tl.maximum(m_i, tl.max(qk, axis=1))
-        p      = tl.where(final, tl.exp(qk - m_new[:, None]), 0.0)
+        in_win = (j_abs[None, :] >= left) & (j_abs[None, :] <= right)
+        final  = in_win & valid_n[None, :] & valid_m[:, None]
+        safe_qk = tl.where(final, qk, -1e30)
+
+        row_max = tl.max(safe_qk, axis=1)
+        row_max = tl.where(valid_m, row_max, -1e30)
+
+        m_new = tl.maximum(m_i, row_max)
+
+        p = tl.exp(safe_qk - m_new[:, None])
+        p = p * final
         l_corr = tl.exp(m_i - m_new)
         l_i    = l_i * l_corr + tl.sum(p, axis=1)
         acc    = acc * l_corr[:, None] + tl.dot(p, tl.trans(v_blk))
@@ -128,9 +133,6 @@ def _dsalt_fwd_kernel(
     p_lmk   = tl.where(causal_lmk & valid_m[:, None], tl.exp(qk_lmk - m_new[:, None]), 0.0)
     l_corr  = tl.exp(m_i - m_new)
     l_i     = l_i * l_corr + tl.sum(p_lmk, axis=1)
-    acc     = acc * l_corr[:, None] + tl.dot(
-        p_lmk.to(tl.float16), tl.trans(lk_v).to(tl.float16)
-    ).to(tl.float32)
 
     out_val = tl.where(
         l_i[:, None] > 1e-9,
@@ -371,6 +373,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
 
         cu_int         = cu_seqlens.to(torch.int32).contiguous()
         lmk_pos_tensor = lmk_indices.to(torch.int32).contiguous()
+        MAX_WIN = min(int(w_sizes.max().item()), 512)
 
         _dsalt_fwd_kernel[(total_blk, n_heads)](
             q_c, k_c, v_c, out,
@@ -388,7 +391,8 @@ class DSALTAttentionFunction(torch.autograd.Function):
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             num_warps=num_warps,
-            num_stages=1,
+            num_stages=2,
+            MAX_WIN=MAX_WIN,
         )
 
         ctx.save_for_backward(
