@@ -94,19 +94,22 @@ def _dsalt_fwd_kernel(
         in_win = (j_abs[None, :] >= left) & (j_abs[None, :] <= right)
         final  = in_win & valid_n[None, :] & valid_m[:, None]
 
-        safe_qk = tl.where(final, qk, -1e30)
+        safe = tl.where(final, qk, float("-inf"))
 
-        row_max = tl.max(safe_qk, axis=1)
-        row_max = tl.where(valid_m, row_max, -1e30)
+        row_max = tl.max(safe, axis=1)
+        row_max = tl.where(valid_m, row_max, float("-inf"))
 
         m_new = tl.maximum(m_i, row_max)
 
-        p = tl.exp(safe_qk - m_new[:, None])
-        p = p * final
+        safe = safe - m_new[:, None]
+
+        p = tl.exp(safe)
+        p = tl.where(final, p, 0.0)
 
         l_corr = tl.exp(m_i - m_new)
-        l_i    = l_i * l_corr + tl.sum(p, axis=1)
-        acc    = acc * l_corr[:, None] + tl.dot(p, tl.trans(v_blk))
+
+        l_i = l_i * l_corr + tl.sum(p, axis=1)
+        acc = acc * l_corr[:, None] + tl.dot(p, tl.trans(v_blk))
 
         m_i = m_new
         n_start += BLOCK_N
