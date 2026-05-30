@@ -3,6 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ..kernels.dsalt_triton_bwd import dsalt_triton_backward
+
 
 _SEQ_BLOCK_MAP_CACHE: dict = {}
 
@@ -261,76 +263,76 @@ def _sparse_attn_backward(
     total_len, n_heads, head_dim = q.shape
     device   = q.device
     num_seqs = cu_seqlens.shape[0] - 1
-    k_lmk    = lmk_K.shape[2]
 
     dq = torch.zeros_like(q)
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
 
-    lens    = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
-    starts  = cu_seqlens[:-1].to(device)
-    seq_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
-    seq_off = torch.arange(total_len, device=device) - starts[seq_ids]
+    for s in range(num_seqs):
+        s_start = int(cu_seqlens[s].item())
+        s_end   = int(cu_seqlens[s + 1].item())
+        slen    = s_end - s_start
 
-    i_abs = torch.arange(total_len, device=device)
-    j_abs = torch.arange(total_len, device=device)
+        q_s  = q[s_start:s_end]
+        k_s  = k[s_start:s_end]
+        v_s  = v[s_start:s_end]
+        go_s = grad_out[s_start:s_end]
+        ws_s = w_sizes[s_start:s_end].long()
 
-    same_seq = seq_ids.unsqueeze(1) == seq_ids.unsqueeze(0)
-    w_l      = w_sizes.long()
-    win_mask = (
-        same_seq &
-        (j_abs.unsqueeze(0) >= (i_abs.unsqueeze(1) - w_l.unsqueeze(1) + 1)) &
-        (j_abs.unsqueeze(0) <= i_abs.unsqueeze(1))
-    )
+        i_idx = torch.arange(slen, device=device)
+        j_idx = torch.arange(slen, device=device)
 
-    q_h  = q.transpose(0, 1).contiguous()
-    k_h  = k.transpose(0, 1).contiguous()
-    v_h  = v.transpose(0, 1).contiguous()
-    go_h = grad_out.transpose(0, 1).contiguous()
+        win_mask = (
+            (j_idx[None, :] >= (i_idx[:, None] - ws_s[:, None] + 1)) &
+            (j_idx[None, :] <= i_idx[:, None])
+        )
 
-    qk_win = torch.bmm(q_h, k_h.transpose(1, 2)) * scale
-    qk_win = qk_win.masked_fill(~win_mask.unsqueeze(0).expand(n_heads, -1, -1), float("-inf"))
+        lpos_s = lmk_pos[:, s, :]
 
-    lmk_K_flat = lmk_K.view(n_heads, num_seqs * k_lmk, head_dim)
-    lmk_V_flat = lmk_V.view(n_heads, num_seqs * k_lmk, head_dim)
+        q_s_h  = q_s.transpose(0, 1).contiguous()
+        k_s_h  = k_s.transpose(0, 1).contiguous()
+        v_s_h  = v_s.transpose(0, 1).contiguous()
+        go_s_h = go_s.transpose(0, 1).contiguous()
 
-    lmk_seq_id = torch.arange(num_seqs, device=device).repeat_interleave(k_lmk)
-    lmk_abs    = starts[lmk_seq_id].unsqueeze(0) + lmk_pos.view(n_heads, -1)
+        lk_s = lmk_K[:, s, :, :].contiguous()
+        lv_s = lmk_V[:, s, :, :].contiguous()
 
-    causal_lmk = (
-        (lmk_abs.unsqueeze(1) <= i_abs.unsqueeze(0).unsqueeze(2)) &
-        (seq_ids.unsqueeze(0).unsqueeze(2) == lmk_seq_id.unsqueeze(0).unsqueeze(1))
-    )
+        causal_lmk = lpos_s[:, None, :] <= i_idx[None, :, None]
 
-    qk_lmk = torch.bmm(q_h, lmk_K_flat.transpose(1, 2)) * scale
-    qk_lmk = qk_lmk.masked_fill(~causal_lmk, float("-inf"))
+        qk_win = torch.bmm(q_s_h, k_s_h.transpose(1, 2)) * scale
+        qk_win = qk_win.masked_fill(~win_mask.unsqueeze(0).expand(n_heads, -1, -1), float("-inf"))
 
-    qk_all = torch.cat([qk_win, qk_lmk], dim=2)
-    p_all  = torch.softmax(qk_all, dim=2)
-    p_win  = p_all[:, :, :total_len]
-    p_lmk  = p_all[:, :, total_len:]
+        qk_lmk = torch.bmm(q_s_h, lk_s.transpose(1, 2)) * scale
+        qk_lmk = qk_lmk.masked_fill(~causal_lmk, float("-inf"))
 
-    dv_win = p_win.transpose(1, 2).bmm(go_h)
-    dv    += dv_win.transpose(0, 1)
+        qk_all = torch.cat([qk_win, qk_lmk], dim=2)
+        p_all  = torch.softmax(qk_all, dim=2)
+        p_win  = p_all[:, :, :slen]
+        p_lmk  = p_all[:, :, slen:]
 
-    dv_lmk_flat = p_lmk.transpose(1, 2).bmm(go_h)
-    abs_lmk_cl  = lmk_abs.clamp(min=0, max=total_len - 1)
+        dv[s_start:s_end] += p_win.transpose(1, 2).bmm(go_s_h).transpose(0, 1)
 
-    for h in range(n_heads):
-        abs_h = abs_lmk_cl[h]
-        dv_h  = dv_lmk_flat[h]
-        dv[:, h, :].scatter_add_(0, abs_h.unsqueeze(-1).expand(-1, head_dim), dv_h)
+        dv_lmk = p_lmk.transpose(1, 2).bmm(go_s_h)
+        abs_lmk = (s_start + lpos_s.long()).clamp(min=0, max=total_len - 1)
+        for h in range(n_heads):
+            dv[:, h, :].scatter_add_(
+                0,
+                abs_lmk[h].unsqueeze(-1).expand(-1, head_dim),
+                dv_lmk[h],
+            )
 
-    dp_win = torch.bmm(go_h, v_h.transpose(1, 2))
-    dp_lmk = torch.bmm(go_h, lmk_V_flat.transpose(1, 2))
-    dp_all = torch.cat([dp_win, dp_lmk], dim=2)
+        dp_win = torch.bmm(go_s_h, v_s_h.transpose(1, 2))
+        dp_lmk = torch.bmm(go_s_h, lv_s.transpose(1, 2))
+        dp_all = torch.cat([dp_win, dp_lmk], dim=2)
 
-    ds_all  = p_all * (dp_all - (dp_all * p_all).sum(dim=2, keepdim=True))
-    ds_win  = ds_all[:, :, :total_len] * scale
-    ds_lmk  = ds_all[:, :, total_len:] * scale
+        ds_all = p_all * (dp_all - (dp_all * p_all).sum(dim=2, keepdim=True))
+        ds_win = ds_all[:, :, :slen] * scale
+        ds_lmk = ds_all[:, :, slen:] * scale
 
-    dq += (torch.bmm(ds_win, k_h) + torch.bmm(ds_lmk, lmk_K_flat)).transpose(0, 1)
-    dk += torch.bmm(ds_win.transpose(1, 2), q_h).transpose(0, 1)
+        dq[s_start:s_end] += (
+            torch.bmm(ds_win, k_s_h) + torch.bmm(ds_lmk, lk_s)
+        ).transpose(0, 1)
+        dk[s_start:s_end] += torch.bmm(ds_win.transpose(1, 2), q_s_h).transpose(0, 1)
 
     return dq, dk, dv
 
@@ -347,7 +349,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
         HEAD_DIM_C = triton.next_power_of_2(head_dim)
         BLOCK_M    = _pick_block_m(head_dim)
         BLOCK_N    = _pick_block_n(head_dim)
-        num_warps = 4 if head_dim <= 64 else 2
+        num_warps  = 4 if head_dim <= 64 else 2
 
         q_c   = q.contiguous().to(torch.float16)
         k_c   = k.contiguous().to(torch.float16)
@@ -390,23 +392,34 @@ class DSALTAttentionFunction(torch.autograd.Function):
         )
 
         ctx.save_for_backward(
-            q.float(), k.float(), v.float(),
+            q.float(), k.float(), v.float(), out.float(),
             lmk_K.float(), lmk_V.float(),
-            lmk_pos_tensor, w_sizes, cu_seqlens,
+            lmk_pos_tensor, w_sizes, cu_seqlens, seq_block_map
         )
         ctx.scale = scale
+        ctx.total_blk = total_blk
+        ctx.HEAD_DIM_C = HEAD_DIM_C
+        ctx.BLOCK_M = BLOCK_M
+        ctx.BLOCK_N = BLOCK_N
 
         return out.float()
 
     @staticmethod
     def backward(ctx, grad_out):
-        q, k, v, lmk_K, lmk_V, lmk_pos, w_sizes, cu_seqlens = ctx.saved_tensors
-        scale = ctx.scale
+        (q, k, v, out, lmk_K, lmk_V, lmk_pos, 
+         w_sizes, cu_seqlens, seq_block_map) = ctx.saved_tensors
 
-        dq, dk, dv = _sparse_attn_backward(
-            grad_out.float(), q, k, v,
+        dq, dk, dv = dsalt_triton_backward(
+            grad_out.float(),
+            q, k, v, out,
             lmk_K, lmk_V, lmk_pos,
-            w_sizes, cu_seqlens, scale,
+            w_sizes, cu_seqlens,
+            ctx.scale,
+            seq_block_map,
+            ctx.total_blk,
+            ctx.BLOCK_M,
+            ctx.BLOCK_N,
+            ctx.HEAD_DIM_C
         )
 
         return dq, dk, dv, None, None, None, None, None, None, None

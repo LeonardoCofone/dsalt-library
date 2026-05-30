@@ -16,6 +16,8 @@ from .sparse_attn import (
     sparse_attention_forward_packed,
 )
 
+from .dsalt_triton_bwd import dsalt_triton_backward
+
 from .cross_entropy import LigerFusedLinearCrossEntropyFunction
 
 try:
@@ -25,6 +27,7 @@ except Exception:
     _TRITON_OK = False
 
 __all__ = [
+    "dsalt_triton_backward",
     "LigerFusedLinearCrossEntropyFunction",
     "dsalt_triton_attention",
     "RMSENorm",
