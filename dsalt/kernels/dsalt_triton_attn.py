@@ -315,13 +315,10 @@ def _sparse_attn_backward(
 
     dv_lmk_flat = p_lmk.transpose(1, 2).bmm(go_h)
     abs_lmk_cl  = lmk_abs.clamp(min=0, max=total_len - 1)
-    idx_t        = abs_lmk_cl.view(n_heads, -1).T.unsqueeze(-1).expand(-1, -1, head_dim)
-    dv_lmk_t     = dv_lmk_flat.transpose(0, 1).reshape(n_heads * k_lmk, head_dim).view(-1, n_heads, head_dim).mean(dim=1, keepdim=False)
 
-    dv_lmk_contrib = dv_lmk_flat.permute(2, 0, 1).reshape(total_len, n_heads, n_heads * k_lmk)
     for h in range(n_heads):
-        abs_h  = abs_lmk_cl[h].clamp(min=0, max=total_len - 1)
-        dv_h   = dv_lmk_flat[h].T
+        abs_h = abs_lmk_cl[h]
+        dv_h  = dv_lmk_flat[h].T
         dv[:, h, :].scatter_add_(0, abs_h.unsqueeze(-1).expand(-1, head_dim), dv_h)
 
     dp_win = torch.bmm(go_h, v_h.transpose(1, 2))
