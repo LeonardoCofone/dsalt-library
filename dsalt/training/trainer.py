@@ -547,6 +547,7 @@ class DSALTTrainer:
 
         while self.global_step < self.total_steps:
             #print(f"--- [trainer] === STEP {self.global_step} START ===")
+            step_loss = 0.0
             t_step = time.perf_counter()
 
             for accum_i in range(self.grad_accum):
@@ -564,7 +565,10 @@ class DSALTTrainer:
                 loss  = self._forward_step(batch) / self.grad_accum
                 accum_loss += loss.item()
                 #print(f"--- [trainer] step={self.global_step} accum {accum_i+1}: loss={loss.item():.4f} | t_fwd={time.perf_counter()-t_fwd:.4f}s")
-
+                
+                step_loss  += loss.item()
+                accum_loss += loss.item()
+                
                 t_bwd = time.perf_counter()
                 if self._scaler is not None:
                     self._scaler.scale(loss).backward()
@@ -577,11 +581,18 @@ class DSALTTrainer:
                     #print(f"--- [trainer] step={self.global_step} GPU mem post-backward: {mem:.3f}GB")
 
             t_opt = time.perf_counter()
+            grad_norm = None
+
             if self._scaler is not None:
                 if self.max_grad_norm > 0:
                     self._scaler.unscale_(self.optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     #print(f"--- [trainer] step={self.global_step} grad_norm (pre-clip)={grad_norm:.6f} max={self.max_grad_norm}")
+                else:
+                    grads = [p.grad.detach().norm()**2 for p in self.model.parameters() if p.grad is not None]
+                    if grads:
+                        grad_norm = torch.stack(grads).sum()**0.5
+                        
                 self._scaler.step(self.optimizer)
                 self._scaler.update()
                 #print(f"--- [trainer] step={self.global_step} scaler.step + update DONE | scale={self._scaler.get_scale():.1f}")
@@ -589,8 +600,15 @@ class DSALTTrainer:
                 if self.max_grad_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     #print(f"--- [trainer] step={self.global_step} grad_norm (pre-clip)={grad_norm:.6f} max={self.max_grad_norm}")
+                
                 self.optimizer.step()
                 #print(f"--- [trainer] step={self.global_step} optimizer.step DONE")
+
+            gn_val = grad_norm.item() if grad_norm is not None else 0.0
+            current_step_loss = accum_loss if self.global_step % self.log_every != 0 else (accum_loss * self.log_every)
+            
+            # Se vuoi la loss specifica di QUESTO singolo step appena chiuso:
+            print(f"[Rank {self.rank}] Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
 
             self.scheduler.step()
             self.optimizer.zero_grad()
