@@ -23,7 +23,6 @@ def _dsalt_fwd_kernel(
     BLOCK_N:  tl.constexpr,
     HEAD_DIM: tl.constexpr,
     K_LMK:   tl.constexpr,
-    MAX_WIN: tl.constexpr,
 ):
     pid_bm = tl.program_id(0)
     pid_h  = tl.program_id(1)
@@ -60,58 +59,42 @@ def _dsalt_fwd_kernel(
     window_start = tl.maximum(0, m_start - w_max_block + 1)
     window_end   = m_start + BLOCK_M
     n_start      = window_start - (window_start % BLOCK_N)
-    n_start = tl.maximum(n_start, 0)
 
-    max_iters = (MAX_WIN + BLOCK_N - 1) // BLOCK_N
-    for _ in range(max_iters):
-        cond = (n_start < window_end) & (n_start + BLOCK_N > window_start)
-
+    for _ in range(0, (window_end - n_start + BLOCK_N - 1) // BLOCK_N):
         n_end_blk    = n_start + BLOCK_N
         blk_in_range = (n_end_blk > window_start) & (n_start < window_end) & (n_start < seq_len)
         valid_n      = ((offs_n + n_start) < seq_len) & blk_in_range
 
         k_blk = tl.load(
             K + (seq_start + n_start + offs_n[None, :]) * stride_kt
-            + pid_h * stride_kh
-            + offs_d[:, None] * stride_kd,
-            mask=valid_n[None, :] & cond, other=0.0,
+              + pid_h * stride_kh
+              + offs_d[:, None] * stride_kd,
+            mask=valid_n[None, :], other=0.0,
         ).to(tl.float32)
-
         v_blk = tl.load(
             V + (seq_start + n_start + offs_n[None, :]) * stride_vt
-            + pid_h * stride_vh
-            + offs_d[:, None] * stride_vd,
-            mask=valid_n[None, :] & cond, other=0.0,
+              + pid_h * stride_vh
+              + offs_d[:, None] * stride_vd,
+            mask=valid_n[None, :], other=0.0,
         ).to(tl.float32)
 
-        qk = tl.dot(q, k_blk) * scale
-
+        qk    = tl.dot(q, k_blk) * scale
         j_abs = n_start + offs_n
-        w = tl.minimum(w_sizes[:, None], BLOCK_M)
-        left  = i_abs[:, None] - w + 1
-        right = i_abs[:, None]
-
-        in_win = (j_abs[None, :] >= left) & (j_abs[None, :] <= right)
+        in_win = (
+            (j_abs[None, :] >= i_abs[:, None] - w_sizes[:, None] + 1) &
+            (j_abs[None, :] <= i_abs[:, None])
+        )
         final  = in_win & valid_n[None, :] & valid_m[:, None]
+        qk     = tl.where(final, qk, float("-inf"))
 
-        safe = tl.where(final, qk, float("-inf"))
-
-        row_max = tl.max(safe, axis=1)
-        row_max = tl.where(valid_m, row_max, float("-inf"))
-
-        m_new = tl.maximum(m_i, row_max)
-
-        safe = safe - m_new[:, None]
-
-        p = tl.exp(safe)
-        p = tl.where(final, p, 0.0)
-
+        m_new  = tl.maximum(m_i, tl.max(qk, axis=1))
+        p      = tl.where(final, tl.exp(qk - m_new[:, None]), 0.0)
         l_corr = tl.exp(m_i - m_new)
-
-        l_i = l_i * l_corr + tl.sum(p, axis=1)
-        acc = acc * l_corr[:, None] + tl.dot(p, tl.trans(v_blk))
-
-        m_i = m_new
+        l_i    = l_i * l_corr + tl.sum(p, axis=1)
+        acc    = acc * l_corr[:, None] + tl.dot(
+            p.to(tl.float16), tl.trans(v_blk).to(tl.float16)
+        ).to(tl.float32)
+        m_i     = m_new
         n_start += BLOCK_N
 
     offs_lk = tl.arange(0, K_LMK)
@@ -140,6 +123,9 @@ def _dsalt_fwd_kernel(
     p_lmk   = tl.where(causal_lmk & valid_m[:, None], tl.exp(qk_lmk - m_new[:, None]), 0.0)
     l_corr  = tl.exp(m_i - m_new)
     l_i     = l_i * l_corr + tl.sum(p_lmk, axis=1)
+    acc     = acc * l_corr[:, None] + tl.dot(
+        p_lmk.to(tl.float16), tl.trans(lk_v).to(tl.float16)
+    ).to(tl.float32)
 
     out_val = tl.where(
         l_i[:, None] > 1e-9,
@@ -159,7 +145,7 @@ def _dsalt_fwd_kernel(
 def _pick_block_m(head_dim: int) -> int:
     if head_dim <= 64:
         return 64
-    if head_dim <= 96:
+    if head_dim <= 128:
         return 32
     return 16
 
@@ -167,9 +153,9 @@ def _pick_block_m(head_dim: int) -> int:
 def _pick_block_n(head_dim: int) -> int:
     if head_dim <= 64:
         return 64
-    elif head_dim <= 96:
-        return 32
     elif head_dim <= 128:
+        return 32
+    elif head_dim <= 256:
         return 16
     else:
         return 8
@@ -275,73 +261,79 @@ def _sparse_attn_backward(
     total_len, n_heads, head_dim = q.shape
     device   = q.device
     num_seqs = cu_seqlens.shape[0] - 1
+    k_lmk    = lmk_K.shape[2]
 
     dq = torch.zeros_like(q)
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
 
-    for s in range(num_seqs):
-        s_start = int(cu_seqlens[s].item())
-        s_end   = int(cu_seqlens[s + 1].item())
-        slen    = s_end - s_start
+    lens    = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+    starts  = cu_seqlens[:-1].to(device)
+    seq_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+    seq_off = torch.arange(total_len, device=device) - starts[seq_ids]
 
-        q_s  = q[s_start:s_end]
-        k_s  = k[s_start:s_end]
-        v_s  = v[s_start:s_end]
-        go_s = grad_out[s_start:s_end]
-        ws_s = w_sizes[s_start:s_end].long()
+    i_abs = torch.arange(total_len, device=device)
+    j_abs = torch.arange(total_len, device=device)
 
-        i_idx = torch.arange(slen, device=device)
-        j_idx = torch.arange(slen, device=device)
+    same_seq = seq_ids.unsqueeze(1) == seq_ids.unsqueeze(0)
+    w_l      = w_sizes.long()
+    win_mask = (
+        same_seq &
+        (j_abs.unsqueeze(0) >= (i_abs.unsqueeze(1) - w_l.unsqueeze(1) + 1)) &
+        (j_abs.unsqueeze(0) <= i_abs.unsqueeze(1))
+    )
 
-        win_mask = (
-            (j_idx[None, :] >= (i_idx[:, None] - ws_s[:, None] + 1)) &
-            (j_idx[None, :] <= i_idx[:, None])
-        )
+    q_h  = q.transpose(0, 1).contiguous()
+    k_h  = k.transpose(0, 1).contiguous()
+    v_h  = v.transpose(0, 1).contiguous()
+    go_h = grad_out.transpose(0, 1).contiguous()
 
-        lpos_s = lmk_pos[:, s, :]
+    qk_win = torch.bmm(q_h, k_h.transpose(1, 2)) * scale
+    qk_win = qk_win.masked_fill(~win_mask.unsqueeze(0).expand(n_heads, -1, -1), float("-inf"))
 
-        q_s_h  = q_s.transpose(0, 1).contiguous()
-        k_s_h  = k_s.transpose(0, 1).contiguous()
-        v_s_h  = v_s.transpose(0, 1).contiguous()
-        go_s_h = go_s.transpose(0, 1).contiguous()
+    lmk_K_flat = lmk_K.view(n_heads, num_seqs * k_lmk, head_dim)
+    lmk_V_flat = lmk_V.view(n_heads, num_seqs * k_lmk, head_dim)
 
-        lk_all = lmk_K[:, s, :, :].contiguous()
-        lv_all = lmk_V[:, s, :, :].contiguous()
+    lmk_seq_id = torch.arange(num_seqs, device=device).repeat_interleave(k_lmk)
+    lmk_abs    = starts[lmk_seq_id].unsqueeze(0) + lmk_pos.view(n_heads, -1)
 
-        causal_lmk_all = lpos_s[:, None, :] <= i_idx[None, :, None]
+    causal_lmk = (
+        (lmk_abs.unsqueeze(1) <= i_abs.unsqueeze(0).unsqueeze(2)) &
+        (seq_ids.unsqueeze(0).unsqueeze(2) == lmk_seq_id.unsqueeze(0).unsqueeze(1))
+    )
 
-        qk_win_all = torch.bmm(q_s_h, k_s_h.transpose(1, 2)) * scale
-        qk_win_all = qk_win_all.masked_fill(~win_mask.unsqueeze(0).expand(n_heads, -1, -1), float("-inf"))
+    qk_lmk = torch.bmm(q_h, lmk_K_flat.transpose(1, 2)) * scale
+    qk_lmk = qk_lmk.masked_fill(~causal_lmk, float("-inf"))
 
-        qk_lmk_all = torch.bmm(q_s_h, lk_all.transpose(1, 2)) * scale
-        qk_lmk_all = qk_lmk_all.masked_fill(~causal_lmk_all, float("-inf"))
+    qk_all = torch.cat([qk_win, qk_lmk], dim=2)
+    p_all  = torch.softmax(qk_all, dim=2)
+    p_win  = p_all[:, :, :total_len]
+    p_lmk  = p_all[:, :, total_len:]
 
-        qk_all  = torch.cat([qk_win_all, qk_lmk_all], dim=2)
-        p_all   = torch.softmax(qk_all, dim=2)
-        p_win   = p_all[:, :, :slen]
-        p_lmk_w = p_all[:, :, slen:]
+    dv_win = p_win.transpose(1, 2).bmm(go_h)
+    dv    += dv_win.transpose(0, 1)
 
-        dv[s_start:s_end] += p_win.transpose(1, 2).bmm(go_s_h).transpose(0, 1)
+    dv_lmk_flat = p_lmk.transpose(1, 2).bmm(go_h)
+    abs_lmk_cl  = lmk_abs.clamp(min=0, max=total_len - 1)
+    idx_t        = abs_lmk_cl.view(n_heads, -1).T.unsqueeze(-1).expand(-1, -1, head_dim)
+    dv_lmk_t     = dv_lmk_flat.transpose(0, 1).reshape(n_heads * k_lmk, head_dim).view(-1, n_heads, head_dim).mean(dim=1, keepdim=False)
 
-        dv_lmk     = p_lmk_w.transpose(1, 2).bmm(go_s_h)
-        abs_lmk_pos = (s_start + lpos_s.long()).clamp(min=0, max=total_len - 1)
-        idx_t       = abs_lmk_pos.transpose(0, 1).unsqueeze(-1).expand(-1, -1, head_dim)
-        dv_lmk_t    = dv_lmk.transpose(0, 1)
-        dv.scatter_add_(0, idx_t, dv_lmk_t)
+    dv_lmk_contrib = dv_lmk_flat.permute(2, 0, 1).reshape(total_len, n_heads, n_heads * k_lmk)
+    for h in range(n_heads):
+        abs_h  = abs_lmk_cl[h].clamp(min=0, max=total_len - 1)
+        dv_h   = dv_lmk_flat[h].T
+        dv[:, h, :].scatter_add_(0, abs_h.unsqueeze(-1).expand(-1, head_dim), dv_h)
 
-        dp_win = torch.bmm(go_s_h, v_s_h.transpose(1, 2))
-        dp_lmk = torch.bmm(go_s_h, lv_all.transpose(1, 2))
-        dp_all = torch.cat([dp_win, dp_lmk], dim=2)
+    dp_win = torch.bmm(go_h, v_h.transpose(1, 2))
+    dp_lmk = torch.bmm(go_h, lmk_V_flat.transpose(1, 2))
+    dp_all = torch.cat([dp_win, dp_lmk], dim=2)
 
-        ds_all = p_all * (dp_all - (dp_all * p_all).sum(dim=2, keepdim=True))
-        ds_win = ds_all[:, :, :slen] * scale
-        ds_lmk = ds_all[:, :, slen:] * scale
+    ds_all  = p_all * (dp_all - (dp_all * p_all).sum(dim=2, keepdim=True))
+    ds_win  = ds_all[:, :, :total_len] * scale
+    ds_lmk  = ds_all[:, :, total_len:] * scale
 
-        dq[s_start:s_end] += (
-            torch.bmm(ds_win, k_s_h) + torch.bmm(ds_lmk, lk_all)
-        ).transpose(0, 1)
-        dk[s_start:s_end] += torch.bmm(ds_win.transpose(1, 2), q_s_h).transpose(0, 1)
+    dq += (torch.bmm(ds_win, k_h) + torch.bmm(ds_lmk, lmk_K_flat)).transpose(0, 1)
+    dk += torch.bmm(ds_win.transpose(1, 2), q_h).transpose(0, 1)
 
     return dq, dk, dv
 
@@ -380,7 +372,6 @@ class DSALTAttentionFunction(torch.autograd.Function):
 
         cu_int         = cu_seqlens.to(torch.int32).contiguous()
         lmk_pos_tensor = lmk_indices.to(torch.int32).contiguous()
-        MAX_WIN = min(int(w_sizes.max().item()), 512)
 
         _dsalt_fwd_kernel[(total_blk, n_heads)](
             q_c, k_c, v_c, out,
@@ -398,8 +389,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             num_warps=num_warps,
-            num_stages=2,
-            MAX_WIN=MAX_WIN,
+            num_stages=1,
         )
 
         ctx.save_for_backward(

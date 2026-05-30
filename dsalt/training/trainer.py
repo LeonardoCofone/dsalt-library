@@ -130,7 +130,9 @@ def compute_metrics(
     noise_per_layer = []
     seq0_len = (cu_seqlens[1] - cu_seqlens[0]).item()
 
-    if seq0_len > 128:
+    run_noise = seq0_len > 128 and math.isfinite(res_norm) and res_norm < 200.0
+
+    if run_noise:
         inject_pos = int(seq0_len // 4)
         ids_pert = ids.clone()
         ids_pert[inject_pos] = torch.randint(0, m.vocab_size, (1,), device=device).item()
@@ -483,16 +485,12 @@ class DSALTTrainer:
         lr_now    = self.scheduler.get_last_lr()[0]
         train_ppl = math.exp(min(accum_loss, 20.0))
 
-        self._timer.start()
-        self._timer.start()
-
         metrics = compute_metrics(
             _unwrap_model(self.model),
             self._last_ids,
             self._last_cu_seqlens,
             self._last_max_seqlen,
         )
-        #print(f"--- [trainer] _log_step | compute_metrics DONE | t={time.perf_counter()-t0:.4f}s")
 
         def _fs(v) -> str:
             return f"{v:.6f}" if math.isfinite(v) else "nan"
