@@ -169,15 +169,20 @@ def _dsalt_bwd_kernel(
     dlk = tl.dot(tl.trans(ds_lmk).to(tl.float16), q.to(tl.float16)).to(tl.float32)
     dlv = tl.dot(tl.trans(p_lmk_norm).to(tl.float16), do.to(tl.float16)).to(tl.float32)
 
+    lmk_abs = seq_start + lmk_pos
+
     for lk_idx in range(0, K_LMK):
-        lpos = tl.load(Lmk_pos + pid_h * stride_lph + seq_id * stride_lpb + lk_idx * stride_lpk).to(tl.int32)
-        abs_tok = seq_start + lpos
+        lmk_mask = offs_lk == lk_idx
+        abs_tok  = tl.sum(tl.where(lmk_mask, lmk_abs, 0))
 
         dk_ptr = DK + abs_tok * stride_dkt + pid_h * stride_dkh + offs_d * stride_dkd
         dv_ptr = DV + abs_tok * stride_dvt + pid_h * stride_dvh + offs_d * stride_dvd
 
-        tl.atomic_add(dk_ptr, dlk[lk_idx, :])
-        tl.atomic_add(dv_ptr, dlv[lk_idx, :])
+        dlk_row = tl.sum(tl.where(lmk_mask[:, None], dlk, 0.0), axis=0)
+        dlv_row = tl.sum(tl.where(lmk_mask[:, None], dlv, 0.0), axis=0)
+
+        tl.atomic_add(dk_ptr, dlk_row)
+        tl.atomic_add(dv_ptr, dlv_row)
 
     n_start = n_start_win
     for _ in range(0, n_iter):
@@ -210,21 +215,22 @@ def _dsalt_bwd_kernel(
         dq  += tl.dot(ds.to(tl.float16), tl.trans(k_blk).to(tl.float16)).to(tl.float32)
 
         for n_idx in range(0, BLOCK_N):
-            n_tok   = n_start + n_idx
-            valid_j = (n_tok < seq_len) & (n_tok < window_end)
-            if valid_j:
-                abs_tok = seq_start + n_tok
-                ds_col  = ds[:, n_idx]
-                p_col   = p_norm[:, n_idx]
+            n_tok      = n_start + n_idx
+            valid_j    = (n_tok < seq_len) & (n_tok < window_end)
+            abs_tok    = seq_start + n_tok
+            col_mask   = offs_n == n_idx
 
-                dk_ptr = DK + abs_tok * stride_dkt + pid_h * stride_dkh + offs_d * stride_dkd
-                dv_ptr = DV + abs_tok * stride_dvt + pid_h * stride_dvh + offs_d * stride_dvd
+            ds_col     = tl.sum(tl.where(col_mask[None, :], ds,     0.0), axis=1)
+            p_col      = tl.sum(tl.where(col_mask[None, :], p_norm, 0.0), axis=1)
 
-                dk_contrib = tl.sum(ds_col[:, None] * q, axis=0)
-                dv_contrib = tl.sum(p_col[:, None] * do, axis=0)
+            dk_contrib = tl.sum(ds_col[:, None] * q,  axis=0)
+            dv_contrib = tl.sum(p_col[:, None]  * do, axis=0)
 
-                tl.atomic_add(dk_ptr, dk_contrib)
-                tl.atomic_add(dv_ptr, dv_contrib)
+            dk_ptr = DK + abs_tok * stride_dkt + pid_h * stride_dkh + offs_d * stride_dkd
+            dv_ptr = DV + abs_tok * stride_dvt + pid_h * stride_dvh + offs_d * stride_dvd
+
+            tl.atomic_add(dk_ptr, tl.where(valid_j, dk_contrib, 0.0))
+            tl.atomic_add(dv_ptr, tl.where(valid_j, dv_contrib, 0.0))
 
         n_start += BLOCK_N
 
