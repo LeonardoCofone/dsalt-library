@@ -3,18 +3,21 @@ import torch
 import triton
 import triton.language as tl
 
+from .dsalt_triton_bwd import dsalt_triton_backward
+
 
 _SEQ_BLOCK_MAP_CACHE: dict = {}
 
 
 @triton.jit
 def _dsalt_fwd_kernel(
-    Q, K, V, Out,
+    Q, K, V, Out, LSE,
     W_sizes, Lmk_K, Lmk_V, Lmk_pos, Cu_seqlens, Seq_block_map,
     stride_qt, stride_qh, stride_qd,
     stride_kt, stride_kh, stride_kd,
     stride_vt, stride_vh, stride_vd,
     stride_ot, stride_oh, stride_od,
+    stride_lset, stride_lseh,
     stride_lkh, stride_lkb, stride_lks, stride_lkd,
     stride_lvh, stride_lvb, stride_lvs, stride_lvd,
     stride_lph, stride_lpb, stride_lpk,
@@ -114,7 +117,8 @@ def _dsalt_fwd_kernel(
     ).to(tl.float32)
 
     lmk_pos    = tl.load(Lmk_pos + pid_h * stride_lph + seq_id * stride_lpb + offs_lk * stride_lpk)
-    causal_lmk = lmk_pos[None, :] <= (m_start + offs_m[:, None])
+    win_lo     = i_abs[:, None] - w_sizes[:, None] + 1
+    causal_lmk = (lmk_pos[None, :] <= i_abs[:, None]) & (lmk_pos[None, :] < win_lo)
 
     qk_lmk = tl.dot(q, lk_k) * scale
     qk_lmk = tl.where(causal_lmk & valid_m[:, None], qk_lmk, float("-inf"))
@@ -126,6 +130,7 @@ def _dsalt_fwd_kernel(
     acc     = acc * l_corr[:, None] + tl.dot(
         p_lmk.to(tl.float16), tl.trans(lk_v).to(tl.float16)
     ).to(tl.float32)
+    m_i = m_new
 
     out_val = tl.where(
         l_i[:, None] > 1e-9,
@@ -139,6 +144,13 @@ def _dsalt_fwd_kernel(
         + offs_d[None, :] * stride_od,
         out_val.to(Out.dtype.element_ty),
         mask=valid_m[:, None],
+    )
+
+    lse_val = tl.where(l_i > 1e-9, m_i + tl.log(l_i), float("-inf"))
+    tl.store(
+        LSE + (seq_start + m_start + offs_m) * stride_lset + pid_h * stride_lseh,
+        lse_val,
+        mask=valid_m,
     )
 
 
@@ -246,95 +258,6 @@ def _build_landmark_kv(
     return lmk_K.contiguous(), lmk_V.contiguous()
 
 
-def _sparse_attn_backward(
-    grad_out:    torch.Tensor,
-    q:           torch.Tensor,
-    k:           torch.Tensor,
-    v:           torch.Tensor,
-    lmk_K:      torch.Tensor,
-    lmk_V:      torch.Tensor,
-    lmk_pos:    torch.Tensor,
-    w_sizes:    torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    scale:      float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    total_len, n_heads, head_dim = q.shape
-    device   = q.device
-    num_seqs = cu_seqlens.shape[0] - 1
-
-    dq = torch.zeros_like(q)
-    dk = torch.zeros_like(k)
-    dv = torch.zeros_like(v)
-
-    for s in range(num_seqs):
-        s_start = int(cu_seqlens[s].item())
-        s_end   = int(cu_seqlens[s + 1].item())
-        slen    = s_end - s_start
-
-        q_s  = q[s_start:s_end]
-        k_s  = k[s_start:s_end]
-        v_s  = v[s_start:s_end]
-        go_s = grad_out[s_start:s_end]
-        ws_s = w_sizes[s_start:s_end].long()
-
-        i_idx = torch.arange(slen, device=device)
-        j_idx = torch.arange(slen, device=device)
-
-        win_mask = (
-            (j_idx[None, :] >= (i_idx[:, None] - ws_s[:, None] + 1)) &
-            (j_idx[None, :] <= i_idx[:, None])
-        )
-
-        lpos_s = lmk_pos[:, s, :]
-
-        q_s_h  = q_s.transpose(0, 1).contiguous()
-        k_s_h  = k_s.transpose(0, 1).contiguous()
-        v_s_h  = v_s.transpose(0, 1).contiguous()
-        go_s_h = go_s.transpose(0, 1).contiguous()
-
-        lk_s = lmk_K[:, s, :, :].contiguous()
-        lv_s = lmk_V[:, s, :, :].contiguous()
-
-        causal_lmk = lpos_s[:, None, :] <= i_idx[None, :, None]
-
-        qk_win = torch.bmm(q_s_h, k_s_h.transpose(1, 2)) * scale
-        qk_win = qk_win.masked_fill(~win_mask.unsqueeze(0).expand(n_heads, -1, -1), float("-inf"))
-
-        qk_lmk = torch.bmm(q_s_h, lk_s.transpose(1, 2)) * scale
-        qk_lmk = qk_lmk.masked_fill(~causal_lmk, float("-inf"))
-
-        qk_all = torch.cat([qk_win, qk_lmk], dim=2)
-        p_all  = torch.softmax(qk_all, dim=2)
-        p_win  = p_all[:, :, :slen]
-        p_lmk  = p_all[:, :, slen:]
-
-        dv[s_start:s_end] += p_win.transpose(1, 2).bmm(go_s_h).transpose(0, 1)
-
-        dv_lmk = p_lmk.transpose(1, 2).bmm(go_s_h)
-        abs_lmk = (s_start + lpos_s.long()).clamp(min=0, max=total_len - 1)
-        for h in range(n_heads):
-            dv[:, h, :].scatter_add_(
-                0,
-                abs_lmk[h].unsqueeze(-1).expand(-1, head_dim),
-                dv_lmk[h],
-            )
-
-        dp_win = torch.bmm(go_s_h, v_s_h.transpose(1, 2))
-        dp_lmk = torch.bmm(go_s_h, lv_s.transpose(1, 2))
-        dp_all = torch.cat([dp_win, dp_lmk], dim=2)
-
-        ds_all = p_all * (dp_all - (dp_all * p_all).sum(dim=2, keepdim=True))
-        ds_win = ds_all[:, :, :slen] * scale
-        ds_lmk = ds_all[:, :, slen:] * scale
-
-        dq[s_start:s_end] += (
-            torch.bmm(ds_win, k_s_h) + torch.bmm(ds_lmk, lk_s)
-        ).transpose(0, 1)
-        dk[s_start:s_end] += torch.bmm(ds_win.transpose(1, 2), q_s_h).transpose(0, 1)
-
-    return dq, dk, dv
-
-
 class DSALTAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -347,12 +270,13 @@ class DSALTAttentionFunction(torch.autograd.Function):
         HEAD_DIM_C = triton.next_power_of_2(head_dim)
         BLOCK_M    = _pick_block_m(head_dim)
         BLOCK_N    = _pick_block_n(head_dim)
-        num_warps = 4 if head_dim <= 64 else 2
+        num_warps  = 4 if head_dim <= 64 else 2
 
         q_c   = q.contiguous().to(torch.float16)
         k_c   = k.contiguous().to(torch.float16)
         v_c   = v.contiguous().to(torch.float16)
         out   = torch.zeros_like(q_c)
+        lse   = torch.empty((total_len, n_heads), device=device, dtype=torch.float32)
         w_int = w_sizes.clamp(min=1).long().contiguous()
 
         cu_seqlens_cpu = cu_seqlens.cpu()
@@ -371,12 +295,13 @@ class DSALTAttentionFunction(torch.autograd.Function):
         lmk_pos_tensor = lmk_indices.to(torch.int32).contiguous()
 
         _dsalt_fwd_kernel[(total_blk, n_heads)](
-            q_c, k_c, v_c, out,
+            q_c, k_c, v_c, out, lse,
             w_int, lmk_K, lmk_V, lmk_pos_tensor, cu_int, seq_block_map,
             q_c.stride(0), q_c.stride(1), q_c.stride(2),
             k_c.stride(0), k_c.stride(1), k_c.stride(2),
             v_c.stride(0), v_c.stride(1), v_c.stride(2),
             out.stride(0), out.stride(1), out.stride(2),
+            lse.stride(0), lse.stride(1),
             lmk_K.stride(0), lmk_K.stride(1), lmk_K.stride(2), lmk_K.stride(3),
             lmk_V.stride(0), lmk_V.stride(1), lmk_V.stride(2), lmk_V.stride(3),
             lmk_pos_tensor.stride(0), lmk_pos_tensor.stride(1), lmk_pos_tensor.stride(2),
@@ -389,27 +314,37 @@ class DSALTAttentionFunction(torch.autograd.Function):
             num_stages=1,
         )
 
-        ctx.save_for_backward(
-            q.float(), k.float(), v.float(),
-            lmk_K.float(), lmk_V.float(),
-            lmk_pos_tensor, w_sizes, cu_seqlens,
-        )
-        ctx.scale = scale
+        ctx.save_for_backward(q, k, v, out, lse)
+        ctx.lmk_K         = lmk_K
+        ctx.lmk_V         = lmk_V
+        ctx.lmk_pos       = lmk_pos_tensor
+        ctx.w_sizes       = w_sizes
+        ctx.cu_seqlens    = cu_seqlens
+        ctx.seq_block_map = seq_block_map
+        ctx.total_blk     = total_blk
+        ctx.scale         = scale
+        ctx.BLOCK_M       = BLOCK_M
+        ctx.BLOCK_N       = BLOCK_N
+        ctx.HEAD_DIM_C    = HEAD_DIM_C
 
         return out.float()
 
     @staticmethod
     def backward(ctx, grad_out):
-        q, k, v, lmk_K, lmk_V, lmk_pos, w_sizes, cu_seqlens = ctx.saved_tensors
-        scale = ctx.scale
+        q, k, v, out, lse = ctx.saved_tensors
 
-        dq, dk, dv = _sparse_attn_backward(
-            grad_out.float(), q, k, v,
-            lmk_K, lmk_V, lmk_pos,
-            w_sizes, cu_seqlens, scale,
+        dq, dk, dv = dsalt_triton_backward(
+            grad_out, q, k, v, out, lse,
+            ctx.lmk_K, ctx.lmk_V, ctx.lmk_pos,
+            ctx.w_sizes, ctx.cu_seqlens, ctx.scale,
+            ctx.seq_block_map, ctx.total_blk,
+            ctx.BLOCK_M, ctx.BLOCK_N, ctx.HEAD_DIM_C,
         )
 
-        return dq, dk, dv, None, None, None, None, None, None, None
+        return (
+            dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype),
+            None, None, None, None, None, None, None,
+        )
 
 
 def dsalt_triton_attention(

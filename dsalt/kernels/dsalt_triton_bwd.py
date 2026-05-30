@@ -120,7 +120,8 @@ def _dsalt_bwd_kernel(
         Lmk_pos + pid_h * stride_lph + seq_id * stride_lpb + offs_lk * stride_lpk,
     ).to(tl.int32)
 
-    causal_lmk = lmk_pos[None, :] <= (m_start + offs_m[:, None])
+    win_lo     = i_abs[:, None] - w_sizes[:, None] + 1
+    causal_lmk = (lmk_pos[None, :] <= i_abs[:, None]) & (lmk_pos[None, :] < win_lo)
     valid_lmk  = causal_lmk & valid_m[:, None]
 
     qk_lmk = tl.dot(q, lk) * scale
@@ -252,7 +253,7 @@ def dsalt_triton_backward(
     out_h = out.contiguous().to(torch.float16)
     do_h  = grad_out.contiguous().to(torch.float16)
 
-    dq = torch.zeros_like(q_h)
+    dq = torch.zeros(total_len, n_heads, head_dim, device=device, dtype=torch.float32)
     dk = torch.zeros(total_len, n_heads, head_dim, device=device, dtype=torch.float32)
     dv = torch.zeros(total_len, n_heads, head_dim, device=device, dtype=torch.float32)
 
