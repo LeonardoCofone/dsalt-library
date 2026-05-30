@@ -284,7 +284,7 @@ def dsalt_triton_backward(
         delta.stride(0), delta.stride(1),
         scale=scale,
         BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_N=16, #DA CAMBIAREE
         HEAD_DIM=HEAD_DIM_C,
         K_LMK=lmk_K.shape[2],
         num_warps=num_warps,
