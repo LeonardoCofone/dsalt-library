@@ -25,7 +25,7 @@ def _dsalt_fwd_kernel(
     BLOCK_M:  tl.constexpr,
     BLOCK_N:  tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    K_LMK:   tl.constexpr,
+    K_LMK:    tl.constexpr,
 ):
     pid_bm = tl.program_id(0)
     pid_h  = tl.program_id(1)
@@ -94,42 +94,36 @@ def _dsalt_fwd_kernel(
         p      = tl.where(final, tl.exp(qk - m_new[:, None]), 0.0)
         l_corr = tl.exp(m_i - m_new)
         l_i    = l_i * l_corr + tl.sum(p, axis=1)
-        acc    = acc * l_corr[:, None] + tl.dot(
-            p.to(tl.float16), tl.trans(v_blk).to(tl.float16)
-        ).to(tl.float32)
+        acc    = acc * l_corr[:, None] + tl.dot(p, tl.trans(v_blk))
         m_i     = m_new
         n_start += BLOCK_N
 
     offs_lk = tl.arange(0, K_LMK)
     lk_k = tl.load(
-        Lmk_K
-        + pid_h * stride_lkh
-        + seq_id * stride_lkb
-        + offs_lk[None, :] * stride_lks
-        + offs_d[:, None] * stride_lkd
+        Lmk_K + pid_h * stride_lkh + seq_id * stride_lkb
+              + offs_lk[None, :] * stride_lks + offs_d[:, None] * stride_lkd
     ).to(tl.float32)
     lk_v = tl.load(
-        Lmk_V
-        + pid_h * stride_lvh
-        + seq_id * stride_lvb
-        + offs_lk[None, :] * stride_lvs
-        + offs_d[:, None] * stride_lvd
+        Lmk_V + pid_h * stride_lvh + seq_id * stride_lvb
+              + offs_lk[None, :] * stride_lvs + offs_d[:, None] * stride_lvd
     ).to(tl.float32)
+    lmk_pos = tl.load(
+        Lmk_pos + pid_h * stride_lph + seq_id * stride_lpb + offs_lk * stride_lpk
+    ).to(tl.int32)
 
-    lmk_pos    = tl.load(Lmk_pos + pid_h * stride_lph + seq_id * stride_lpb + offs_lk * stride_lpk)
+    lmk_valid  = (lmk_pos >= 0) & (lmk_pos < seq_len)
     win_lo     = i_abs[:, None] - w_sizes[:, None] + 1
     causal_lmk = (lmk_pos[None, :] <= i_abs[:, None]) & (lmk_pos[None, :] < win_lo)
+    valid_lmk  = causal_lmk & valid_m[:, None] & lmk_valid[None, :]
 
     qk_lmk = tl.dot(q, lk_k) * scale
-    qk_lmk = tl.where(causal_lmk & valid_m[:, None], qk_lmk, float("-inf"))
+    qk_lmk = tl.where(valid_lmk, qk_lmk, float("-inf"))
 
     m_new   = tl.maximum(m_i, tl.max(qk_lmk, axis=1))
-    p_lmk   = tl.where(causal_lmk & valid_m[:, None], tl.exp(qk_lmk - m_new[:, None]), 0.0)
+    p_lmk   = tl.where(valid_lmk, tl.exp(qk_lmk - m_new[:, None]), 0.0)
     l_corr  = tl.exp(m_i - m_new)
     l_i     = l_i * l_corr + tl.sum(p_lmk, axis=1)
-    acc     = acc * l_corr[:, None] + tl.dot(
-        p_lmk.to(tl.float16), tl.trans(lk_v).to(tl.float16)
-    ).to(tl.float32)
+    acc     = acc * l_corr[:, None] + tl.dot(p_lmk, tl.trans(lk_v))
     m_i = m_new
 
     out_val = tl.where(
@@ -236,9 +230,14 @@ def _compute_landmark_indices(
     score_pad = torch.full((n_heads, num_seqs, max_len), float("-inf"), device=device)
     score_pad[:, seq_ids, seq_off] = scores_fil.T
 
-    k_eff        = min(k_lmk, max_len)
-    _, top_local = torch.topk(score_pad, k_eff, dim=2, sorted=False)
-    return top_local
+    k_eff           = min(k_lmk, max_len)
+    top_val, top_lc = torch.topk(score_pad, k_eff, dim=2, sorted=False)
+
+    out = torch.full((n_heads, num_seqs, k_lmk), -1, dtype=torch.long, device=device)
+    valid = torch.isfinite(top_val)
+    top_lc = torch.where(valid, top_lc, torch.full_like(top_lc, -1))
+    out[:, :, :k_eff] = top_lc
+    return out
 
 
 def _build_landmark_kv(
@@ -250,11 +249,15 @@ def _build_landmark_kv(
     n_heads:     int,
     head_dim:    int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    starts  = cu_seqlens[:-1].to(K.device)
-    abs_idx = starts[None, :, None] + lmk_indices
-    h_idx   = torch.arange(n_heads, device=K.device)[:, None, None].expand_as(abs_idx)
-    lmk_K   = K[abs_idx, h_idx, :]
-    lmk_V   = V[abs_idx, h_idx, :]
+    starts   = cu_seqlens[:-1].to(K.device)
+    safe_idx = lmk_indices.clamp(min=0)
+    abs_idx  = starts[None, :, None] + safe_idx
+    h_idx    = torch.arange(n_heads, device=K.device)[:, None, None].expand_as(abs_idx)
+    lmk_K    = K[abs_idx, h_idx, :]
+    lmk_V    = V[abs_idx, h_idx, :]
+    invalid  = (lmk_indices < 0).unsqueeze(-1)
+    lmk_K    = lmk_K.masked_fill(invalid, 0.0)
+    lmk_V    = lmk_V.masked_fill(invalid, 0.0)
     return lmk_K.contiguous(), lmk_V.contiguous()
 
 
@@ -282,7 +285,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
         cu_seqlens_cpu = cu_seqlens.cpu()
 
         with torch.no_grad():
-            lmk_indices   = _compute_landmark_indices(
+            lmk_indices = _compute_landmark_indices(
                 x.float(), W_V.float(), alpha.detach().float(),
                 w_sizes.float(), cu_seqlens, k_lmk, n_min, total_len,
             )
