@@ -42,7 +42,7 @@ def _dsalt_bwd_preprocess(
 def _dsalt_bwd_kernel(
     Q, K, V, Out, DO,
     DQ, DK, DV,
-    W_sizes, Lmk_K, Lmk_V, Lmk_pos,
+    LSE, W_sizes, Lmk_K, Lmk_V, Lmk_pos,
     Delta, Cu_seqlens, Seq_block_map,
     stride_qt, stride_qh, stride_qd,
     stride_kt, stride_kh, stride_kd,
@@ -52,6 +52,7 @@ def _dsalt_bwd_kernel(
     stride_dqt, stride_dqh, stride_dqd,
     stride_dkt, stride_dkh, stride_dkd,
     stride_dvt, stride_dvh, stride_dvd,
+    stride_lset, stride_lseh,
     stride_lkh, stride_lkb, stride_lks, stride_lkd,
     stride_lvh, stride_lvb, stride_lvs, stride_lvd,
     stride_lph, stride_lpb, stride_lpk,
@@ -125,41 +126,17 @@ def _dsalt_bwd_kernel(
     qk_lmk = tl.dot(q, lk) * scale
     qk_lmk = tl.where(valid_lmk, qk_lmk, float("-inf"))
 
-    window_start = tl.maximum(0, m_start - w_max_block + 1)
-    window_end   = m_start + BLOCK_M
-    n_start_win  = window_start - (window_start % BLOCK_N)
+    lse_vals = tl.load(
+        LSE + (seq_start + m_start + offs_m) * stride_lset + pid_h * stride_lseh,
+        mask=valid_m, other=0.0,
+    ).to(tl.float32)
 
-    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    m_lmk = lse_vals
+    l_i   = tl.where(lse_vals > float("-inf"), tl.exp(lse_vals - lse_vals), 1.0)
+    l_i   = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
 
-    n_iter = (window_end - n_start_win + BLOCK_N - 1) // BLOCK_N
-    n_tmp  = n_start_win
-    for _ in range(0, n_iter):
-        valid_n = ((offs_n + n_tmp) < seq_len) & (n_tmp < window_end)
-        j_abs   = n_tmp + offs_n
-        in_win  = (
-            (j_abs[None, :] >= i_abs[:, None] - w_sizes[:, None] + 1) &
-            (j_abs[None, :] <= i_abs[:, None])
-        )
-        final = in_win & valid_n[None, :] & valid_m[:, None]
-        k_blk = tl.load(
-            K + (seq_start + n_tmp + offs_n[None, :]) * stride_kt
-              + pid_h * stride_kh + offs_d[:, None] * stride_kd,
-            mask=valid_n[None, :], other=0.0,
-        ).to(tl.float32)
-        qk    = tl.where(final, tl.dot(q, k_blk) * scale, float("-inf"))
-        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        p     = tl.where(final, tl.exp(qk - m_new[:, None]), 0.0)
-        l_i   = l_i * tl.exp(m_i - m_new) + tl.sum(p, axis=1)
-        m_i   = m_new
-        n_tmp += BLOCK_N
-
-    m_lmk = tl.maximum(m_i, tl.max(qk_lmk, axis=1))
-    p_lmk = tl.where(valid_lmk, tl.exp(qk_lmk - m_lmk[:, None]), 0.0)
-    l_i   = l_i * tl.exp(m_i - m_lmk) + tl.sum(p_lmk, axis=1)
-    l_i   = tl.where(l_i > 1e-9, l_i, 1.0)
-
-    p_lmk_norm = p_lmk / l_i[:, None]
+    p_lmk      = tl.where(valid_lmk, tl.exp(qk_lmk - m_lmk[:, None]), 0.0)
+    p_lmk_norm = p_lmk
     dp_lmk     = tl.dot(do, lv)
     ds_lmk     = p_lmk_norm * (dp_lmk - delta[:, None])
     ds_lmk     = tl.where(valid_lmk, ds_lmk * scale, 0.0)
@@ -184,6 +161,11 @@ def _dsalt_bwd_kernel(
         tl.atomic_add(dk_ptr, dlk_row)
         tl.atomic_add(dv_ptr, dlv_row)
 
+    window_start = tl.maximum(0, m_start - w_max_block + 1)
+    window_end   = m_start + BLOCK_M
+    n_start_win  = window_start - (window_start % BLOCK_N)
+    n_iter       = (window_end - n_start_win + BLOCK_N - 1) // BLOCK_N
+
     n_start = n_start_win
     for _ in range(0, n_iter):
         valid_n = ((offs_n + n_start) < seq_len) & (n_start < window_end)
@@ -207,7 +189,7 @@ def _dsalt_bwd_kernel(
 
         qk     = tl.where(final, tl.dot(q, k_blk) * scale, float("-inf"))
         p      = tl.where(final, tl.exp(qk - m_lmk[:, None]), 0.0)
-        p_norm = p / l_i[:, None]
+        p_norm = p
 
         dp   = tl.dot(do, v_blk)
         ds   = tl.where(final, p_norm * (dp - delta[:, None]) * scale, 0.0)
@@ -248,6 +230,7 @@ def dsalt_triton_backward(
     k:           torch.Tensor,
     v:           torch.Tensor,
     out:         torch.Tensor,
+    lse:         torch.Tensor,
     lmk_K:      torch.Tensor,
     lmk_V:      torch.Tensor,
     lmk_pos:    torch.Tensor,
@@ -290,10 +273,12 @@ def dsalt_triton_backward(
     num_warps = 4 if head_dim <= 64 else 2
     cu_int    = cu_seqlens.to(torch.int32).contiguous()
 
+    lse_c = lse.contiguous().to(torch.float32)
+
     _dsalt_bwd_kernel[(total_blk, n_heads)](
         q_h, k_h, v_h, out_h, do_h,
         dq, dk, dv,
-        w_sizes.clamp(min=1).long().contiguous(),
+        lse_c, w_sizes.clamp(min=1).to(torch.int32).contiguous(),
         lmk_K.to(torch.float16).contiguous(),
         lmk_V.to(torch.float16).contiguous(),
         lmk_pos.to(torch.int32).contiguous(),
@@ -306,6 +291,7 @@ def dsalt_triton_backward(
         dq.stride(0),   dq.stride(1),   dq.stride(2),
         dk.stride(0),   dk.stride(1),   dk.stride(2),
         dv.stride(0),   dv.stride(1),   dv.stride(2),
+        lse_c.stride(0), lse_c.stride(1),
         lmk_K.stride(0), lmk_K.stride(1), lmk_K.stride(2), lmk_K.stride(3),
         lmk_V.stride(0), lmk_V.stride(1), lmk_V.stride(2), lmk_V.stride(3),
         lmk_pos.stride(0), lmk_pos.stride(1), lmk_pos.stride(2),
@@ -316,7 +302,7 @@ def dsalt_triton_backward(
         HEAD_DIM=HEAD_DIM_C,
         K_LMK=lmk_K.shape[2],
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=2,
     )
 
     return dq.float(), dk.float(), dv.float()
