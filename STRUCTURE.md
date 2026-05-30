@@ -10,7 +10,7 @@
         │    ├── sparse_attn.py       # Funzioni atomiche per il calcolo dell'attenzione sparsa (logica core)
         │    ├── window_utils.py      # Utility per gestire la sliding window (masking, padding, indici relativi)  
         │    ├── dsalt_triton_attn.py      #triton  
-        │    ├── dsalt_triton_bwd.py      #triton backend  
+        │    ├── dsalt_triton_bwd.py      #triton backend (non usato)  
         │    ├── cross_entropy.py      #cross entropy fused da: # https://github.com/linkedin/Liger-Kernel
         │
         ├── 📁model
@@ -54,5 +54,5 @@ sparse_attn.py -> usato in dsalt_attention.py
 landmark_tokens_ker.py -> NON USATO (boh)
 cross_entropy.py -> dsalt_lm.py
 dsalt_triton_attn.py -> dsalt_attention.py
-dsalt_triton_bwd.py -> dsalt_triton_attn.py
+dsalt_triton_bwd.py -> NON USATO AL MOMENTO
 RMSENorm.py -> dsalt_transformer.py e dsalt_lm.py

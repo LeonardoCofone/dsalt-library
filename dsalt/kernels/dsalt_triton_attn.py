@@ -3,21 +3,18 @@ import torch
 import triton
 import triton.language as tl
 
-from ..kernels.dsalt_triton_bwd import dsalt_triton_backward
-
 
 _SEQ_BLOCK_MAP_CACHE: dict = {}
 
 
 @triton.jit
 def _dsalt_fwd_kernel(
-    Q, K, V, Out, LSE,
+    Q, K, V, Out,
     W_sizes, Lmk_K, Lmk_V, Lmk_pos, Cu_seqlens, Seq_block_map,
     stride_qt, stride_qh, stride_qd,
     stride_kt, stride_kh, stride_kd,
     stride_vt, stride_vh, stride_vd,
     stride_ot, stride_oh, stride_od,
-    stride_lset, stride_lseh,
     stride_lkh, stride_lkb, stride_lks, stride_lkd,
     stride_lvh, stride_lvb, stride_lvs, stride_lvd,
     stride_lph, stride_lpb, stride_lpk,
@@ -135,7 +132,6 @@ def _dsalt_fwd_kernel(
         acc / l_i[:, None],
         tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32),
     )
-    lse_val = tl.where(l_i > 1e-9, m_new + tl.log(l_i), float("-inf"))
     tl.store(
         Out
         + (seq_start + m_start + offs_m[:, None]) * stride_ot
@@ -143,11 +139,6 @@ def _dsalt_fwd_kernel(
         + offs_d[None, :] * stride_od,
         out_val.to(Out.dtype.element_ty),
         mask=valid_m[:, None],
-    )
-    tl.store(
-        LSE + (seq_start + m_start + offs_m) * stride_lset + pid_h * stride_lseh,
-        lse_val,
-        mask=valid_m,
     )
 
 
@@ -356,14 +347,13 @@ class DSALTAttentionFunction(torch.autograd.Function):
         HEAD_DIM_C = triton.next_power_of_2(head_dim)
         BLOCK_M    = _pick_block_m(head_dim)
         BLOCK_N    = _pick_block_n(head_dim)
-        num_warps  = 4 if head_dim <= 64 else 2
+        num_warps = 4 if head_dim <= 64 else 2
 
         q_c   = q.contiguous().to(torch.float16)
         k_c   = k.contiguous().to(torch.float16)
         v_c   = v.contiguous().to(torch.float16)
         out   = torch.zeros_like(q_c)
-        lse   = torch.full((total_len, n_heads), float("-inf"), device=device, dtype=torch.float32)
-        w_int = w_sizes.clamp(min=1).to(torch.int32).contiguous()
+        w_int = w_sizes.clamp(min=1).long().contiguous()
 
         cu_seqlens_cpu = cu_seqlens.cpu()
 
@@ -381,13 +371,12 @@ class DSALTAttentionFunction(torch.autograd.Function):
         lmk_pos_tensor = lmk_indices.to(torch.int32).contiguous()
 
         _dsalt_fwd_kernel[(total_blk, n_heads)](
-            q_c, k_c, v_c, out, lse,
+            q_c, k_c, v_c, out,
             w_int, lmk_K, lmk_V, lmk_pos_tensor, cu_int, seq_block_map,
             q_c.stride(0), q_c.stride(1), q_c.stride(2),
             k_c.stride(0), k_c.stride(1), k_c.stride(2),
             v_c.stride(0), v_c.stride(1), v_c.stride(2),
             out.stride(0), out.stride(1), out.stride(2),
-            lse.stride(0), lse.stride(1),
             lmk_K.stride(0), lmk_K.stride(1), lmk_K.stride(2), lmk_K.stride(3),
             lmk_V.stride(0), lmk_V.stride(1), lmk_V.stride(2), lmk_V.stride(3),
             lmk_pos_tensor.stride(0), lmk_pos_tensor.stride(1), lmk_pos_tensor.stride(2),
@@ -397,38 +386,27 @@ class DSALTAttentionFunction(torch.autograd.Function):
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             num_warps=num_warps,
-            num_stages=2,
+            num_stages=1,
         )
 
         ctx.save_for_backward(
-            q.float(), k.float(), v.float(), out.float(),
+            q.float(), k.float(), v.float(),
             lmk_K.float(), lmk_V.float(),
-            lmk_pos_tensor, w_sizes, cu_seqlens, seq_block_map, lse
+            lmk_pos_tensor, w_sizes, cu_seqlens,
         )
         ctx.scale = scale
-        ctx.total_blk = total_blk
-        ctx.HEAD_DIM_C = HEAD_DIM_C
-        ctx.BLOCK_M = BLOCK_M
-        ctx.BLOCK_N = BLOCK_N
 
         return out.float()
 
     @staticmethod
     def backward(ctx, grad_out):
-        (q, k, v, out, lmk_K, lmk_V, lmk_pos, 
-         w_sizes, cu_seqlens, seq_block_map, lse) = ctx.saved_tensors
+        q, k, v, lmk_K, lmk_V, lmk_pos, w_sizes, cu_seqlens = ctx.saved_tensors
+        scale = ctx.scale
 
-        dq, dk, dv = dsalt_triton_backward(
-            grad_out.float(),
-            q, k, v, out, lse,
+        dq, dk, dv = _sparse_attn_backward(
+            grad_out.float(), q, k, v,
             lmk_K, lmk_V, lmk_pos,
-            w_sizes, cu_seqlens,
-            ctx.scale,
-            seq_block_map,
-            ctx.total_blk,
-            ctx.BLOCK_M,
-            ctx.BLOCK_N,
-            ctx.HEAD_DIM_C
+            w_sizes, cu_seqlens, scale,
         )
 
         return dq, dk, dv, None, None, None, None, None, None, None
