@@ -318,7 +318,7 @@ def _sparse_attn_backward(
 
     for h in range(n_heads):
         abs_h = abs_lmk_cl[h]
-        dv_h  = dv_lmk_flat[h].T
+        dv_h  = dv_lmk_flat[h]
         dv[:, h, :].scatter_add_(0, abs_h.unsqueeze(-1).expand(-1, head_dim), dv_h)
 
     dp_win = torch.bmm(go_h, v_h.transpose(1, 2))
