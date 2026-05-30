@@ -75,7 +75,7 @@ class DSALTLMHeadModel(nn.Module):
         padding_idx:        int | None = None,
         lm_head_chunk_size: int        = 512,
         loss_fn:            str        = "liger",
-        aux_loss_weight:    float      = 1e-4,
+        aux_loss_weight:    float      = 0.0,
     ):
         super().__init__()
         assert loss_fn in _LOSS_FN, f"loss_fn must be one of {list(_LOSS_FN)}"

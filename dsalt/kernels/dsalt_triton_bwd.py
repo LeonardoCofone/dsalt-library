@@ -42,7 +42,7 @@ def _dsalt_bwd_preprocess(
 def _dsalt_bwd_kernel(
     Q, K, V, DO,
     DQ, DK, DV,
-    LSE, W_sizes, Lmk_K, Lmk_V, Lmk_pos,
+    LSE, W_sizes, Lmk_K, Lmk_V, Lmk_pos, Lmk_bias, D_bias,
     Delta, Cu_seqlens, Seq_block_map,
     stride_qt, stride_qh, stride_qd,
     stride_kt, stride_kh, stride_kd,
@@ -55,6 +55,8 @@ def _dsalt_bwd_kernel(
     stride_lkh, stride_lkb, stride_lks, stride_lkd,
     stride_lvh, stride_lvb, stride_lvs, stride_lvd,
     stride_lph, stride_lpb, stride_lpk,
+    stride_lbh, stride_lbb, stride_lbk,
+    stride_dbbh, stride_dbbb, stride_dbbk,
     stride_dt,  stride_dh,
     scale:    tl.constexpr,
     BLOCK_M:  tl.constexpr,
@@ -122,31 +124,31 @@ def _dsalt_bwd_kernel(
     causal_lmk = (lmk_pos[None, :] <= i_abs[:, None]) & (lmk_pos[None, :] < win_lo)
     valid_lmk  = causal_lmk & row_ok[:, None] & lmk_valid[None, :]
 
-    qk_lmk = tl.dot(q, lk) * scale
+    lmk_bias = tl.load(
+        Lmk_bias + pid_h * stride_lbh + seq_id * stride_lbb + offs_lk * stride_lbk
+    ).to(tl.float32)
+    qk_lmk = tl.dot(q, lk) * scale + lmk_bias[None, :]
     p_lmk  = tl.where(valid_lmk, tl.exp(qk_lmk - lse[:, None]), 0.0)
 
     dp_lmk = tl.dot(do, lv)
-    ds_lmk = tl.where(valid_lmk, p_lmk * (dp_lmk - delta[:, None]) * scale, 0.0)
+    recip  = tl.where(valid_lmk, p_lmk * (dp_lmk - delta[:, None]), 0.0)
+    ds_lmk = recip * scale
 
     dq += tl.dot(ds_lmk, tl.trans(lk))
 
     dlk = tl.dot(tl.trans(ds_lmk), q)
     dlv = tl.dot(tl.trans(p_lmk), do)
 
+    dbias_s   = tl.sum(recip, axis=0)
+    dbias_ptr = D_bias + pid_h * stride_dbbh + seq_id * stride_dbbb + offs_lk * stride_dbbk
+    tl.atomic_add(dbias_ptr, dbias_s)
+
     lmk_abs = seq_start + lmk_pos
-    for lk_idx in range(0, K_LMK):
-        lmk_mask = offs_lk == lk_idx
-        this_ok  = tl.sum(tl.where(lmk_mask, lmk_valid.to(tl.int32), 0)) > 0
-        abs_tok  = tl.sum(tl.where(lmk_mask, lmk_abs, 0))
-
-        dlk_row = tl.sum(tl.where(lmk_mask[:, None], dlk, 0.0), axis=0)
-        dlv_row = tl.sum(tl.where(lmk_mask[:, None], dlv, 0.0), axis=0)
-
-        dk_ptr = DK + abs_tok * stride_dkt + pid_h * stride_dkh + offs_d * stride_dkd
-        dv_ptr = DV + abs_tok * stride_dvt + pid_h * stride_dvh + offs_d * stride_dvd
-        if this_ok:
-            tl.atomic_add(dk_ptr, dlk_row)
-            tl.atomic_add(dv_ptr, dlv_row)
+    lmk_abs_safe = seq_start + tl.maximum(lmk_pos, 0)
+    dlk_ptrs = DK + lmk_abs_safe[:, None] * stride_dkt + pid_h * stride_dkh + offs_d[None, :] * stride_dkd
+    dlv_ptrs = DV + lmk_abs_safe[:, None] * stride_dvt + pid_h * stride_dvh + offs_d[None, :] * stride_dvd
+    tl.atomic_add(dlk_ptrs, dlk, mask=lmk_valid[:, None])
+    tl.atomic_add(dlv_ptrs, dlv, mask=lmk_valid[:, None])
 
     window_start = tl.maximum(0, m_start - w_max_block + 1)
     window_end   = m_start + BLOCK_M
@@ -185,20 +187,13 @@ def _dsalt_bwd_kernel(
         dk_blk = tl.dot(tl.trans(ds), q)
         dv_blk = tl.dot(tl.trans(p), do)
 
-        for n_idx in range(0, BLOCK_N):
-            n_tok    = n_start + n_idx
-            valid_j  = (n_tok < seq_len) & (n_tok < window_end)
-            abs_tok  = seq_start + n_tok
-            row_mask = offs_n == n_idx
-
-            dk_row = tl.sum(tl.where(row_mask[:, None], dk_blk, 0.0), axis=0)
-            dv_row = tl.sum(tl.where(row_mask[:, None], dv_blk, 0.0), axis=0)
-
-            dk_ptr = DK + abs_tok * stride_dkt + pid_h * stride_dkh + offs_d * stride_dkd
-            dv_ptr = DV + abs_tok * stride_dvt + pid_h * stride_dvh + offs_d * stride_dvd
-            if valid_j:
-                tl.atomic_add(dk_ptr, dk_row)
-                tl.atomic_add(dv_ptr, dv_row)
+        n_tok   = n_start + offs_n
+        store_n = (n_tok < seq_len) & (n_tok < window_end)
+        abs_n   = seq_start + n_tok
+        dk_ptrs = DK + abs_n[:, None] * stride_dkt + pid_h * stride_dkh + offs_d[None, :] * stride_dkd
+        dv_ptrs = DV + abs_n[:, None] * stride_dvt + pid_h * stride_dvh + offs_d[None, :] * stride_dvd
+        tl.atomic_add(dk_ptrs, dk_blk, mask=store_n[:, None])
+        tl.atomic_add(dv_ptrs, dv_blk, mask=store_n[:, None])
 
         n_start += BLOCK_N
 
@@ -220,6 +215,7 @@ def dsalt_triton_backward(
     lmk_K:         torch.Tensor,
     lmk_V:         torch.Tensor,
     lmk_pos:       torch.Tensor,
+    lmk_bias:      torch.Tensor,
     w_sizes:       torch.Tensor,
     cu_seqlens:    torch.Tensor,
     scale:         float,
@@ -228,15 +224,19 @@ def dsalt_triton_backward(
     BLOCK_M:       int,
     BLOCK_N:       int,
     HEAD_DIM_C:    int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     total_len, n_heads, head_dim = q.shape
-    device = q.device
+    device   = q.device
+    num_seqs = cu_seqlens.shape[0] - 1
+    k_lmk    = lmk_K.shape[2]
+    d_bias   = torch.zeros(n_heads, num_seqs, k_lmk, device=device, dtype=torch.float32)
 
-    q_f   = q.contiguous().to(torch.float32)
-    k_f   = k.contiguous().to(torch.float32)
-    v_f   = v.contiguous().to(torch.float32)
+    in_dtype = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else torch.float16
+    q_f   = q.contiguous().to(in_dtype)
+    k_f   = k.contiguous().to(in_dtype)
+    v_f   = v.contiguous().to(in_dtype)
     out_f = out.contiguous().to(torch.float32)
-    do_f  = grad_out.contiguous().to(torch.float32)
+    do_f  = grad_out.contiguous().to(in_dtype)
 
     dq = torch.zeros(total_len, n_heads, head_dim, device=device, dtype=torch.float32)
     dk = torch.zeros(total_len, n_heads, head_dim, device=device, dtype=torch.float32)
@@ -260,15 +260,17 @@ def dsalt_triton_backward(
     cu_int    = cu_seqlens.to(torch.int32).contiguous()
     lse_c     = lse.contiguous().to(torch.float32)
 
-    lmk_K_f   = lmk_K.to(torch.float32).contiguous()
-    lmk_V_f   = lmk_V.to(torch.float32).contiguous()
+    lmk_K_f   = lmk_K.to(in_dtype).contiguous()
+    lmk_V_f   = lmk_V.to(in_dtype).contiguous()
     lmk_pos_i = lmk_pos.to(torch.int32).contiguous()
+    lmk_bias_f = lmk_bias.to(torch.float32).contiguous()
     w_int     = w_sizes.clamp(min=1).to(torch.int32).contiguous()
 
     _dsalt_bwd_kernel[(total_blk, n_heads)](
         q_f, k_f, v_f, do_f,
         dq, dk, dv,
-        lse_c, w_int, lmk_K_f, lmk_V_f, lmk_pos_i,
+        lse_c, w_int, lmk_K_f, lmk_V_f, lmk_pos_i, lmk_bias_f, d_bias,
+        delta, cu_int, seq_block_map,lse_c, w_int, lmk_K_f, lmk_V_f, lmk_pos_i,
         delta, cu_int, seq_block_map,
         q_f.stride(0),  q_f.stride(1),  q_f.stride(2),
         k_f.stride(0),  k_f.stride(1),  k_f.stride(2),
@@ -281,14 +283,16 @@ def dsalt_triton_backward(
         lmk_K_f.stride(0), lmk_K_f.stride(1), lmk_K_f.stride(2), lmk_K_f.stride(3),
         lmk_V_f.stride(0), lmk_V_f.stride(1), lmk_V_f.stride(2), lmk_V_f.stride(3),
         lmk_pos_i.stride(0), lmk_pos_i.stride(1), lmk_pos_i.stride(2),
+        lmk_bias_f.stride(0), lmk_bias_f.stride(1), lmk_bias_f.stride(2),
+        d_bias.stride(0), d_bias.stride(1), d_bias.stride(2),
         delta.stride(0), delta.stride(1),
         scale=scale,
         BLOCK_M=BLOCK_M,
-        BLOCK_N=16, #DA CAMBIAREE
+        BLOCK_N=BLOCK_N,
         HEAD_DIM=HEAD_DIM_C,
         K_LMK=lmk_K.shape[2],
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=2,
     )
 
     return dq, dk, dv

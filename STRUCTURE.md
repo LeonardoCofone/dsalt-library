@@ -10,7 +10,7 @@
         │    ├── sparse_attn.py       # Funzioni atomiche per il calcolo dell'attenzione sparsa (logica core)
         │    ├── window_utils.py      # Utility per gestire la sliding window (masking, padding, indici relativi)  
         │    ├── dsalt_triton_attn.py      #triton  
-        │    ├── dsalt_triton_bwd.py      #triton backend (non usato)  
+        │    ├── dsalt_triton_bwd.py      #triton backend 
         │    ├── cross_entropy.py      #cross entropy fused da: # https://github.com/linkedin/Liger-Kernel
         │
         ├── 📁model

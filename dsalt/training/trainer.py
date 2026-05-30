@@ -2,6 +2,7 @@ import math
 import os
 import time
 from pathlib import Path
+import contextlib
 
 import torch
 import torch.nn as nn
@@ -285,7 +286,7 @@ class DSALTTrainer:
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=False,
+                find_unused_parameters=True,
                 gradient_as_bucket_view=True,
             )
             #print(f"--- [trainer] DDP wrapping DONE")
@@ -397,9 +398,6 @@ class DSALTTrainer:
                 gradient_checkpointing=self.gradient_checkpointing,
             )
             loss = out["loss"]
-
-        if not math.isfinite(loss.item()):
-            print(f"--- [trainer] CRITICAL: loss not finished! loss={loss.item()} - step={self.global_step}")
 
         return loss
 
@@ -526,124 +524,89 @@ class DSALTTrainer:
     def train(self):
         self.model.train()
         self.optimizer.zero_grad()
-        data_iter  = iter(self.train_loader)
-        accum_loss = 0.0
+        data_iter = iter(self.train_loader)
 
         if self.is_main:
             n_params = sum(p.numel() for p in _unwrap_model(self.model).parameters() if p.requires_grad)
-            mode     = (
-                f"DDP×{self.world_size} (backend={self.ddp_backend})"
-                if self.world_size > 1 else "1×GPU"
-            )
+            mode = f"DDP×{self.world_size} (backend={self.ddp_backend})" if self.world_size > 1 else "1×GPU"
             self.logger.info(
                 f"training start | mode={mode} | steps={self.total_steps} | "
                 f"grad_accum={self.grad_accum} | device={self.device} | "
                 f"amp={self._amp_dtype} | gc={self.gradient_checkpointing} | "
                 f"params={n_params:,}"
             )
-            #print(f"--- [trainer] train() START | mode={mode} steps={self.total_steps} params={n_params:,}")
 
-        self._timer.start()
+        ddp_active = self.world_size > 1 and isinstance(self.model, DDP)
 
         while self.global_step < self.total_steps:
-            #print(f"--- [trainer] === STEP {self.global_step} START ===")
-            step_loss = 0.0
-            t_step = time.perf_counter()
+            accum_loss = torch.zeros((), device=self.device)
 
             for accum_i in range(self.grad_accum):
-                #print(f"--- [trainer] step={self.global_step} accum {accum_i+1}/{self.grad_accum}")
                 try:
                     batch = next(data_iter)
                 except StopIteration:
-                    #print(f"--- [trainer] DataLoader esaurito, ricreo iteratore")
                     if isinstance(self.train_loader.sampler, DistributedSampler):
                         self.train_loader.sampler.set_epoch(self.global_step)
                     data_iter = iter(self.train_loader)
-                    batch     = next(data_iter)
+                    batch = next(data_iter)
 
-                t_fwd = time.perf_counter()
-                loss  = self._forward_step(batch) / self.grad_accum
-                accum_loss += loss.item()
-                #print(f"--- [trainer] step={self.global_step} accum {accum_i+1}: loss={loss.item():.4f} | t_fwd={time.perf_counter()-t_fwd:.4f}s")
-                
-                step_loss  += loss.item()
-                accum_loss += loss.item()
-                
-                t_bwd = time.perf_counter()
-                if self._scaler is not None:
-                    self._scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-                #print(f"--- [trainer] step={self.global_step} backward DONE | t_bwd={time.perf_counter()-t_bwd:.4f}s")
+                is_last  = accum_i == self.grad_accum - 1
+                sync_ctx = self.model.no_sync() if (ddp_active and not is_last) else contextlib.nullcontext()
 
-                if torch.cuda.is_available():
-                    mem = torch.cuda.memory_allocated(self.device) / 1e9
-                    #print(f"--- [trainer] step={self.global_step} GPU mem post-backward: {mem:.3f}GB")
+                with sync_ctx:
+                    loss = self._forward_step(batch) / self.grad_accum
+                    if self._scaler is not None:
+                        self._scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+                accum_loss += loss.detach()
 
-            t_opt = time.perf_counter()
+            accum_loss = accum_loss.item()
+
             grad_norm = None
-
             if self._scaler is not None:
                 if self.max_grad_norm > 0:
                     self._scaler.unscale_(self.optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    #print(f"--- [trainer] step={self.global_step} grad_norm (pre-clip)={grad_norm:.6f} max={self.max_grad_norm}")
                 else:
-                    grads = [p.grad.detach().norm()**2 for p in self.model.parameters() if p.grad is not None]
+                    grads = [p.grad.detach().norm() ** 2 for p in self.model.parameters() if p.grad is not None]
                     if grads:
-                        grad_norm = torch.stack(grads).sum()**0.5
-                        
+                        grad_norm = torch.stack(grads).sum() ** 0.5
                 self._scaler.step(self.optimizer)
                 self._scaler.update()
-                #print(f"--- [trainer] step={self.global_step} scaler.step + update DONE | scale={self._scaler.get_scale():.1f}")
             else:
                 if self.max_grad_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    #print(f"--- [trainer] step={self.global_step} grad_norm (pre-clip)={grad_norm:.6f} max={self.max_grad_norm}")
-                
                 self.optimizer.step()
-                #print(f"--- [trainer] step={self.global_step} optimizer.step DONE")
 
             gn_val = grad_norm.item() if grad_norm is not None else 0.0
-            current_step_loss = accum_loss if self.global_step % self.log_every != 0 else (accum_loss * self.log_every)
-            
-            # Se vuoi la loss specifica di QUESTO singolo step appena chiuso:
             print(f"[Rank {self.rank}] Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
 
             self.scheduler.step()
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1
-            #print(f"--- [trainer] step={self.global_step-1} optimizer+scheduler DONE | t_opt={time.perf_counter()-t_opt:.4f}s | t_step={time.perf_counter()-t_step:.4f}s")
 
             if self.global_step % self.log_every == 0:
-                avg_loss = accum_loss / self.log_every
-                #print(f"--- [trainer] log_step trigger | avg_loss={avg_loss:.4f}")
-                self._log_step(avg_loss)
-                accum_loss = 0.0
+                self._log_step(accum_loss)
 
             if self.global_step % self.val_every == 0:
-                #print(f"--- [trainer] val_step trigger | step={self.global_step}")
                 barrier(self.rank, self.world_size)
                 val_ppl = self._validate()
                 if self.is_main:
                     self.history["val_ppl"].append(val_ppl)
                     self.history["val_steps"].append(self.global_step)
                     is_best = val_ppl < self.best_val_ppl
-                    #print(f"--- [trainer] val_ppl={val_ppl:.4f} | best={self.best_val_ppl:.4f} | is_best={is_best}")
                     self.logger.info(
-                        f"step={self.global_step} | val_ppl={val_ppl:.4f}"
-                        + (" ← best" if is_best else "")
+                        f"step={self.global_step} | val_ppl={val_ppl:.4f}" + (" ← best" if is_best else "")
                     )
                 if val_ppl < self.best_val_ppl:
                     self.best_val_ppl = val_ppl
                     self._save_checkpoint("best")
 
             if self.global_step % self.save_every == 0:
-                #print(f"--- [trainer] save_step trigger | step={self.global_step}")
                 self._save_checkpoint(f"step_{self.global_step}")
 
             if self.global_step >= self.total_steps:
-                #print(f"--- [trainer] raggiunto total_steps={self.total_steps}, uscita loop")
                 break
 
             self._timer.start()
@@ -651,6 +614,4 @@ class DSALTTrainer:
         self._save_checkpoint("final")
         if self.is_main:
             self.logger.info(f"done | best_val_ppl={self.best_val_ppl:.4f}")
-            #print(f"--- [trainer] train() DONE | best_val_ppl={self.best_val_ppl:.4f}")
-
         cleanup_ddp()

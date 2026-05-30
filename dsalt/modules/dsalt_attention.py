@@ -42,6 +42,35 @@ def _hybrid_scores(
 
     return alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)
 
+def _landmark_bias_grad_alpha(
+    x:           torch.Tensor,
+    W_V:         torch.Tensor,
+    alpha:       torch.Tensor,
+    lmk_indices: torch.Tensor,
+    cu_seqlens:  torch.Tensor,
+    dh:          int,
+) -> torch.Tensor:
+    T       = x.shape[0]
+    n_heads = alpha.shape[0]
+    device  = x.device
+
+    x_d  = x.detach()
+    W_d  = W_V.detach()
+    x_norm = x_d.norm(dim=-1)
+    z_x    = ((x_norm - x_norm.mean()) / x_norm.std().clamp(min=1e-6)).unsqueeze(1)
+    xwv    = (x_d @ W_d.T).view(T, n_heads, dh).norm(dim=-1)
+    z_v    = (xwv - xwv.mean(0, keepdim=True)) / xwv.std(0, keepdim=True).clamp(min=1e-6)
+
+    scores_live = alpha * z_v + (1.0 - alpha) * z_x
+
+    starts  = cu_seqlens[:-1].to(device)
+    abs_idx = (starts[None, :, None] + lmk_indices.clamp(min=0)).clamp(max=T - 1)
+    h_idx   = torch.arange(n_heads, device=device)[:, None, None].expand_as(abs_idx)
+    gathered = scores_live[abs_idx, h_idx]
+
+    bias = torch.nn.functional.logsigmoid(gathered)
+    return torch.where(lmk_indices >= 0, bias, torch.zeros_like(bias))
+
 
 @torch.no_grad()
 def _build_mask_batched(
@@ -252,12 +281,16 @@ class DSALTAttention(nn.Module):
         aux          = self._window_aux(w_sizes_soft)
 
         if _TRITON_OK:
+            lmk_indices = _compute_landmark_indices(
+                x.float().detach(), self.v_proj.weight.float().detach(),
+                alpha.detach().float(), w_sizes_soft.float().detach(),
+                cu_seqlens, self.k_lmk, self.n_min, total_len,
+            )
+            lmk_bias = _landmark_bias_grad_alpha(
+                x, self.v_proj.weight, alpha, lmk_indices, cu_seqlens, self.head_dim,
+            )
             out = dsalt_triton_attention(
-                q, k, v, x,
-                self.v_proj.weight.detach(),
-                alpha.detach(),
-                w_sizes_soft.detach(),
-                cu_seqlens, self.k_lmk, self.n_min,
+                q, k, v, lmk_indices, lmk_bias, w_sizes_soft.detach(), cu_seqlens,
             )
         else:
             attn_mask = _build_mask_packed(
