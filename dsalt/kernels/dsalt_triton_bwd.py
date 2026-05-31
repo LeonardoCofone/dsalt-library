@@ -270,7 +270,6 @@ def dsalt_triton_backward(
         q_f, k_f, v_f, do_f,
         dq, dk, dv,
         lse_c, w_int, lmk_K_f, lmk_V_f, lmk_pos_i, lmk_bias_f, d_bias,
-        delta, cu_int, seq_block_map,lse_c, w_int, lmk_K_f, lmk_V_f, lmk_pos_i,
         delta, cu_int, seq_block_map,
         q_f.stride(0),  q_f.stride(1),  q_f.stride(2),
         k_f.stride(0),  k_f.stride(1),  k_f.stride(2),
