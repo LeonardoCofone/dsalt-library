@@ -49,7 +49,7 @@ def _dsalt_fwd_kernel(
         + pid_h * stride_qh
         + offs_d[None, :] * stride_qd
     )
-    q = tl.load(q_ptrs, mask=valid_m[:, None], other=0.0).to(tl.float32)
+    q = tl.load(q_ptrs, mask=valid_m[:, None], other=0.0)
 
     w_sizes     = tl.load(W_sizes + seq_start + m_start + offs_m, mask=valid_m, other=1).to(tl.int32)
     w_sizes     = tl.maximum(w_sizes, 1)
@@ -74,13 +74,13 @@ def _dsalt_fwd_kernel(
               + pid_h * stride_kh
               + offs_d[:, None] * stride_kd,
             mask=valid_n[None, :], other=0.0,
-        ).to(tl.float32)
+        )
         v_blk = tl.load(
             V + (seq_start + n_start + offs_n[None, :]) * stride_vt
               + pid_h * stride_vh
               + offs_d[:, None] * stride_vd,
             mask=valid_n[None, :], other=0.0,
-        ).to(tl.float32)
+        )
 
         qk    = tl.dot(q, k_blk) * scale
         j_abs = n_start + offs_n
@@ -95,7 +95,7 @@ def _dsalt_fwd_kernel(
         p      = tl.where(final, tl.exp(qk - m_new[:, None]), 0.0)
         l_corr = tl.exp(m_i - m_new)
         l_i    = l_i * l_corr + tl.sum(p, axis=1)
-        acc    = acc * l_corr[:, None] + tl.dot(p, tl.trans(v_blk))
+        acc    = acc * l_corr[:, None] + tl.dot(p.to(k_blk.dtype), tl.trans(v_blk))
         m_i     = m_new
         n_start += BLOCK_N
 
@@ -103,11 +103,11 @@ def _dsalt_fwd_kernel(
     lk_k = tl.load(
         Lmk_K + pid_h * stride_lkh + seq_id * stride_lkb
               + offs_lk[None, :] * stride_lks + offs_d[:, None] * stride_lkd
-    ).to(tl.float32)
+    )
     lk_v = tl.load(
         Lmk_V + pid_h * stride_lvh + seq_id * stride_lvb
               + offs_lk[None, :] * stride_lvs + offs_d[:, None] * stride_lvd
-    ).to(tl.float32)
+    )
     lmk_pos = tl.load(
         Lmk_pos + pid_h * stride_lph + seq_id * stride_lpb + offs_lk * stride_lpk
     ).to(tl.int32)
@@ -127,7 +127,7 @@ def _dsalt_fwd_kernel(
     p_lmk   = tl.where(valid_lmk, tl.exp(qk_lmk - m_new[:, None]), 0.0)
     l_corr  = tl.exp(m_i - m_new)
     l_i     = l_i * l_corr + tl.sum(p_lmk, axis=1)
-    acc     = acc * l_corr[:, None] + tl.dot(p_lmk, tl.trans(lk_v))
+    acc     = acc * l_corr[:, None] + tl.dot(p_lmk.to(lk_v.dtype), tl.trans(lk_v))
     m_i = m_new
 
     out_val = tl.where(
@@ -218,11 +218,11 @@ def _compute_landmark_indices(
     n_heads = alpha.shape[0]
     dh      = W_V.shape[0] // n_heads
 
-    x_norm      = x.norm(dim=-1)
+    x_norm      = x.norm(dim=-1).float()
     mu_x, std_x = x_norm.mean(), x_norm.std().clamp(min=1e-6)
     z_x         = (x_norm - mu_x) / std_x
 
-    xwv_h    = (x @ W_V.T).view(total, n_heads, dh).norm(dim=-1)
+    xwv_h    = (x @ W_V.T).view(total, n_heads, dh).norm(dim=-1).float()
     mu_v     = xwv_h.mean(0, keepdim=True)
     std_v    = xwv_h.std(0, keepdim=True).clamp(min=1e-6)
     z_v      = (xwv_h - mu_v) / std_v
@@ -243,7 +243,7 @@ def _compute_landmark_indices(
     valid = torch.isfinite(top_val)
     top_lc = torch.where(valid, top_lc, torch.full_like(top_lc, -1))
     out[:, :, :k_eff] = top_lc
-    return out
+    return out, z_x, z_v
 
 
 def _build_landmark_kv(

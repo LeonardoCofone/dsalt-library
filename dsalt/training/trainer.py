@@ -286,7 +286,7 @@ class DSALTTrainer:
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=True,
+                find_unused_parameters=False,
                 gradient_as_bucket_view=True,
             )
             #print(f"--- [trainer] DDP wrapping DONE")
@@ -580,7 +580,8 @@ class DSALTTrainer:
                 self.optimizer.step()
 
             gn_val = grad_norm.item() if grad_norm is not None else 0.0
-            print(f"[Rank {self.rank}] Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
+            if self.rank == 0:
+                print(f"Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
 
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
