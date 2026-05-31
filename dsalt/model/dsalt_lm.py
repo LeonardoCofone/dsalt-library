@@ -14,16 +14,15 @@ def _chunked_cross_entropy(
     labels:     torch.Tensor,
     chunk_size: int = 512,
 ) -> torch.Tensor:
-    total      = x.shape[0]
-    loss_acc   = torch.zeros((), device=x.device, dtype=torch.float32)
-    valid_acc  = torch.zeros((), device=x.device, dtype=torch.float32)
-    weight_f32 = weight.float().contiguous()
+    total     = x.shape[0]
+    loss_acc  = torch.zeros((), device=x.device, dtype=torch.float32)
+    valid_acc = torch.zeros((), device=x.device, dtype=torch.float32)
 
     for start in range(0, total, chunk_size):
         end = min(start + chunk_size, total)
         y_c = labels[start:end]
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            logits = F.linear(x[start:end].float(), weight_f32)
+        logits = F.linear(x[start:end], weight).float()
+        assert torch.isfinite(logits).all()
         loss = F.cross_entropy(logits, y_c, ignore_index=-100, reduction="sum")
         loss_acc  += loss
         valid_acc += (y_c != -100).sum()
