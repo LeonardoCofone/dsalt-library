@@ -138,9 +138,10 @@ class _StepFormatter(logging.Formatter):
     def _step(self, record: logging.LogRecord, msg: str) -> str:
         p      = _parse(msg)
         ts     = f"{DIM}{self.formatTime(record, self.datefmt)}{RESET}"
-        it_s   = getattr(record, "it_s",   0.0)
-        mem_gb = getattr(record, "mem_gb", 0.0)
-        mem_c  = _mem_color(mem_gb)
+        it_s    = getattr(record, "it_s",    0.0)
+        mem_gb  = getattr(record, "mem_gb",  0.0)
+        peak_gb = getattr(record, "peak_gb", 0.0)
+        mem_c   = _mem_color(peak_gb if peak_gb > 0 else mem_gb)
 
         step = p.get("step", "?")
 
@@ -163,7 +164,11 @@ class _StepFormatter(logging.Formatter):
         lr_s   = f"{MAGENTA}{p.get('lr', '?')}{RESET}"
 
         speed_s = f"{CYAN}{it_s:6.2f} it/s{RESET}" if it_s   > 0 else f"{DIM}  ?.?? it/s{RESET}"
-        mem_s   = f"{mem_c}{mem_gb:5.2f} GB{RESET}" if mem_gb > 0 else f"{DIM}  ?.? GB{RESET}"
+        total_gb = getattr(record, "total_gb", 0.0)
+        mem_s = (
+            f"{mem_c}peak {peak_gb:.2f} GB{RESET}{DIM} / {total_gb:.0f} GB tot{RESET}"
+            if peak_gb > 0 else f"{DIM}  ?.? GB{RESET}"
+        )
         mem_bar = _bar(mem_gb, 16.0, width=6, color=mem_c)
 
         sep = f"{DIM}{'─' * _W_BAR}{RESET}"
@@ -191,7 +196,7 @@ class _StepFormatter(logging.Formatter):
 
 class _DSALTFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        for field in ["it_s", "tok_s", "mem_gb", "rank_eff"]:
+        for field in ["it_s", "tok_s", "mem_gb", "peak_gb", "rank_eff"]:
             if not hasattr(record, field):
                 setattr(record, field, 0.0)
         return True

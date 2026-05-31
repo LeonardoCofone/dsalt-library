@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-import time
 
 from ..kernels.RMSENorm  import RMSENorm
 from .dsalt_attention    import DSALTAttention
@@ -61,45 +60,16 @@ class DSALTTransformerBlock(nn.Module):
                 return attn_out
 
             aux = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-            
             attn_normed = self.attn_norm(x)
-            x_attn = torch.utils.checkpoint.checkpoint(
-                custom_attn,
-                attn_normed,
-                use_reentrant=False,
-            )
+            x_attn = torch.utils.checkpoint.checkpoint(custom_attn, attn_normed, use_reentrant=False)
             x = x + x_attn
-
             ffn_normed = self.ffn_norm(x)
-            x_ffn = torch.utils.checkpoint.checkpoint(
-                self.ffn,
-                ffn_normed,
-                use_reentrant=False,
-            )
+            x_ffn = torch.utils.checkpoint.checkpoint(self.ffn, ffn_normed, use_reentrant=False)
             x = x + x_ffn
         else:
-            t1 = time.perf_counter()
-            # PER DEBUG:
-            from torch.profiler import record_function
-            with record_function("attn_norm"):
-                xn = self.attn_norm(x)
-            with record_function("attn_block"):
-                x_attn, aux = self.attn(xn, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rope_cs=rope_cs)
-            x = x + x_attn
-            with record_function("ffn_norm"):
-                xn2 = self.ffn_norm(x)
-            with record_function("ffn_block"):
-                x_ffn = self.ffn(xn2)
-
-            """
-            PRIMA ERA:
             x_attn, aux = self.attn(self.attn_norm(x), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rope_cs=rope_cs)
             x = x + x_attn
-
-            t2 = time.perf_counter()
             x_ffn = self.ffn(self.ffn_norm(x))
-            x = x + x_ffn
-            """
             x = x + x_ffn
 
         return x, aux

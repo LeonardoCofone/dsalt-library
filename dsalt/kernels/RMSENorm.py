@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class RMSENorm(nn.Module):
@@ -7,14 +8,7 @@ class RMSENorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(d_model))
+        self.normalized_shape = (d_model,)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        x = x * rms
-
-        out = x * self.weight
-
-        if self.training:
-            return out
-
-        return out
+        return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)
