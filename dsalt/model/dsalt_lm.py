@@ -14,28 +14,21 @@ def _chunked_cross_entropy(
     labels:     torch.Tensor,
     chunk_size: int = 512,
 ) -> torch.Tensor:
-    total         = x.shape[0]
-    n_valid_total = (labels != -100).sum().item()
-
-    if n_valid_total == 0:
-        return torch.zeros((), device=x.device, dtype=torch.float32)
-
-    loss_acc  = torch.zeros((), device=x.device, dtype=torch.float32)
-    valid_acc = torch.zeros((), device=x.device, dtype=torch.long)
+    total      = x.shape[0]
+    loss_acc   = torch.zeros((), device=x.device, dtype=torch.float32)
+    valid_acc  = torch.zeros((), device=x.device, dtype=torch.float32)
+    weight_f32 = weight.float().contiguous()
 
     for start in range(0, total, chunk_size):
-        end  = min(start + chunk_size, total)
-        y_c  = labels[start:end]
-        if not (y_c != -100).any():
-            continue
-        x_chunk    = x[start:end].float()
-        logits     = F.linear(x_chunk, weight.float())
-        loss       = F.cross_entropy(logits, y_c, ignore_index=-100, reduction="sum")
-        loss_acc  += loss.float()
+        end = min(start + chunk_size, total)
+        y_c = labels[start:end]
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            logits = F.linear(x[start:end].float(), weight_f32)
+        loss = F.cross_entropy(logits, y_c, ignore_index=-100, reduction="sum")
+        loss_acc  += loss
         valid_acc += (y_c != -100).sum()
-        del logits, loss, x_chunk
 
-    return loss_acc / valid_acc.clamp(min=1).float()
+    return loss_acc / valid_acc.clamp(min=1.0)
 
 
 def _liger_cross_entropy(
@@ -73,8 +66,8 @@ class DSALTLMHeadModel(nn.Module):
         yarn_scale:         float      = 1.0,
         tie_weights:        bool       = True,
         padding_idx:        int | None = None,
-        lm_head_chunk_size: int        = 512,
-        loss_fn:            str        = "liger",
+        lm_head_chunk_size: int        = 2048,
+        loss_fn:            str        = "chunked",
         aux_loss_weight:    float      = 0.0,
     ):
         super().__init__()

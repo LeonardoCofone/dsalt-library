@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsalt"
-version = "0.3.79"
+version = "0.3.80"
 description = "Dynamic Sparse Attention with Landmark Tokens - High-performance Triton implementation"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -105,7 +105,7 @@ known_first_party = ["dsalt"]
 known_third_party = ["torch", "triton", "numpy"]
 
 [tool.mypy]
-python_version = "0.3.79"
+python_version = "0.3.80"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
@@ -128,7 +128,7 @@ module = [
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-minversion = "0.3.79"
+minversion = "0.3.80"
 addopts = "-ra -q --cov=dsalt --cov-report=term-missing --cov-report=html"
 testpaths = ["tests"]
 python_files = "test_*.py"
