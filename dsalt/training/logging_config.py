@@ -166,7 +166,7 @@ class _StepFormatter(logging.Formatter):
         speed_s = f"{CYAN}{it_s:6.2f} it/s{RESET}" if it_s   > 0 else f"{DIM}  ?.?? it/s{RESET}"
         total_gb = getattr(record, "total_gb", 0.0)
         mem_s = (
-            f"{mem_c}peak {peak_gb:.2f} GB{RESET}{DIM} / {total_gb:.0f} GB tot{RESET}"
+            f"{mem_c}cur {mem_gb:.2f}{RESET}{DIM}·{RESET}{mem_c}peak {peak_gb:.2f} GB{RESET}{DIM} / {total_gb:.0f} tot{RESET}"
             if peak_gb > 0 else f"{DIM}  ?.? GB{RESET}"
         )
         mem_bar = _bar(mem_gb, 16.0, width=6, color=mem_c)
