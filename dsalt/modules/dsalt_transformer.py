@@ -79,11 +79,27 @@ class DSALTTransformerBlock(nn.Module):
             x = x + x_ffn
         else:
             t1 = time.perf_counter()
+            # PER DEBUG:
+            from torch.profiler import record_function
+            with record_function("attn_norm"):
+                xn = self.attn_norm(x)
+            with record_function("attn_block"):
+                x_attn, aux = self.attn(xn, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rope_cs=rope_cs)
+            x = x + x_attn
+            with record_function("ffn_norm"):
+                xn2 = self.ffn_norm(x)
+            with record_function("ffn_block"):
+                x_ffn = self.ffn(xn2)
+
+            """
+            PRIMA ERA:
             x_attn, aux = self.attn(self.attn_norm(x), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rope_cs=rope_cs)
             x = x + x_attn
 
             t2 = time.perf_counter()
             x_ffn = self.ffn(self.ffn_norm(x))
+            x = x + x_ffn
+            """
             x = x + x_ffn
 
         return x, aux

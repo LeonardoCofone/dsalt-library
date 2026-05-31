@@ -45,7 +45,7 @@ def _liger_cross_entropy(
 ) -> torch.Tensor:
     loss, *_ = LigerFusedLinearCrossEntropyFunction.apply(
         x.contiguous(),
-        weight.contiguous(),
+        weight,
         labels.contiguous(),
     )
     return loss
