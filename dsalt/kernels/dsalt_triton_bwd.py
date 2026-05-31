@@ -266,6 +266,8 @@ def dsalt_triton_backward(
     lmk_bias_f = lmk_bias.to(torch.float32).contiguous()
     w_int     = w_sizes.clamp(min=1).to(torch.int32).contiguous()
 
+    BLOCK_N = min(BLOCK_N, 32)
+
     _dsalt_bwd_kernel[(total_blk, n_heads)](
         q_f, k_f, v_f, do_f,
         dq, dk, dv,
@@ -291,7 +293,7 @@ def dsalt_triton_backward(
         HEAD_DIM=HEAD_DIM_C,
         K_LMK=lmk_K.shape[2],
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=2,
     )
 
     return dq, dk, dv
