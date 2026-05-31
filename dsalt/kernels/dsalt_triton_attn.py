@@ -212,7 +212,6 @@ def _build_seq_block_map(
     _SEQ_BLOCK_MAP_CACHE[key] = (result, total_blks)
     return result, total_blks
 
-@torch.compile(dynamic=False)
 def _score_block(x: torch.Tensor, W_V: torch.Tensor, alpha: torch.Tensor, n_heads: int, dh: int):
     x_norm = x.norm(dim=-1).float()
     z_x    = (x_norm - x_norm.mean()) / x_norm.std().clamp(min=1e-6)
@@ -247,12 +246,21 @@ def _compute_landmark_indices(
     covered_h  = covered.unsqueeze(1).expand(-1, n_heads)
     scores_fil = scores.masked_fill(covered_h, float("-inf"))
 
+    uniform = bool((lens == lens[0]).all())
+    if uniform:
+        L = int(lens[0])
+        sp = scores_fil.T.view(n_heads, num_seqs, L)
+        k_eff = min(k_lmk, L)
+        top_val, top_lc = torch.topk(sp, k_eff, dim=2, sorted=False)
+        out = torch.full((n_heads, num_seqs, k_lmk), -1, dtype=torch.long, device=device)
+        valid = torch.isfinite(top_val)
+        out[:, :, :k_eff] = torch.where(valid, top_lc, torch.full_like(top_lc, -1))
+        return out, z_x, z_v
+
     score_pad = torch.full((n_heads, num_seqs, max_len), float("-inf"), device=device)
     score_pad[:, seq_ids, seq_off] = scores_fil.T
-
     k_eff           = min(k_lmk, max_len)
     top_val, top_lc = torch.topk(score_pad, k_eff, dim=2, sorted=False)
-
     out = torch.full((n_heads, num_seqs, k_lmk), -1, dtype=torch.long, device=device)
     valid = torch.isfinite(top_val)
     top_lc = torch.where(valid, top_lc, torch.full_like(top_lc, -1))
@@ -272,7 +280,7 @@ def _build_landmark_kv(
     starts   = cu_seqlens[:-1].to(K.device)
     safe_idx = lmk_indices.clamp(min=0)
     abs_idx  = starts[None, :, None] + safe_idx
-    h_idx    = torch.arange(n_heads, device=K.device)[:, None, None].expand_as(abs_idx)
+    h_idx    = torch.arange(n_heads, device=K.device)[:, None, None]
     lmk_K    = K[abs_idx, h_idx, :]
     lmk_V    = V[abs_idx, h_idx, :]
     invalid  = (lmk_indices < 0).unsqueeze(-1)
