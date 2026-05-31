@@ -291,7 +291,7 @@ def dsalt_triton_backward(
         HEAD_DIM=HEAD_DIM_C,
         K_LMK=lmk_K.shape[2],
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=1,
     )
 
     return dq, dk, dv
