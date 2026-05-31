@@ -8,6 +8,23 @@ from .dsalt_triton_bwd import dsalt_triton_backward
 
 _SEQ_BLOCK_MAP_CACHE: dict = {}
 
+_SEQ_META_CACHE: dict = {}
+
+
+def _seq_meta(cu_seqlens: torch.Tensor, total: int, device: torch.device):
+    key = (int(cu_seqlens[-1]), cu_seqlens.shape[0] - 1)
+    if key in _SEQ_META_CACHE:
+        return _SEQ_META_CACHE[key]
+    num_seqs = cu_seqlens.shape[0] - 1
+    lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+    starts   = cu_seqlens[:-1].to(device)
+    seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+    seq_off  = torch.arange(total, device=device) - starts[seq_ids]
+    max_len  = int(lens.max())
+    val = (num_seqs, lens, starts, seq_ids, seq_off, max_len)
+    _SEQ_META_CACHE[key] = val
+    return val
+
 
 @triton.jit
 def _dsalt_fwd_kernel(
@@ -195,6 +212,17 @@ def _build_seq_block_map(
     _SEQ_BLOCK_MAP_CACHE[key] = (result, total_blks)
     return result, total_blks
 
+@torch.compile(dynamic=False)
+def _score_block(x: torch.Tensor, W_V: torch.Tensor, alpha: torch.Tensor, n_heads: int, dh: int):
+    x_norm = x.norm(dim=-1).float()
+    z_x    = (x_norm - x_norm.mean()) / x_norm.std().clamp(min=1e-6)
+    xwv_h  = (x @ W_V.T).view(x.shape[0], n_heads, dh).norm(dim=-1).float()
+    mu_v   = xwv_h.mean(0, keepdim=True)
+    std_v  = xwv_h.std(0, keepdim=True).clamp(min=1e-6)
+    z_v    = (xwv_h - mu_v) / std_v
+    scores = alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)
+    return scores, z_x, z_v
+
 
 def _compute_landmark_indices(
     x:          torch.Tensor,
@@ -208,26 +236,12 @@ def _compute_landmark_indices(
 ) -> torch.Tensor:
     device   = x.device
     total    = x.shape[0]
-    num_seqs = cu_seqlens.shape[0] - 1
-    lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
-    starts   = cu_seqlens[:-1].to(device)
-    seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
-    seq_off  = torch.arange(total, device=device) - starts[seq_ids]
-    max_len  = int(lens.max())
+    num_seqs, lens, starts, seq_ids, seq_off, max_len = _seq_meta(cu_seqlens, total, device)
 
     n_heads = alpha.shape[0]
     dh      = W_V.shape[0] // n_heads
 
-    x_norm      = x.norm(dim=-1).float()
-    mu_x, std_x = x_norm.mean(), x_norm.std().clamp(min=1e-6)
-    z_x         = (x_norm - mu_x) / std_x
-
-    xwv_h    = (x @ W_V.T).view(total, n_heads, dh).norm(dim=-1).float()
-    mu_v     = xwv_h.mean(0, keepdim=True)
-    std_v    = xwv_h.std(0, keepdim=True).clamp(min=1e-6)
-    z_v      = (xwv_h - mu_v) / std_v
-
-    scores = alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)
+    scores, z_x, z_v = _score_block(x, W_V, alpha, n_heads, dh)
 
     covered    = seq_off < w_sizes.long()
     covered_h  = covered.unsqueeze(1).expand(-1, n_heads)
