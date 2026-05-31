@@ -196,7 +196,7 @@ class _StepFormatter(logging.Formatter):
 
 class _DSALTFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        for field in ["it_s", "tok_s", "mem_gb", "peak_gb", "rank_eff"]:
+        for field in ["it_s", "tok_s", "mem_gb", "peak_gb", "rank_eff", "total_gb"]:
             if not hasattr(record, field):
                 setattr(record, field, 0.0)
         return True

@@ -482,10 +482,6 @@ class DSALTTrainer:
             stats   = get_gpu_memory_stats(self.device)
             mem_gb  = stats.get("allocated_gb", 0.0)
             peak_gb = stats.get("peak_gb", 0.0)
-            if self.world_size > 1:
-                t = torch.tensor([peak_gb], device=self.device)
-                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
-                peak_gb = t.item()
             torch.cuda.reset_peak_memory_stats(self.device)
         lr_now    = self.scheduler.get_last_lr()[0]
         train_ppl = math.exp(min(accum_loss, 20.0))
@@ -515,7 +511,7 @@ class DSALTTrainer:
         )
         #print(f"--- [trainer] _log_step | {msg}")
 
-        self.logger.info(msg, extra={"it_s": it_s, "mem_gb": mem_gb, "peak_gb": peak_gb})
+        self.logger.info(msg, extra={"it_s": it_s, "mem_gb": mem_gb, "peak_gb": peak_gb, "total_gb": stats.get("total_gb", 0.0)})
 
         self.history["gpu_peak_gb"] = self.history.get("gpu_peak_gb", [])
         self.history["gpu_peak_gb"].append(peak_gb)
