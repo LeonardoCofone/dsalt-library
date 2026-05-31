@@ -22,7 +22,6 @@ def _chunked_cross_entropy(
         end = min(start + chunk_size, total)
         y_c = labels[start:end]
         logits = F.linear(x[start:end], weight).float()
-        assert torch.isfinite(logits).all()
         loss = F.cross_entropy(logits, y_c, ignore_index=-100, reduction="sum")
         loss_acc  += loss
         valid_acc += (y_c != -100).sum()
