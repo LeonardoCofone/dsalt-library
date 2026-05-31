@@ -144,12 +144,25 @@ class DSALTLMHeadModel(nn.Module):
         x        = self.embed_dropout(self.embed_tokens(input_ids))
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
 
+        rope_cs = None
+        if cu_seqlens is not None:
+            device   = input_ids.device
+            attn0    = self.layers[0].attn
+            num_seqs = cu_seqlens.shape[0] - 1
+            lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+            starts   = cu_seqlens[:-1].to(device)
+            seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+            total_len = input_ids.shape[0]
+            pos_ids  = torch.arange(total_len, device=device) - starts[seq_ids]
+            rope_cs  = (attn0.rope_cos[pos_ids], attn0.rope_sin[pos_ids])
+
         for layer in self.layers:
             x, layer_aux = layer(
                 x,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 gradient_checkpointing=gradient_checkpointing,
+                rope_cs=rope_cs,
             )
             aux_loss = aux_loss + layer_aux
 

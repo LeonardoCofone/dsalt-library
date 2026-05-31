@@ -217,9 +217,10 @@ class DSALTAttention(nn.Module):
         x:          torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None          = None,
+        rope_cs:    tuple | None         = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if cu_seqlens is not None:
-            return self._packed(x, cu_seqlens, x.shape[0], x.device)
+            return self._packed(x, cu_seqlens, x.shape[0], x.device, rope_cs)
         B, T, _ = x.shape
         return self._batched(x, B, T, x.device)
 
@@ -253,19 +254,21 @@ class DSALTAttention(nn.Module):
 
         return self.out_proj(out.transpose(1, 2).contiguous().view(B, T, self.d_model)), aux
 
-    def _packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, total_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, total_len: int, device: torch.device, rope_cs: tuple | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         q = self.q_proj(x).view(total_len, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(total_len, self.n_heads, self.head_dim)
         v = self.v_proj(x).view(total_len, self.n_heads, self.head_dim)
 
-        num_seqs = cu_seqlens.shape[0] - 1
-        lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
-        starts   = cu_seqlens[:-1].to(device)
-        seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
-        pos_ids  = torch.arange(total_len, device=device) - starts[seq_ids]
-
-        cos = self.rope_cos[pos_ids].to(device)
-        sin = self.rope_sin[pos_ids].to(device)
+        if rope_cs is None:
+            num_seqs = cu_seqlens.shape[0] - 1
+            lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+            starts   = cu_seqlens[:-1].to(device)
+            seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+            pos_ids  = torch.arange(total_len, device=device) - starts[seq_ids]
+            cos = self.rope_cos[pos_ids]
+            sin = self.rope_sin[pos_ids]
+        else:
+            cos, sin = rope_cs
         q, k = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
 
         w_sizes_soft = compute_window_sizes(x, self.window_proj, self.n_min, self.n_max)

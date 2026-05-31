@@ -67,6 +67,7 @@ def build_local_window_mask_packed(
     return (same_seq & in_win)
 
 
+@torch.compile(dynamic=False)
 def apply_rotary_emb(
     q:   torch.Tensor,
     k:   torch.Tensor,
