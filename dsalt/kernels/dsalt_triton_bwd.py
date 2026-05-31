@@ -229,7 +229,7 @@ def dsalt_triton_backward(
     device   = q.device
     num_seqs = cu_seqlens.shape[0] - 1
     k_lmk    = lmk_K.shape[2]
-    d_bias   = torch.zeros(n_heads, num_seqs, k_lmk, device=device, dtype=torch.float32)
+    d_bias = torch.zeros(n_heads, num_seqs, k_lmk, device=device, dtype=torch.float32)
 
     in_dtype = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else torch.float16
     q_f   = q.contiguous().to(in_dtype)
@@ -296,4 +296,4 @@ def dsalt_triton_backward(
         num_stages=2,
     )
 
-    return dq, dk, dv
+    return dq, dk, dv, d_bias
