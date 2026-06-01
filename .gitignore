@@ -4,7 +4,6 @@ __pycache__/
 *$py.class
 MIO.md
 PROBLEMI.md
-.env
 
 # C extensions
 *.so
@@ -29,7 +28,6 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-release.ps1
 
 # PyInstaller
 *.manifest
@@ -149,9 +147,8 @@ logs/
 *.pth
 wandb/
 
-release.ps1
 COSE_CAMBIATE_DALLA_TEORIA.md
 last_version_6.pdf
-.claude/
+
 # Claude AI
 .claude/

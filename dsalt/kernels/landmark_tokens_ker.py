@@ -1,19 +1,19 @@
-"""Hybrid Energy Landmark scoring — fonte unica della formula DSALT (§4.3).
+"""Hybrid Energy Landmark scoring, single source of the DSALT formula (§4.3).
 
-Questo modulo definisce *l'unica* implementazione del punteggio energetico ibrido
-usato per la selezione dei landmark. Sia il path di attenzione (``dsalt_attention``)
-sia il kernel Triton (``dsalt_triton_attn``) richiamano :func:`hybrid_scores_per_head`,
-così che la formula del paper esista in un solo posto e non possa divergere tra i
-percorsi di esecuzione.
+This module defines *the only* implementation of the hybrid-energy score used for
+landmark selection. Both the attention path (``dsalt_attention``) and the Triton
+kernel (``dsalt_triton_attn``) call :func:`hybrid_scores_per_head`, so that the
+paper's formula lives in a single place and cannot diverge between execution
+paths.
 
-Formula (per token ``j``, layer ``l``, head ``h``)::
+Formula (for token ``j``, layer ``l``, head ``h``)::
 
     s = alpha * z(||x_j W_V||_2) + (1 - alpha) * z(||x_j||_2)
 
-dove ``z(·)`` è la standardizzazione (media/dev. std empiriche sui token candidati),
-``alpha = sigmoid(alpha_raw)`` è il parametro di bilanciamento per-head/per-layer, e
-``||x_j W_V||_2`` è calcolato **per head** (output-sensitivity), mentre ``||x_j||_2``
-è la persistenza rappresentazionale (condivisa tra le head).
+where ``z(·)`` is standardisation (empirical mean/std over the candidate tokens),
+``alpha = sigmoid(alpha_raw)`` is the per-head/per-layer balancing parameter, and
+``||x_j W_V||_2`` is computed **per head** (output-sensitivity), while ``||x_j||_2``
+is the representational persistence (shared across heads).
 """
 
 import torch
@@ -27,24 +27,24 @@ def hybrid_scores_per_head(
     n_heads: int,
     dh:      int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Calcola il punteggio ibrido per-head e i segnali normalizzati grezzi.
+    """Compute the per-head hybrid score and the raw normalised signals.
 
     Args:
-        x:       Stati nascosti ``[T, d]``.
-        W_V:     Matrice di proiezione dei value ``[d, d]`` (``v_proj.weight``).
-        alpha:   Bilanciamento per head, ``[n_heads]``, in ``(0, 1)``.
-        n_heads: Numero di head.
-        dh:      Dimensione per head (``d // n_heads``).
+        x:       Hidden states ``[T, d]``.
+        W_V:     Value projection matrix ``[d, d]`` (``v_proj.weight``).
+        alpha:   Per-head balancing, ``[n_heads]``, in ``(0, 1)``.
+        n_heads: Number of heads.
+        dh:      Per-head dimension (``d // n_heads``).
 
     Returns:
-        Tupla ``(scores, z_x, z_v)`` dove:
-          * ``scores`` ``[T, n_heads]`` è il punteggio ibrido ``s``;
-          * ``z_x`` ``[T]`` è la persistenza rappresentazionale standardizzata;
-          * ``z_v`` ``[T, n_heads]`` è la output-sensitivity standardizzata per head.
+        Tuple ``(scores, z_x, z_v)`` where:
+          * ``scores`` ``[T, n_heads]`` is the hybrid score ``s``;
+          * ``z_x`` ``[T]`` is the standardised representational persistence;
+          * ``z_v`` ``[T, n_heads]`` is the per-head standardised output-sensitivity.
 
-    ``z_x`` e ``z_v`` sono restituiti separatamente perché il backward su ``alpha``
-    (gate dei landmark nel kernel Triton) li richiede per ricostruire lo score
-    differenziabile senza ricalcolare le norme.
+    ``z_x`` and ``z_v`` are returned separately because the backward over ``alpha``
+    (the landmark gate in the Triton kernel) needs them to reconstruct the
+    differentiable score without recomputing the norms.
     """
     T = x.shape[0]
 
@@ -65,16 +65,16 @@ def compute_hybrid_scores(
     W_V:   torch.Tensor,
     alpha: torch.Tensor,
 ) -> torch.Tensor:
-    """Punteggio ibrido — wrapper retro-compatibile dell'API pubblica.
+    """Hybrid score, backward-compatible wrapper of the public API.
 
-    Mantiene la firma storica ``(x, W_V, alpha)``. ``alpha`` può essere:
+    Keeps the historical signature ``(x, W_V, alpha)``. ``alpha`` can be:
 
-    * **scalare** → comportamento legacy *query-agnostic*: la norma value è
-      calcolata sull'intero vettore (head singola), restituisce ``[T]``;
-    * **vettore** ``[n_heads]`` → delega a :func:`hybrid_scores_per_head`,
-      restituendo i punteggi per head ``[T, n_heads]``.
+    * **scalar** → legacy *query-agnostic* behaviour: the value norm is computed
+      over the whole vector (single head), returns ``[T]``;
+    * **vector** ``[n_heads]`` → delegates to :func:`hybrid_scores_per_head`,
+      returning the per-head scores ``[T, n_heads]``.
 
-    Per il path runtime DSALT usare direttamente :func:`hybrid_scores_per_head`.
+    For the DSALT runtime path use :func:`hybrid_scores_per_head` directly.
     """
     if alpha.ndim == 0:
         x_norm      = x.norm(dim=-1)
@@ -94,7 +94,7 @@ def select_landmarks(
     k:            int,
     exclude_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Top-k landmark dai punteggi, escludendo opzionalmente la finestra locale."""
+    """Top-k landmarks from the scores, optionally excluding the local window."""
     if exclude_mask is not None:
         scores = scores.masked_fill(exclude_mask, float("-inf"))
 
@@ -114,7 +114,7 @@ def soft_landmark_weights(
     exclude_mask: torch.Tensor | None = None,
     temperature:  float = 1.0,
 ) -> torch.Tensor:
-    """Pesi soft (softmax temperato) sui candidati — utility ausiliaria."""
+    """Soft weights (temperature-scaled softmax) over candidates, auxiliary utility."""
     if exclude_mask is not None:
         scores = scores.masked_fill(exclude_mask, float("-inf"))
     weights = torch.softmax(scores / temperature, dim=-1)
@@ -122,11 +122,11 @@ def soft_landmark_weights(
 
 
 class HybridEnergyLandmarkSelector(nn.Module):
-    """Selettore landmark con ``alpha`` per-layer/per-head apprendibile.
+    """Landmark selector with a learnable per-layer/per-head ``alpha``.
 
-    Wrapper ``nn.Module`` attorno alla formula condivisa. Mantiene
-    ``alpha`` ``[n_layers, n_heads]`` inizializzato a ``sigmoid^{-1}(0.6)``,
-    coerente con :class:`~dsalt.modules.dsalt_attention.DSALTAttention`.
+    An ``nn.Module`` wrapper around the shared formula. Keeps
+    ``alpha`` ``[n_layers, n_heads]`` initialised to ``sigmoid^{-1}(0.6)``,
+    consistent with :class:`~dsalt.modules.dsalt_attention.DSALTAttention`.
     """
 
     def __init__(self, n_layers: int, n_heads: int):

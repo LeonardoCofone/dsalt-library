@@ -1,17 +1,17 @@
-"""DSALT — Dynamic Sparse Attention with Landmark Tokens.
+"""DSALT, Dynamic Sparse Attention with Landmark Tokens.
 
-Questo pacchetto aggrega i componenti principali della libreria:
-- :class:`DSALTConfig` / :class:`DSALTLMHeadModel` — config e modello di linguaggio;
-- :class:`DSALTAttention`, :class:`DSALTTransformerBlock`, :class:`SwiGLUFFN` — i blocchi;
-- :func:`hybrid_scores_per_head` — fonte unica del punteggio energetico ibrido (§4.3),
-  condivisa tra il path SDPA e il kernel Triton;
-- utility per finestra adattiva e RoPE;
-- :class:`DSALTTrainer` — loop di addestramento con DDP e checkpointing.
+This package aggregates the library's main components:
+- :class:`DSALTConfig` / :class:`DSALTLMHeadModel`, config and language model;
+- :class:`DSALTAttention`, :class:`DSALTTransformerBlock`, :class:`SwiGLUFFN`, the blocks;
+- :func:`hybrid_scores_per_head`, single source of the hybrid-energy score (§4.3),
+  shared between the SDPA path and the Triton kernel;
+- utilities for the adaptive window and RoPE;
+- :class:`DSALTTrainer`, training loop with DDP and checkpointing.
 
-I kernel Triton (attenzione sparsa e cross-entropy fuso) sono opzionali: senza
-Triton la libreria resta importabile e usa il fallback SDPA.
+The Triton kernels (sparse attention and fused cross-entropy) are optional:
+without Triton the library stays importable and uses the SDPA fallback.
 
-Esempio::
+Example::
 
     from dsalt import DSALTConfig, DSALTLMHeadModel
     cfg   = DSALTConfig(vocab_size=50257, d_model=512, n_layers=6, n_heads=8,

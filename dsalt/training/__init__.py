@@ -1,5 +1,5 @@
 """
-Questo modulo espone il trainer DSALT, includendo la classe DSALTTrainer e la funzione di schedule cosine con warmup.
+This module exposes the DSALT trainer, including the DSALTTrainer class and the cosine schedule with warmup.
 """
 from .trainer import DSALTTrainer
 

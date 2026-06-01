@@ -5,6 +5,7 @@ import triton.language as tl
 
 from .dsalt_triton_bwd import dsalt_triton_backward
 from .landmark_tokens_ker import hybrid_scores_per_head
+from .autotune import autotune_blocks, get_tuned_config, _heuristic_config
 
 
 _SEQ_BLOCK_MAP_CACHE: dict = {}
@@ -170,23 +171,16 @@ def _dsalt_fwd_kernel(
     )
 
 
-def _pick_block_m(head_dim: int) -> int:
-    if head_dim <= 64:
-        return 64
-    if head_dim <= 128:
-        return 32
-    return 16
+def _resolve_blocks(head_dim: int, device: torch.device) -> dict:
+    """Config (BLOCK_M/BLOCK_N/num_warps/num_stages) for ``(head_dim, GPU)``.
 
-
-def _pick_block_n(head_dim: int) -> int:
-    if head_dim <= 64:
-        return 64
-    elif head_dim <= 128:
-        return 32
-    elif head_dim <= 256:
-        return 16
-    else:
-        return 8
+    Uses the values produced by the autotune if already available, otherwise the
+    dynamic heuristics (which also serve as the tuning seed/fallback).
+    """
+    tuned = get_tuned_config(head_dim, device)
+    if tuned is not None:
+        return tuned
+    return _heuristic_config(head_dim, device)
 
 
 def _build_seq_block_map(
@@ -214,7 +208,7 @@ def _build_seq_block_map(
     return result, total_blks
 
 def _score_block(x: torch.Tensor, W_V: torch.Tensor, alpha: torch.Tensor, n_heads: int, dh: int):
-    # Fonte unica della formula: vedi kernels.landmark_tokens_ker
+    # Single source of the formula: see kernels.landmark_tokens_ker
     return hybrid_scores_per_head(x, W_V, alpha, n_heads, dh)
 
 
@@ -284,6 +278,85 @@ def _build_landmark_kv(
     return lmk_K.contiguous(), lmk_V.contiguous()
 
 
+def _launch_fwd(q_c, k_c, v_c, out, lse, w_int, lmk_K, lmk_V, lmk_pos,
+                lmk_bias_c, cu_int, seq_block_map, total_blk, n_heads,
+                scale, HEAD_DIM_C, k_lmk, cfg):
+    """Forward kernel launch parameterised by the block config.
+
+    Extracted into a function so that the same path is used by both the normal
+    run and the autotune benchmark (no duplication, no divergence between what is
+    measured and what runs in training).
+    """
+    _dsalt_fwd_kernel[(total_blk, n_heads)](
+        q_c, k_c, v_c, out, lse,
+        w_int, lmk_K, lmk_V, lmk_pos, lmk_bias_c, cu_int, seq_block_map,
+        q_c.stride(0), q_c.stride(1), q_c.stride(2),
+        k_c.stride(0), k_c.stride(1), k_c.stride(2),
+        v_c.stride(0), v_c.stride(1), v_c.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        lse.stride(0), lse.stride(1),
+        lmk_K.stride(0), lmk_K.stride(1), lmk_K.stride(2), lmk_K.stride(3),
+        lmk_V.stride(0), lmk_V.stride(1), lmk_V.stride(2), lmk_V.stride(3),
+        lmk_pos.stride(0), lmk_pos.stride(1), lmk_pos.stride(2),
+        lmk_bias_c.stride(0), lmk_bias_c.stride(1), lmk_bias_c.stride(2),
+        scale=scale,
+        HEAD_DIM=HEAD_DIM_C,
+        K_LMK=k_lmk,
+        BLOCK_M=cfg["BLOCK_M"],
+        BLOCK_N=cfg["BLOCK_N"],
+        num_warps=cfg["num_warps"],
+        num_stages=cfg["num_stages"],
+    )
+
+
+def _maybe_autotune(head_dim, device, q_c, k_c, v_c, lmk_indices, lmk_bias,
+                    w_sizes, cu_seqlens, n_heads, scale, HEAD_DIM_C, k_lmk):
+    """Run the fwd+bwd autotune only once per (head_dim, GPU).
+
+    Builds a ``make_runner`` that, given a config, prepares the buffers and
+    returns a closure running a full fwd + bwd with that config. The result is
+    cached in ``autotune._TUNED_CONFIG``.
+    """
+    if get_tuned_config(head_dim, device) is not None:
+        return
+
+    cu_int      = cu_seqlens.to(torch.int32).contiguous()
+    lmk_pos     = lmk_indices.to(torch.int32).contiguous()
+    lmk_bias_c  = lmk_bias.detach().to(torch.float32).contiguous()
+    w_int       = w_sizes.clamp(min=1).long().contiguous()
+    total_len   = q_c.shape[0]
+
+    with torch.no_grad():
+        lmk_K, lmk_V = _build_landmark_kv(
+            k_c, v_c, lmk_indices, cu_seqlens, k_lmk, n_heads, head_dim,
+        )
+
+    def make_runner(cfg):
+        # seq_block_map depends on BLOCK_M → rebuilt for every candidate.
+        seq_block_map, total_blk = _build_seq_block_map(cu_seqlens, cfg["BLOCK_M"], device)
+        out = torch.zeros_like(q_c)
+        lse = torch.empty((total_len, n_heads), device=device, dtype=torch.float32)
+
+        def run():
+            _launch_fwd(
+                q_c, k_c, v_c, out, lse, w_int, lmk_K, lmk_V, lmk_pos,
+                lmk_bias_c, cu_int, seq_block_map, total_blk, n_heads,
+                scale, HEAD_DIM_C, k_lmk, cfg,
+            )
+            grad_out = torch.ones_like(out)
+            dsalt_triton_backward(
+                grad_out, q_c, k_c, v_c, out, lse,
+                lmk_K, lmk_V, lmk_pos, lmk_bias_c,
+                w_sizes, cu_seqlens, scale,
+                seq_block_map, total_blk,
+                cfg["BLOCK_M"], cfg["BLOCK_N"], HEAD_DIM_C,
+                num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
+            )
+        return run
+
+    autotune_blocks(head_dim, device, make_runner, verbose=True)
+
+
 class DSALTAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, lmk_indices, lmk_bias, w_sizes, cu_seqlens):
@@ -291,15 +364,22 @@ class DSALTAttentionFunction(torch.autograd.Function):
         device     = q.device
         scale      = 1.0 / math.sqrt(head_dim)
         HEAD_DIM_C = triton.next_power_of_2(head_dim)
-        BLOCK_M    = _pick_block_m(head_dim)
-        BLOCK_N    = _pick_block_n(head_dim)
-        num_warps  = 4 if head_dim <= 64 else 2
         k_lmk      = lmk_indices.shape[-1]
 
         in_dtype = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else torch.float16
         q_c   = q.contiguous().to(in_dtype)
         k_c   = k.contiguous().to(in_dtype)
         v_c   = v.contiguous().to(in_dtype)
+
+        # Autotune only once per (head_dim, GPU), on the first real batch.
+        _maybe_autotune(
+            head_dim, device, q_c, k_c, v_c, lmk_indices, lmk_bias,
+            w_sizes, cu_seqlens, n_heads, scale, HEAD_DIM_C, k_lmk,
+        )
+        cfg     = _resolve_blocks(head_dim, device)
+        BLOCK_M = cfg["BLOCK_M"]
+        BLOCK_N = cfg["BLOCK_N"]
+
         out   = torch.zeros_like(q_c)
         lse   = torch.empty((total_len, n_heads), device=device, dtype=torch.float32)
         w_int = w_sizes.clamp(min=1).long().contiguous()
@@ -314,25 +394,10 @@ class DSALTAttentionFunction(torch.autograd.Function):
         lmk_pos     = lmk_indices.to(torch.int32).contiguous()
         lmk_bias_c  = lmk_bias.detach().to(torch.float32).contiguous()
 
-        _dsalt_fwd_kernel[(total_blk, n_heads)](
-            q_c, k_c, v_c, out, lse,
-            w_int, lmk_K, lmk_V, lmk_pos, lmk_bias_c, cu_int, seq_block_map,
-            q_c.stride(0), q_c.stride(1), q_c.stride(2),
-            k_c.stride(0), k_c.stride(1), k_c.stride(2),
-            v_c.stride(0), v_c.stride(1), v_c.stride(2),
-            out.stride(0), out.stride(1), out.stride(2),
-            lse.stride(0), lse.stride(1),
-            lmk_K.stride(0), lmk_K.stride(1), lmk_K.stride(2), lmk_K.stride(3),
-            lmk_V.stride(0), lmk_V.stride(1), lmk_V.stride(2), lmk_V.stride(3),
-            lmk_pos.stride(0), lmk_pos.stride(1), lmk_pos.stride(2),
-            lmk_bias_c.stride(0), lmk_bias_c.stride(1), lmk_bias_c.stride(2),
-            scale=scale,
-            HEAD_DIM=HEAD_DIM_C,
-            K_LMK=k_lmk,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            num_warps=num_warps,
-            num_stages=2,
+        _launch_fwd(
+            q_c, k_c, v_c, out, lse, w_int, lmk_K, lmk_V, lmk_pos,
+            lmk_bias_c, cu_int, seq_block_map, total_blk, n_heads,
+            scale, HEAD_DIM_C, k_lmk, cfg,
         )
 
         ctx.save_for_backward(q_c, k_c, v_c, out, lse, lmk_K, lmk_V, lmk_pos, lmk_bias_c)

@@ -3,68 +3,81 @@
 [![PyPI](https://img.shields.io/pypi/v/dsalt)](https://pypi.org/project/dsalt/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-DSALT is a high‑performance PyTorch library that implements **Dynamic Sparse Attention with Landmark Tokens** – a memory‑efficient attention mechanism for transformers. It relies on Triton kernels and supports distributed training.
+**DSALT** is a PyTorch library implementing *Dynamic Sparse Attention with
+Landmark Tokens*, a memory-efficient attention mechanism for transformers. Each
+query attends to an **adaptive local causal window** plus a small set of
+**global landmark tokens**, instead of the full `O(N²)` set. On CUDA it runs
+custom **Triton** kernels; everywhere else it falls back to a masked **SDPA**
+path, so the package stays importable and runnable on any platform (including
+CPU and Windows).
 
 > **Install**: `pip install dsalt`  
 > **Source**: <https://github.com/LeonardoCofone/dsalt-library>  
-> **Paper**: <https://zenodo.org/records/19312826>  
+> **Paper**: <https://zenodo.org/records/19312826>
 
-## 🚀 Key Features
+## ✨ Key Features
 
-- **Memory‑efficient sparse attention** – Triton‑accelerated kernels provide 4–8× memory savings compared to dense attention.
-- **Adaptive local windows** – Token‑wise window sizes that grow with sequence position.
-- **Global landmark tokens** – Top‑k informative tokens per head selected via a hybrid energy scoring function.
-- **Production‑ready training** – Mixed‑precision, gradient checkpointing, and validation support.
-- **Distributed training** – Full DDP and FSDP support for multi‑GPU setups.
-- **Numerical verification** – CPU/GPU equivalence tests and gradient stability checks.
+- **Sparse attention**, local adaptive window `∪` top-`k` landmark tokens per head.
+- **GPU-portable**, Triton kernels on CUDA, transparent SDPA fallback otherwise; correct AMP autodetect across GPU generations (bf16 only where natively supported, fp16 on T4-class cards).
+- **One-shot autotune**, Triton block sizes are benchmarked once per `(head_dim, GPU)` at the first launch, then reused for the whole run; heuristic fallback if benchmarking is impossible.
+- **Packed-sequence training**, concatenated sequences + `cu_seqlens`, fused forward/backward with online softmax.
+- **Fused cross-entropy**, optional Liger fused linear cross-entropy, or a memory-frugal chunked pure-PyTorch loss.
+- **DDP training**, single- and multi-GPU via `DistributedDataParallel`, gradient accumulation, cosine schedule with warm-up, checkpointing, and rich representation-health diagnostics.
 
 ---
 
 ## 📋 Table of Contents
-1. [Installation](#installation)
-2. [Quick Start](#quick-start)
-3. [Architecture Overview](#architecture)
-4. [Training & Generation](#training--generation)
-5. [API Reference](#api-reference)
-6. [Hyperparameter Guide](#hyperparameter-guide)
-7. [Testing](#testing)
-8. [Performance & Benchmarks](#performance--benchmarks)
-9. [Citation](#citation)
-10. [Contributing](#contributing)
-11. [License](#license)
+- [DSALT: Dynamic Sparse Attention with Landmark Tokens](#dsalt-dynamic-sparse-attention-with-landmark-tokens)
+  - [✨ Key Features](#-key-features)
+  - [📋 Table of Contents](#-table-of-contents)
+  - [🛠️ Installation](#️-installation)
+    - [Requirements](#requirements)
+    - [From PyPI](#from-pypi)
+    - [From source](#from-source)
+  - [🚀 Quick Start](#-quick-start)
+    - [Inference](#inference)
+    - [Computing the loss](#computing-the-loss)
+    - [Building from a config](#building-from-a-config)
+  - [🏗️ Architecture Overview](#️-architecture-overview)
+  - [🎯 Training](#-training)
+    - [Mixed precision](#mixed-precision)
+    - [Multi-GPU (DDP)](#multi-gpu-ddp)
+  - [📚 API Reference](#-api-reference)
+  - [📖 Hyperparameter Guide](#-hyperparameter-guide)
+  - [📄 License](#-license)
+  - [🤝 Contributing](#-contributing)
+  - [📝 Citation](#-citation)
 
 ---
 
 ## 🛠️ Installation
 
 ### Requirements
-- Python 3.8+
-- PyTorch 2.0+
-- CUDA 11.0+ (GPU) – CPU fallback is available
-- Triton 2.0+ (optional, enables GPU kernels)
+- Python **3.10+** (the codebase uses `X | None` / `tuple[...]` syntax)
+- PyTorch 2.0+
+- CUDA 11.0+ for the GPU path (CPU fallback always available)
+- Triton 2.0+ (optional; enables the GPU kernels, Linux/CUDA)
 
 ### From PyPI
 ```bash
-pip install dsalt
+pip install dsalt                 # core
+pip install "dsalt[triton]"       # + Triton GPU kernels
+pip install "dsalt[dev]"          # + lint/type/test tooling
 ```
 
 ### From source
 ```bash
 git clone https://github.com/LeonardoCofone/dsalt-library.git
-cd dsalt-pytorch
+cd dsalt-library
 pip install -e .
-```
-
-### Development setup
-```bash
-pip install -r requirements-dev.txt
 ```
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Language‑model inference
+### Inference
+
 ```python
 import torch
 from dsalt.model import DSALTLMHeadModel
@@ -77,309 +90,196 @@ model = DSALTLMHeadModel(
     n_min=32,
     n_max=512,
     k_lmk=64,
+    max_seq_len=2048,   # required
 )
 
-input_ids = torch.randint(0, 32000, (1, 1024))  # [batch, seq_len]
-logits = model(input_ids)                     # [1, 1024, 32000]
+input_ids = torch.randint(0, 32000, (1, 1024))   # [batch, seq_len]
+out = model(input_ids)                           # dict
+logits = out["logits"]                           # [1, 1024, 32000]
 print(logits.shape)
+```
 
-# With labels – loss is computed internally
+### Computing the loss
+
+The forward computes the loss internally (fused) when `labels` are given, and
+returns a **dict** `{"loss", "logits", "aux_loss"}`:
+
+```python
 labels = torch.randint(0, 32000, (1, 1024))
-outputs = model(input_ids, labels=labels)
-loss = outputs.loss
+out  = model(input_ids, labels=labels)
+loss = out["loss"]          # logits is None here (loss is fused)
 loss.backward()
 ```
 
-### 2. Single‑GPU training
+### Building from a config
+
 ```python
-import torch
-from torch.utils.data import DataLoader, TensorDataset
-from dsalt.model import DSALTLMHeadModel
-from dsalt.training import DSALTTrainer
+from dsalt.model import DSALTConfig, DSALTLMHeadModel
 
-vocab_size = 32000
-seq_len = 512
-train_dataset = TensorDataset(
-    torch.randint(0, vocab_size, (1000, seq_len))
+cfg = DSALTConfig(
+    vocab_size=50257, d_model=512, n_layers=6, n_heads=8,
+    n_min=64, n_max=256, k_lmk=16, max_seq_len=1024,
 )
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-
-model = DSALTLMHeadModel(
-    vocab_size=vocab_size,
-    d_model=768,
-    n_layers=12,
-    n_heads=12,
-    n_min=32,
-    n_max=256,
-    k_lmk=32,
-)
-
-trainer = DSALTTrainer(
-    model=model,
-    train_loader=train_loader,
-    lr=3e-4,
-    total_steps=10_000,
-    save_dir="checkpoints",
-    dtype=torch.bfloat16,
-    log_every=50,
-)
-trainer.train()
+model = DSALTLMHeadModel.from_config(cfg)
+cfg.save("config.json")               # reload with DSALTConfig.load(...)
 ```
-
-### 3. Multi‑GPU with DataParallel
-```python
-import torch
-import torch.nn as nn
-from dsalt.model import DSALTLMHeadModel
-from dsalt.training import DSALTTrainer
-
-model = DSALTLMHeadModel(...).to("cuda")
-model = nn.DataParallel(model)  # uses all available GPUs
-
-trainer = DSALTTrainer(
-    model=model,
-    train_loader=train_loader,
-    lr=3e-4,
-    total_steps=100_000,
-    dtype=torch.bfloat16,
-    save_dir="checkpoints",
-)
-trainer.train()
-```
-
-### 4. Multi‑GPU with FSDP (model sharding)
-```bash
-torchrun --nproc_per_node=2 train.py
-```
-Then configure the trainer with `fsdp=True`.
 
 ---
 
 ## 🏗️ Architecture Overview
 
-DSALT combines **local causal windows** (adaptive per token) with **global landmark tokens** (top‑k per head):
+DSALT combines a per-token **local causal window** with **global landmark
+tokens** selected per head:
+
 ```
-┌─ Local window (adaptive) ──┬─ Global landmarks ─┐
-│ Recent N tokens            │ Top‑K informative  │ 
-│ (window size grows)        │ tokens per head    │
-└────────────────────────────┴────────────────────┘
-                ↓                     ↓
-            Sparse attention output
+┌─ Local window (adaptive) ──┬─ Global landmarks ──┐
+│  Recent tokens up to       │  Top-k informative  │
+│  window size               │  tokens per head    │
+└────────────────────────────┴─────────────────────┘
+                 ↓                      ↓
+              Sparse attention output  (W(i) ∪ L(i))
 ```
-Key components:
-1. `DSALTAttention` – multi‑head sparse attention with adaptive windows and landmark selection.
-2. `WindowSizePredictor` – learns per‑token window sizes.
-3. `HybridEnergyScorer` (kernel) – computes landmark scores.
-4. `DSALTTransformer` – stack of attention + feed‑forward layers.
-5. Triton kernels – fused forward and backward passes for speed and memory efficiency.
+
+Components:
+1. `DSALTAttention`, multi-head sparse attention over `W(i) ∪ L(i)` with RoPE/YaRN positions.
+2. `hybrid_scores_per_head`, the single source of the hybrid-energy landmark score (§4.3), shared by both the SDPA path and the Triton kernel.
+3. `DSALTTransformerBlock` / `SwiGLUFFN`, pre-norm block with a gated SwiGLU FFN.
+4. `DSALTLMHeadModel`, embeddings + block stack + RMSNorm + (tied) LM head.
+5. Triton kernels, fused forward (`dsalt_triton_attention`) and backward with online softmax and one-shot autotuned block sizes.
+
+> **Note.** The local window is frozen to `(n_min + n_max) // 2` in this release
+> (no learnable window predictor). The learned adaptivity is the per-head
+---
+
+## 🎯 Training
+
+`DSALTTrainer` drives single- and multi-GPU (DDP) training. It expects **packed**
+batches: `(input_ids, labels, cu_seqlens, max_seqlen)`, where `cu_seqlens` is an
+`int32` offset tensor of shape `[num_seqs + 1]` and `-100` labels are ignored.
+
+```python
+from dsalt.model import DSALTLMHeadModel
+from dsalt.training import DSALTTrainer
+
+model = DSALTLMHeadModel(
+    vocab_size=32000, d_model=768, n_layers=12, n_heads=12,
+    n_min=32, n_max=256, k_lmk=32, max_seq_len=1024,
+)
+
+trainer = DSALTTrainer(
+    model=model,
+    train_loader=train_loader,   # yields (ids, labels, cu_seqlens, max_seqlen)
+    val_loader=val_loader,
+    lr=3e-4,
+    total_steps=10_000,
+    warmup_steps=1_000,
+    mixed_precision="auto",      # bf16 on sm_80+, fp16 on T4-class, none on CPU
+    save_dir="./checkpoints_dsalt",
+    log_every=100,
+)
+trainer.train()
+```
+
+### Mixed precision
+
+`mixed_precision="auto"` selects the dtype from the GPU's **compute capability**:
+bf16 on `sm_80+` (A100/H100/L4/…), fp16 (with a `GradScaler`) below that
+(e.g. T4 sm_75), and no autocast on CPU. You can force `"bf16"`, `"fp16"`, or
+`"none"` explicitly.
+
+### Multi-GPU (DDP)
+
+Launch one process per GPU and pass the distributed identity through; the trainer
+wraps the model in `DistributedDataParallel` when `world_size > 1`:
+
+```bash
+torchrun --nproc_per_node=2 your_train_script.py
+```
+
+```python
+trainer = DSALTTrainer(
+    model=model, train_loader=train_loader, val_loader=val_loader,
+    rank=rank, local_rank=local_rank, world_size=world_size,
+    ddp_backend="nccl", total_steps=100_000,
+)
+trainer.train()
+```
+
+Only DDP is supported in this release (no FSDP). The trainer also handles
+gradient accumulation, gradient clipping, cosine LR decay with warm-up,
+checkpointing (`checkpoint_best/step_N/final.pt`), and per-layer
+representation-health metrics. Resume with `trainer.load_checkpoint(path)`.
 
 ---
 
-## 🎯 Training & Generation
+## 📚 API Reference
 
-See the code snippets above for full training loops. The `DSALTTrainer` handles:
-- Mixed‑precision (BF16 default)
-    -   Gradient checkpointing to save activation memory at the cost of recomputing some layers.
-    -   Learning‑rate warm‑up and cosine decay for stable and effective optimisation.
-    -   Optional window‑entropy regularisation (`window_reg_coef`) to encourage diverse window size predictions.
-    -   Comprehensive checkpointing and logging utilities.
-    -   Support for various distributed training strategies (DDP, FSDP).
+```python
+# Top-level exports
+from dsalt import (
+    DSALTConfig, DSALTLMHeadModel,
+    DSALTAttention, DSALTTransformerBlock, SwiGLUFFN,
+    DSALTTrainer,
+    dsalt_triton_attention,            # None when Triton is unavailable
+    hybrid_scores_per_head,            # single source of the landmark score
+    sparse_attention_forward, sparse_attention_forward_packed,
+    RMSENorm, compute_window_sizes, apply_rotary_emb, build_rope_cache,
+)
 
-For detailed configuration, refer to the Hyperparameter Guide below, especially the `DSALTTrainer` section.
+# Low-level Triton kernel (packed sequences, CUDA + Triton only)
+from dsalt.kernels import dsalt_triton_attention
+out = dsalt_triton_attention(q, k, v, lmk_indices, lmk_bias, w_sizes, cu_seqlens)
+```
+
+`q, k, v` are `[total_len, n_heads, head_dim]`; `cu_seqlens` is the `int32`
+sequence-offset tensor. See `FEATURE.md` for the full signature and semantics of
+every component.
 
 ---
 
 ## 📖 Hyperparameter Guide
 
-This section provides a comprehensive reference for all key hyperparameters across DSALT components, their defaults, and recommended usage.
+Full, source-verified defaults for `DSALTLMHeadModel`, `DSALTConfig`,
+`DSALTAttention`, and `DSALTTrainer` live in [`FEATURE.md`](FEATURE.md). Highlights:
 
-### DSALTLMHeadModel (Language Model)
+| Component            | Required                                                            | Notable defaults                                                                 |
+|----------------------|---------------------------------------------------------------------|----------------------------------------------------------------------------------|
+| `DSALTLMHeadModel`   | `vocab_size, d_model, n_layers, n_heads, n_min, n_max, k_lmk, max_seq_len` | `d_ff=None` (→ 8/3·d_model), `loss_fn="chunked"`, `tie_weights=True`, `yarn_scale=1.0` |
+| `DSALTTrainer`       | `model, train_loader, val_loader`                                   | `lr=3e-4`, `max_grad_norm=0.5`, `warmup_steps=1000`, `mixed_precision="auto"`     |
 
-The main language‑model wrapper that combines embeddings, transformer blocks, and an output head.
-
-#### Required Parameters
-```python
-vocab_size: int          # Vocabulary size (e.g., 32000 for GPT‑2)
-d_model: int            # Hidden dimension, must be divisible by `n_heads`
-n_layers: int           # Number of transformer blocks
-n_heads: int            # Number of attention heads (d_model // n_heads must be a power of two and ≥ 16)
-```
-
-#### Architecture Hyperparameters
-```python
-d_ff: int | None = None   # Feed‑forward hidden dim (default = 4 × d_model)
-max_seq_len: int = 2048   # Maximum sequence length for positional embeddings
-dropout: float = 0.0     # Dropout rate applied after attention and FFN
-use_fa2: bool = True      # Enable FlashAttention 2 when Triton is available
-tie_weights: bool = True # Share embedding and output‑projection weights
-```
-
-#### Sparse‑Attention Hyperparameters
-```python
-n_min: int = 32            # Minimum local window size (causal sliding window)
-n_max: int = 256           # Maximum local window size (grows with token position)
-k_lmk: int = 16           # Number of global landmark tokens per head
-```
-
-*Note*: `alpha` is a learnable per‑head weight automatically initialised; it is **not** exposed as a configuration flag.
-
-### DSALTAttention (Attention Module)
-
-A multi‑head sparse‑attention layer with adaptive windows and landmark selection.
-
-#### Required Parameters
-```python
-d_model: int
-n_heads: int
-```
-
-#### Sparse‑Attention Hyperparameters (inherited from the model)
-```python
-n_min: int
-n_max: int
-k_lmk: int
-alpha: float = 0.6   # Initial value for the learnable weight per head
-```
-
-#### Regularisation & Optimisation
-```python
-dropout: float = 0.0
-use_fa2: bool = True                # FlashAttention 2 fallback when the whole sequence fits the local window
-gradient_checkpointing: bool = False # Enable gradient checkpointing for memory savings
-compile_attention: bool = False     # Enable `torch.compile` for the attention block (requires PyTorch 2.0+)
-```
-
-### WindowSizePredictor (Dynamic Window Module)
-
-Learns a per‑token window size that adapts between `n_min` and `n_max`.
-
-### Embedded Parameters (no constructor arguments)
--   `d_model`, `n_heads`, `n_min`, `n_max` are automatically inferred from the parent `DSALTAttention`.
-
-### Output
-```text
-output: [batch, n_heads, seq_len]   # Predicted window size per token per head
-```
-The module also returns a continuous regularisation term used by the trainer when `window_reg_coef > 0`.
-
-### DSALTTransformer (Core Stack)
-
-Stack of `DSALTAttention` + feed‑forward blocks.
-
-All architectural hyperparameters are inherited from `DSALTLMHeadModel`.
-
-### DSALTTrainer (Training Configuration)
-
-High‑level training loop with mixed‑precision, distributed training, and checkpointing.
-
-#### Optimisation Hyperparameters
-```python
-lr: float = 3e-4                 # Initial learning rate
-weight_decay: float = 0.1        # L2 regularisation strength
-max_grad_norm: float = 1.0       # Maximum gradient norm for clipping
-grad_accum: int = 1              # Number of gradient accumulation steps
-```
-
-#### Learning‑Rate Schedule
-```python
-warmup_steps: int = 500          # Number of steps for linear learning rate warm-up
-total_steps: int = 10_000        # Total number of training steps for cosine decay
-```
-
-#### Logging & Checkpointing
-```python
-log_every: int = 50              # Log training metrics every N steps
-val_every: int = 500             # Run validation every N steps
-save_every: int = 1000           # Save model checkpoint every N steps
-save_dir: str = "checkpoints"    # Directory to save checkpoints and logs
-```
-
-#### Precision & Device
-```python
-dtype: torch.dtype = torch.bfloat16   # Data type for training (BF16 default for speed/stability)
-device: torch.device = "cuda:0"       # Device to run training on (e.g., "cuda:0", "cpu")
-```
-
-#### Distributed Training (choose **one**)
-```python
-ddp: bool = False                     # Enable standard DistributedDataParallel
-fsdp: bool = False                    # Enable Fully‑sharded Data Parallel (model sharding)
-fsdp_cpu_offload: bool = False        # Optional CPU off‑load for very large models with FSDP
-```
-
-#### Memory Optimisation
-```python
-gradient_checkpointing: bool = False   # Save ~30 % activation memory at the cost of extra compute
-```
-
-#### Regularisation
-```python
-window_reg_coef: float = 0.0   # Entropy penalty on the predicted window distribution (0.0 disables)
-```
-
----
-
-## 📚 API Reference (excerpt)
-
-```python
-# Model creation
-from dsalt.model import DSALTLMHeadModel
-model = DSALTLMHeadModel(
-    vocab_size=32000,
-    d_model=1024,
-    n_layers=24,
-    n_heads=16,
-    n_min=32,
-    n_max=512,
-    k_lmk=64,
-)
-
-# Forward pass
-input_ids = torch.randint(0, 32000, (1, 1024))
-logits, windows = model(input_ids, return_window=True)
-
-# Low‑level kernel call (for advanced users)
-from dsalt.kernels import dsalt_attention
-Q, K, V = torch.randn(1, 16, 1024, 64), torch.randn(1, 16, 1024, 64), torch.randn(1, 16, 1024, 64)
-window_sizes = torch.full((1, 16, 1024), 64, dtype=torch.int32)
-landmark_idx = torch.randint(0, 1024, (1, 16, 1024, 16), dtype=torch.int32)
-out = dsalt_attention(Q, K, V, window_sizes, landmark_idx)
-```
-
----
-
-## 🧪 Testing
-
-
-Key test modules include:
--   `tests/test_sparse_attn.py` – CPU/GPU equivalence and backward pass.
--   `tests/test_hybrid_energy.py` – Landmark scoring and selection.
--   `tests/test_dsalt_lm.py` – Language‑model wrapper and loss.
--   `tests/test_main.py` – End‑to‑end smoke test.
+`alpha` is a learnable per-head parameter (init `sigmoid ≈ 0.6`), not a
+constructor flag. The auxiliary loss term is inert in this release (frozen
+window) and kept only for signature compatibility.
 
 ---
 
 ## 📄 License
 
-See here: <https://github.com/LeonardoCofone/dsalt-library/blob/main/LICENSE>
+Apache 2.0, see
+<https://github.com/LeonardoCofone/dsalt-library/blob/main/LICENSE>.
 
 ---
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please read `CONTRIBUTING.md` for guidelines. Areas where help is especially valuable:
--   Triton kernel optimisation
--   New model architectures (encoder, encoder‑decoder)
--   Additional training strategies and samplers
--   Documentation and tutorials
--   Bug reports and fixes
+Contributions are welcome, see [`CONTRIBUTING.md`](CONTRIBUTING.md). Especially
+valuable: Triton kernel optimisation, new architectures (encoder /
+encoder-decoder), additional training strategies, documentation, and bug fixes.
+
+- **Issues**: <https://github.com/LeonardoCofone/dsalt-library/issues>
+- **Discussions**: <https://github.com/LeonardoCofone/dsalt-library/discussions>
 
 ---
 
-## 📞 Support & Questions
+## 📝 Citation
 
--   **Issues**: <https://github.com/LeonardoCofone/dsalt-library/issues>
--   **Discussions**: <https://github.com/LeonardoCofone/dsalt-library/discussions>
--   **Paper**: <https://zenodo.org/records/19312826>
+If you use DSALT in your research, please cite the paper:
 
----
+```bibtex
+@software{dsalt,
+  author  = {Cofone, Leonardo},
+  title   = {DSALT: Dynamic Sparse Attention with Landmark Tokens},
+  url      = {https://github.com/LeonardoCofone/dsalt-library},
+  note    = {https://zenodo.org/records/19312826},
+}
+```

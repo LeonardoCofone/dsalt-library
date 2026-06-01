@@ -61,6 +61,15 @@ def _fmt_val(s: str, decimals: int = 4, color: str = WHITE) -> str:
         return f"{DIM}{'nan':>{_W_VAL}}{RESET}"
 
 
+def _fmt_tok_s(tok_s: float) -> str:
+    """Compact throughput: 12.3M / 4.5k / 123 tok/s."""
+    if tok_s >= 1e6:
+        return f"{tok_s / 1e6:5.2f}M"
+    if tok_s >= 1e3:
+        return f"{tok_s / 1e3:5.1f}k"
+    return f"{tok_s:5.0f}"
+
+
 def _fmt_ppl(loss: float) -> str:
     try:
         ppl = math.exp(min(loss, 20.0))
@@ -139,6 +148,7 @@ class _StepFormatter(logging.Formatter):
         p      = _parse(msg)
         ts     = f"{DIM}{self.formatTime(record, self.datefmt)}{RESET}"
         it_s    = getattr(record, "it_s",    0.0)
+        tok_s   = getattr(record, "tok_s",   0.0)
         mem_gb  = getattr(record, "mem_gb",  0.0)
         peak_gb = getattr(record, "peak_gb", 0.0)
         mem_c   = _mem_color(peak_gb if peak_gb > 0 else mem_gb)
@@ -164,6 +174,7 @@ class _StepFormatter(logging.Formatter):
         lr_s   = f"{MAGENTA}{p.get('lr', '?')}{RESET}"
 
         speed_s = f"{CYAN}{it_s:6.2f} it/s{RESET}" if it_s   > 0 else f"{DIM}  ?.?? it/s{RESET}"
+        tok_s_s = f"{CYAN}{_fmt_tok_s(tok_s)} tok/s{RESET}" if tok_s > 0 else f"{DIM}  ? tok/s{RESET}"
         total_gb = getattr(record, "total_gb", 0.0)
         mem_s = (
             f"{mem_c}cur {mem_gb:.2f}{RESET}{DIM}·{RESET}{mem_c}peak {peak_gb:.2f} GB{RESET}{DIM} / {total_gb:.0f} tot{RESET}"
@@ -181,7 +192,7 @@ class _StepFormatter(logging.Formatter):
         except Exception:
             progress = f"{BOLD}step {CYAN}{step}{RESET}"
 
-        hdr = f"  {ts}   {progress}   {speed_s}   {mem_s}"
+        hdr = f"  {ts}   {progress}   {speed_s}   {tok_s_s}   {mem_s}"
 
         rows = [
             f"  {_cell('loss', loss_s)}{G}{_cell('ppl',       ppl_s)}",

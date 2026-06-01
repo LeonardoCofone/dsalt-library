@@ -7,8 +7,8 @@ from ..kernels.RMSENorm          import RMSENorm
 from ..modules.dsalt_transformer import DSALTTransformerBlock
 from .config                     import DSALTConfig
 
-# Liger (cross-entropy fuso) richiede Triton: opzionale, importato a runtime
-# solo quando loss_fn="liger" è effettivamente richiesto.
+# Liger (fused cross-entropy) requires Triton: optional, imported at runtime
+# only when loss_fn="liger" is actually requested.
 try:
     from ..kernels.cross_entropy import LigerFusedLinearCrossEntropyFunction
     _LIGER_OK = True
@@ -58,35 +58,35 @@ _LOSS_FN = {
 
 
 class DSALTLMHeadModel(nn.Module):
-    """Language Model causale basato su DSALT (Dynamic Sparse Attention with Landmark Tokens).
+    """Causal Language Model based on DSALT (Dynamic Sparse Attention with Landmark Tokens).
 
-    Stack di :class:`~dsalt.modules.dsalt_transformer.DSALTTransformerBlock` con
-    embedding token, RMSNorm finale e testa LM (opzionalmente legata all'embedding).
+    A stack of :class:`~dsalt.modules.dsalt_transformer.DSALTTransformerBlock` with
+    token embeddings, a final RMSNorm, and an LM head (optionally tied to the embedding).
 
-    L'input è atteso in formato **packed** (sequenze concatenate + ``cu_seqlens``),
-    il percorso ottimizzato per il training; il forward accetta anche tensori
-    ``[B, T]`` per inferenza.
+    The input is expected in **packed** format (concatenated sequences + ``cu_seqlens``),
+    the path optimised for training; the forward also accepts ``[B, T]`` tensors for
+    inference.
 
-    Istanziare preferibilmente via :meth:`from_config` con una
+    Preferably instantiate via :meth:`from_config` with a
     :class:`~dsalt.model.config.DSALTConfig`.
 
     Args:
-        vocab_size:         Dimensione del vocabolario.
-        d_model:            Dimensione del modello (deve essere divisibile per ``n_heads``).
-        n_layers:           Numero di blocchi Transformer.
-        n_heads:            Numero di attention head.
-        n_min, n_max:       Estremi della finestra locale adattiva (§4.2).
-        k_lmk:              Numero di landmark token per query (§4.3).
-        max_seq_len:        Lunghezza massima per la cache RoPE.
-        d_ff:               Dimensione FFN; se ``None`` usa ~8/3·d_model arrotondato.
-        dropout:            Probabilità di dropout.
-        yarn_scale:         Fattore di scala posizionale RoPE/YaRN.
-        tie_weights:        Lega i pesi della testa LM all'embedding.
-        padding_idx:        Indice di padding per l'embedding.
-        lm_head_chunk_size: Chunk per la cross-entropy "chunked" (memoria).
-        loss_fn:            ``"chunked"`` (default) o ``"liger"`` (richiede Triton).
-        aux_loss_weight:    Peso del termine ausiliario (inerte: finestra congelata,
-                            mantenuto per compatibilità della firma).
+        vocab_size:         Vocabulary size.
+        d_model:            Model dimension (must be divisible by ``n_heads``).
+        n_layers:           Number of Transformer blocks.
+        n_heads:            Number of attention heads.
+        n_min, n_max:       Bounds of the adaptive local window (§4.2).
+        k_lmk:              Number of landmark tokens per query (§4.3).
+        max_seq_len:        Max length for the RoPE cache.
+        d_ff:               FFN dimension; if ``None`` uses ~8/3·d_model rounded.
+        dropout:            Dropout probability.
+        yarn_scale:         RoPE/YaRN positional scaling factor.
+        tie_weights:        Tie the LM head weights to the embedding.
+        padding_idx:        Padding index for the embedding.
+        lm_head_chunk_size: Chunk for the "chunked" cross-entropy (memory).
+        loss_fn:            ``"chunked"`` (default) or ``"liger"`` (requires Triton).
+        aux_loss_weight:    Weight of the auxiliary term (inert: frozen window,
+                            kept for signature compatibility).
     """
 
     def __init__(
@@ -112,8 +112,8 @@ class DSALTLMHeadModel(nn.Module):
         assert loss_fn in _LOSS_FN, f"loss_fn must be one of {list(_LOSS_FN)}"
         if loss_fn == "liger" and not _LIGER_OK:
             raise RuntimeError(
-                "loss_fn='liger' richiede il kernel Triton (cross_entropy fuso), "
-                "non disponibile in questo ambiente. Usa loss_fn='chunked'."
+                "loss_fn='liger' requires the Triton kernel (fused cross_entropy), "
+                "not available in this environment. Use loss_fn='chunked'."
             )
 
         self.d_model            = d_model
@@ -150,7 +150,7 @@ class DSALTLMHeadModel(nn.Module):
 
     @classmethod
     def from_config(cls, config: "DSALTConfig") -> "DSALTLMHeadModel":
-        """Istanzia il modello da una :class:`~dsalt.model.config.DSALTConfig`."""
+        """Instantiate the model from a :class:`~dsalt.model.config.DSALTConfig`."""
         return cls(**config.to_dict())
 
     def _init_weights(self):

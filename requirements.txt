@@ -1,7 +1,5 @@
 # Core dependencies
 torch>=2.0.0
-numpy>=1.21.0
 
-# Optional GPU acceleration
+# Optional GPU acceleration (Triton kernels; falls back to SDPA without it)
 triton>=2.0.0; sys_platform != "win32"
-flash-attn>=2.0.0; sys_platform != "win32"

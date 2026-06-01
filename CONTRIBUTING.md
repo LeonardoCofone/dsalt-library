@@ -8,20 +8,19 @@ Thank you for your interest in contributing to DSALT! We welcome contributions f
 2. Clone your fork:
    ```bash
    git clone https://github.com/LeonardoCofone/dsalt-library.git
-   cd dsalt-pytorch
+   cd dsalt-library
    ```
 
-3. Install development dependencies:
+3. Install in editable mode with development dependencies:
    ```bash
-   make install-dev
-   # or
    pip install -e ".[dev]"
    ```
 
-4. Set up pre-commit hooks:
+   On a machine with a CUDA GPU, add the Triton extra for the custom kernels:
    ```bash
-   pre-commit install
+   pip install -e ".[dev,triton]"
    ```
+   Without Triton the library still works and falls back to the SDPA path.
 
 ## Development Workflow
 
@@ -30,69 +29,40 @@ Thank you for your interest in contributing to DSALT! We welcome contributions f
    git checkout -b feature/your-feature-name
    ```
 
-2. Make your changes following our coding standards
+2. Make your changes following the coding standards below.
 
-3. Run tests and linters:
+3. Format and lint:
    ```bash
-   make test
-   make lint
+   black dsalt
+   isort dsalt
+   flake8 dsalt
+   mypy dsalt
    ```
 
-4. Format your code:
-   ```bash
-   make format
-   ```
-
-5. Commit your changes:
-   ```bash
-   git commit -m "Add your descriptive commit message"
-   ```
-
-6. Push to your fork and create a pull request
+4. Commit and push to your fork, then open a pull request.
 
 ## Coding Standards
 
 ### Python Style
-- Follow PEP 8
-- Use type hints for all function signatures
-- Write docstrings for all public functions/classes
-- Keep line length under 88 characters (Black default)
+- Target Python 3.10+ (the codebase uses `X | None` / `tuple[...]` syntax).
+- Use type hints for all function signatures.
+- Write docstrings for all public functions/classes.
+- Keep line length under 88 characters (Black default).
 
 ### Code Quality Tools
-We use several tools to maintain code quality:
-
-- **Black**: Code formatting
-- **isort**: Import sorting
-- **flake8**: Linting
-- **mypy**: Type checking
-- **pytest**: Testing
-
-### Testing
-- Write tests for all new functionality
-- Maintain test coverage above 80%
-- Run the full test suite before submitting PRs:
-  ```bash
-  make test-cov
-  ```
+- **Black**: code formatting
+- **isort**: import sorting
+- **flake8**: linting
+- **mypy**: type checking
 
 ## Pull Request Guidelines
-
-### PR Title
-Use a clear, descriptive title that explains what the PR does.
 
 ### PR Description
 Include:
 - What changes were made
 - Why the changes were needed
 - How to test the changes
-- Any breaking changes
-
-### Checklist
-- [ ] Tests pass locally
-- [ ] Code is properly formatted
-- [ ] Type hints are correct
-- [ ] Documentation is updated
-- [ ] No new linting errors
+- Any breaking changes (e.g. anything that alters trained-model numerics)
 
 ## Reporting Issues
 
@@ -100,19 +70,11 @@ When reporting bugs, please include:
 - Python version
 - PyTorch version
 - Triton version (if applicable)
-- CUDA version (if applicable)
+- CUDA version and GPU model (if applicable)
 - Operating system
 - Steps to reproduce
 - Expected vs actual behavior
 - Error messages/logs
-
-## Feature Requests
-
-We welcome feature requests! Please:
-- Check if the feature is already planned or implemented
-- Describe the use case clearly
-- Explain why it would be valuable
-- Consider implementation complexity
 
 ## License
 

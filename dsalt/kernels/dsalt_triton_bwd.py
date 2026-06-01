@@ -3,6 +3,11 @@ import triton
 import triton.language as tl
 
 
+# Structural cap on BLOCK_N in the backward (see note at the launch): the bwd
+# kernel uses atomic_add and cannot handle N tiles as wide as the forward.
+_BWD_MAX_BLOCK_N = 32
+
+
 @triton.jit
 def _dsalt_bwd_preprocess(
     Out, DO,
@@ -224,6 +229,8 @@ def dsalt_triton_backward(
     BLOCK_M:       int,
     BLOCK_N:       int,
     HEAD_DIM_C:    int,
+    num_warps:     int | None = None,
+    num_stages:    int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     total_len, n_heads, head_dim = q.shape
     device   = q.device
@@ -256,7 +263,18 @@ def dsalt_triton_backward(
         num_warps=4,
     )
 
-    num_warps = 4 if head_dim <= 64 else 2
+    # num_warps/num_stages: explicit values take priority (passed by the autotune
+    # benchmark to faithfully measure a candidate), then the config already tuned
+    # for this GPU, finally the per-head_dim heuristic. BLOCK_M/BLOCK_N come from
+    # the forward (they must match: seq_block_map is shared).
+    if num_warps is None or num_stages is None:
+        from .autotune import get_tuned_config
+        tuned = get_tuned_config(head_dim, device)
+        if num_warps is None:
+            num_warps = tuned["num_warps"] if tuned is not None else (4 if head_dim <= 64 else 2)
+        if num_stages is None:
+            num_stages = tuned["num_stages"] if tuned is not None else 2
+    num_stages_bwd = num_stages
     cu_int    = cu_seqlens.to(torch.int32).contiguous()
     lse_c     = lse.contiguous().to(torch.float32)
 
@@ -266,7 +284,11 @@ def dsalt_triton_backward(
     lmk_bias_f = lmk_bias.to(torch.float32).contiguous()
     w_int     = w_sizes.clamp(min=1).to(torch.int32).contiguous()
 
-    BLOCK_N = min(BLOCK_N, 32)
+    # The backward is heavier in registers/smem than the forward (accumulation
+    # via atomic_add): we cap BLOCK_N at _BWD_MAX_BLOCK_N regardless of what the
+    # forward/autotune chose. A structural kernel limit, not a tunable
+    # hyperparameter.
+    BLOCK_N = min(BLOCK_N, _BWD_MAX_BLOCK_N)
 
     _dsalt_bwd_kernel[(total_blk, n_heads)](
         q_f, k_f, v_f, do_f,
@@ -293,7 +315,7 @@ def dsalt_triton_backward(
         HEAD_DIM=HEAD_DIM_C,
         K_LMK=lmk_K.shape[2],
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=num_stages_bwd,
     )
 
     return dq, dk, dv, d_bias

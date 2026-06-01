@@ -30,7 +30,7 @@ def _hybrid_scores(
     alpha: torch.Tensor,
     dh:    int,
 ) -> torch.Tensor:
-    # Fonte unica della formula: vedi kernels.landmark_tokens_ker
+    # Single source of the formula: see kernels.landmark_tokens_ker
     n_heads      = alpha.shape[0]
     scores, _, _ = hybrid_scores_per_head(x, W_V, alpha, n_heads, dh)
     return scores
@@ -138,24 +138,22 @@ def _build_mask_packed(
 
 
 class DSALTAttention(nn.Module):
-    """Attenzione sparsa DSALT: finestra locale adattiva + landmark token globali (§4).
+    """DSALT sparse attention: adaptive local window + global landmark tokens (§4).
 
-    L'insieme di attenzione di ogni query è ``A(i) = W(i) ∪ L(i)``: una finestra
-    locale causale di dimensione **fissa** ``(n_min+n_max)//2`` (§4.2) unita a un
-    piccolo insieme di landmark selezionati per energia ibrida (``alpha_w``
-    per-head apprendibile, §4.3).
+    Each query's attention set is ``A(i) = W(i) ∪ L(i)``: a causal local window of
+    **fixed** size ``(n_min+n_max)//2`` (§4.2) joined with a small set of landmarks
+    selected by hybrid energy (learnable per-head ``alpha_w``, §4.3).
 
-    Due percorsi:
-      * **packed** (``cu_seqlens`` fornito) → kernel Triton ``dsalt_triton_attention``
-        in training, con fallback SDPA mascherato se Triton non è disponibile;
-      * **batched** (``[B, T, d]``) → SDPA su maschera densa, usato in inferenza.
+    Two paths:
+      * **packed** (``cu_seqlens`` provided) → Triton kernel ``dsalt_triton_attention``
+        in training, with a masked SDPA fallback if Triton is unavailable;
+      * **batched** (``[B, T, d]``) → SDPA over a dense mask, used at inference.
 
-    Nota implementativa: la finestra è congelata a un valore costante (nessun
-    parametro apprendibile); l'adattività dimostrata è quella di ``alpha``
-    per-head. Vedi ``COSE_CAMBIATE_DALLA_TEORIA.md``.
+    Implementation note: the window is frozen to a constant value (no learnable
+    parameter); the demonstrated adaptivity is that of the per-head ``alpha``.
 
-    In ``eval`` salva in ``_last_P`` la matrice di attenzione densa della prima
-    sequenza, usata dalle metriche di rank/entropy/attention-sink del trainer.
+    In ``eval`` it stores in ``_last_P`` the dense attention matrix of the first
+    sequence, used by the trainer's rank/entropy/attention-sink metrics.
     """
 
     def __init__(
@@ -207,8 +205,8 @@ class DSALTAttention(nn.Module):
         return self.rope_cos.to(device), self.rope_sin.to(device)
 
     def _aux_zero(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        # Finestra congelata: nessuna loss ausiliaria sulla finestra. Manteniamo
-        # la firma (out, aux) ritornando un termine nullo inerte.
+        # Frozen window: no auxiliary loss on the window. We keep the (out, aux)
+        # signature by returning an inert zero term.
         return torch.zeros((), device=device, dtype=dtype)
 
     @torch.no_grad()
@@ -352,7 +350,7 @@ class DSALTAttention(nn.Module):
 
                 full_mask = in_win.unsqueeze(0) | in_lmk
             else:
-                # Fallback senza Triton: maschera densa condivisa tra le head [T0, T0]
+                # Fallback without Triton: dense mask shared across heads [T0, T0]
                 full_mask = _build_mask_packed(
                     x[s0:e0], w0, self.v_proj.weight.detach(),
                     alpha0, cu0, T0, self.k_lmk, self.head_dim, device,

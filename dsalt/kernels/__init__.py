@@ -18,24 +18,29 @@ from .sparse_attn import (
     sparse_attention_forward_packed,
 )
 
-# I kernel Triton sono opzionali: senza Triton/CUDA la libreria resta
-# importabile e usa il fallback SDPA (sparse_attn). Gli oggetti Triton
-# valgono ``None`` quando il backend non è disponibile.
+# The Triton kernels are optional: without Triton/CUDA the library stays
+# importable and uses the SDPA fallback (sparse_attn). The Triton objects are
+# ``None`` when the backend is unavailable.
 try:
     from .dsalt_triton_bwd import dsalt_triton_backward
     from .dsalt_triton_attn import dsalt_triton_attention
     from .cross_entropy import LigerFusedLinearCrossEntropyFunction
+    from .autotune import autotune_blocks, get_tuned_config
     _TRITON_OK = True
 except Exception:
     dsalt_triton_backward                 = None
     dsalt_triton_attention                = None
     LigerFusedLinearCrossEntropyFunction  = None
+    autotune_blocks                       = None
+    get_tuned_config                      = None
     _TRITON_OK = False
 
 __all__ = [
     "dsalt_triton_backward",
     "LigerFusedLinearCrossEntropyFunction",
     "dsalt_triton_attention",
+    "autotune_blocks",
+    "get_tuned_config",
     "RMSENorm",
     "compute_window_sizes",
     "build_local_window_mask",

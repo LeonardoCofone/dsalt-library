@@ -4,43 +4,43 @@
         ├── README.md
     └── 📁dsalt
         ├── 📁kernels
-        │    ├── __init__.py          # Espone le funzioni di basso livello (scoring e masking)
-        │    ├── landmark_tokens_ker.py # Logica di selezione dei Landmark (Energy-based scoring + Top-K)
-        │    ├── RMSENorm.py          # Implementazione della Root Mean Square Layer Normalization (stabilità)
-        │    ├── sparse_attn.py       # Funzioni atomiche per il calcolo dell'attenzione sparsa (logica core)
-        │    ├── window_utils.py      # Utility per gestire la sliding window (masking, padding, indici relativi)  
-        │    ├── dsalt_triton_attn.py      #triton  
-        │    ├── dsalt_triton_bwd.py      #triton backend 
-        │    ├── cross_entropy.py      #cross entropy fused da: # https://github.com/linkedin/Liger-Kernel
+        │    ├── __init__.py          # Exposes the low-level functions (scoring, masking, kernels)
+        │    ├── landmark_tokens_ker.py # Landmark selection logic (hybrid-energy scoring + Top-K)
+        │    ├── RMSENorm.py          # Root Mean Square Layer Normalization (stability)
+        │    ├── sparse_attn.py       # SDPA-based sparse attention (CPU/GPU fallback path)
+        │    ├── window_utils.py      # Sliding-window utilities (masking, RoPE cache, relative indices)
+        │    ├── dsalt_triton_attn.py # Triton forward kernel + autograd Function
+        │    ├── dsalt_triton_bwd.py  # Triton backward kernel
+        │    ├── autotune.py          # One-shot block-size autotuning (per head_dim, GPU)
+        │    ├── cross_entropy.py     # Fused cross-entropy, adapted from https://github.com/linkedin/Liger-Kernel
         │
         ├── 📁model
-        │    ├── __init__.py          # Inizializzazione del namespace del modello  
+        │    ├── __init__.py          # Model namespace initialization
         │    ├── config.py            # DSALTConfig + from_config
-        │    ├── dsalt_lm.py          # Definizione della classe Language Model (Causal LM head + Wrapper)
+        │    ├── dsalt_lm.py          # Language Model class (causal LM head + wrapper)
         │
         ├── 📁modules
-        │    ├── __init__.py          # Espone i blocchi del Transformer
-        │    ├── dsalt_attention.py   # Implementazione dell'attenzione DSALT (Window + Landmark fusion)
-        │    ├── dsalt_transformer.py # Definizione del Transformer Block e della struttura a strati (Encoder/Decoder)
+        │    ├── __init__.py          # Exposes the Transformer blocks
+        │    ├── dsalt_attention.py   # DSALT attention implementation (window + landmark fusion)
+        │    ├── dsalt_transformer.py # Transformer block and SwiGLU FFN
         │
         ├── 📁training
-        │    ├── __init__.py          # Utility per l'avvio del loop di training
-        │    ├── gpu_auto.py          # Rilevamento hardware, setup DDP (DistributedDataParallel) e allocazione VRAM
-        │    ├── logging_config.py    # Configurazione di WandB/Tensorboard per monitorare Loss e Rank Collapse
-        │    ├── trainer.py           # Loop di allenamento, backpropagation, checkpointing e scheduling LR
+        │    ├── __init__.py          # Exposes the training loop entry point
+        │    ├── gpu_auto.py          # Hardware detection, DDP setup, VRAM stats
+        │    ├── logging_config.py    # ANSI step formatter, file logging, StepTimer (it/s, tok/s)
+        │    ├── trainer.py           # Training loop, backprop, checkpointing, LR scheduling, metrics
         │
-        ├── __init__.py               # Versione della libreria e import principali
-        └── py.typed                  # Marcatore per indicare a mypy che il pacchetto supporta il type hinting
+        ├── __init__.py               # Library version and top-level imports
+        └── py.typed                  # Marker telling mypy the package ships type hints
     ├── .env
     ├── .gitignore
-    ├── CHANGELOG.md
     ├── CONTRIBUTING.md
     ├── FEATURE.md
     ├── LICENSE
-    ├── Makefile
     ├── MANIFEST.in
     ├── pyproject.toml
     ├── README.md
+    ├── release.ps1
     ├── requirements-dev.txt
     ├── requirements.txt
     ├── setup.py
@@ -49,11 +49,12 @@
 
 
 
-COME SONO USATI I FILES IN KERNELS?:
-window_utils.py -> usato in dsalt_attention.py
-sparse_attn.py -> usato in dsalt_attention.py
-landmark_tokens_ker.py -> NON USATO (boh)
-cross_entropy.py -> dsalt_lm.py
-dsalt_triton_attn.py -> dsalt_attention.py
-dsalt_triton_bwd.py -> NON USATO AL MOMENTO
-RMSENorm.py -> dsalt_transformer.py e dsalt_lm.py
+HOW ARE THE FILES IN kernels/ USED?
+window_utils.py        -> used in dsalt_attention.py
+sparse_attn.py         -> used in dsalt_attention.py
+landmark_tokens_ker.py -> used in dsalt_triton_attn.py and dsalt_attention.py
+cross_entropy.py       -> used in dsalt_lm.py
+dsalt_triton_attn.py   -> used in dsalt_attention.py
+dsalt_triton_bwd.py    -> used in dsalt_triton_attn.py
+autotune.py            -> used in dsalt_triton_attn.py and dsalt_triton_bwd.py
+RMSENorm.py            -> used in dsalt_transformer.py and dsalt_lm.py
