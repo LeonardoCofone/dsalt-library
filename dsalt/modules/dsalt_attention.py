@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 
 from ..kernels.window_utils import (
-    compute_window_sizes,
     build_local_window_mask,
     build_local_window_mask_packed,
     build_rope_cache,
@@ -92,6 +91,117 @@ def _landmark_ste_term(
     return sel_w.sum() / denom
 
 
+def _window_ste_term(
+    w_tilde:    torch.Tensor,
+    v:          torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    n_min:      int,
+    band:       int   = 8,
+    tau:        float = 1.0,
+) -> torch.Tensor:
+    """Soft-edge straight-through gradient term for the window predictor (§4.2).
+
+    The attention mask uses the *hard* window ``round(w̃(i))`` (built inside the
+    kernel), which is non-differentiable in ``win_gate``. To let gradients flow
+    through the window-size predictor — exactly the continuous relaxation the
+    paper prescribes — we attach a soft-edge term defined on a narrow band of
+    tokens around each query's window boundary ``j ≈ i - w̃(i)``.
+
+    For a query ``i`` and a boundary-band token ``j``, the soft membership
+    ``g(i,j) = σ((w̃(i) - (i - j)) / τ)`` smoothly turns on as ``j`` enters the
+    window. We weight it by the value norm ``‖v_j‖`` (output sensitivity, the
+    same signal as §4.3): if tokens just outside the window carry large value
+    mass, the gradient pushes ``w̃`` to expand; if the boundary tokens are inert,
+    it lets ``w̃`` shrink. The term is returned as a scalar to be added as
+    ``term - term.detach()`` so the forward output is numerically unchanged.
+
+    Cost is ``O(T · band)``: only a thin band around each boundary is touched,
+    never the full ``[T, T]`` matrix.
+    """
+    device   = w_tilde.device
+    total    = w_tilde.shape[0]
+    num_seqs = cu_seqlens.shape[0] - 1
+    lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+    starts   = cu_seqlens[:-1].to(device)
+    seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+    seq_off  = (torch.arange(total, device=device) - starts[seq_ids]).float()  # i within seq
+
+    # Value-norm proxy of each token's output contribution: ‖v_j‖ over head·dim.
+    v_norm = v.reshape(total, -1).norm(dim=-1).detach()             # [T], grad must reach win_gate, not v
+
+    # The band is at FIXED integer distances d around the current (detached) window
+    # edge. Crucially d does not depend on w̃, otherwise the dependence would cancel
+    # inside g and no gradient would reach win_gate. Only g(i,d) below depends on w̃.
+    d_center = w_tilde.detach().round()                            # [T], constant
+    offs     = torch.arange(-band, band + 1, device=device).float()  # [2B+1]
+    dist     = d_center.unsqueeze(1) + offs.unsqueeze(0)           # [T, 2B+1] distances i-j (fixed)
+
+    j_local  = seq_off.unsqueeze(1) - dist                         # token position j = i - d
+    j_round  = j_local.round().long()
+    j_abs    = starts[seq_ids].unsqueeze(1) + j_round             # absolute index into the packed buffer
+
+    # Valid band tokens: inside the same sequence, strictly below the query (causal),
+    # and outside the always-on local core n_min (those never gate).
+    in_seq   = (j_round >= 0) & (j_round.float() < lens[seq_ids].unsqueeze(1).float())
+    causal   = j_round.float() < seq_off.unsqueeze(1)
+    gated    = dist > n_min
+    band_ok  = in_seq & causal & gated
+
+    # Soft membership g(i,d) = σ((w̃(i) - d) / τ): turns on as the window grows past
+    # distance d. Differentiable in w̃ (d is constant), so the gradient pushes w̃ to
+    # expand toward high-value boundary tokens and shrink away from inert ones.
+    g        = torch.sigmoid((w_tilde.unsqueeze(1) - dist) / tau)  # [T, 2B+1]
+
+    j_safe   = j_abs.clamp(min=0, max=total - 1)
+    contrib  = g * v_norm[j_safe]                                   # [T, 2B+1]
+    contrib  = torch.where(band_ok, contrib, torch.zeros_like(contrib))
+
+    denom = band_ok.sum().clamp(min=1)
+    return contrib.sum() / denom
+
+
+def _select_landmarks_for_ste(
+    x:          torch.Tensor,
+    v_weight:   torch.Tensor,
+    alpha:      torch.Tensor,
+    w_sizes:    torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    k_lmk:      int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch landmark selection for the SDPA fallback's alpha STE.
+
+    Mirrors the selection of the Triton path (``_compute_landmark_indices``) but
+    without importing the Triton module, so it is available even when Triton is
+    absent. Returns sequence-local landmark indices ``[n_heads, num_seqs, k_lmk]``
+    (``-1`` = padding) and the standardised signals ``z_x [T]`` / ``z_v [T, H]``
+    needed to rebuild the differentiable score in :func:`_landmark_ste_term`.
+    """
+    device   = x.device
+    total    = x.shape[0]
+    n_heads  = alpha.shape[0]
+    dh       = v_weight.shape[0] // n_heads
+    num_seqs = cu_seqlens.shape[0] - 1
+    lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+    starts   = cu_seqlens[:-1].to(device)
+    seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+    seq_off  = torch.arange(total, device=device) - starts[seq_ids]
+    max_len  = int(lens.max())
+
+    scores, z_x, z_v = hybrid_scores_per_head(x, v_weight, alpha, n_heads, dh)
+
+    covered    = seq_off < w_sizes.long()
+    scores_fil = scores.masked_fill(covered.unsqueeze(1), float("-inf"))
+
+    score_pad = torch.full((n_heads, num_seqs, max_len), float("-inf"), device=device)
+    score_pad[:, seq_ids, seq_off] = scores_fil.T
+    k_eff           = min(k_lmk, max_len)
+    top_val, top_lc = torch.topk(score_pad, k_eff, dim=2, sorted=False)
+    out = torch.full((n_heads, num_seqs, k_lmk), -1, dtype=torch.long, device=device)
+    valid = torch.isfinite(top_val)
+    out[:, :, :k_eff] = torch.where(valid, top_lc, torch.full_like(top_lc, -1))
+    return out, z_x, z_v
+
+
 @torch.no_grad()
 def _build_mask_batched(
     x:        torch.Tensor,
@@ -176,16 +286,19 @@ class DSALTAttention(nn.Module):
     """DSALT sparse attention: adaptive local window + global landmark tokens (§4).
 
     Each query's attention set is ``A(i) = W(i) ∪ L(i)``: a causal local window of
-    **fixed** size ``(n_min+n_max)//2`` (§4.2) joined with a small set of landmarks
-    selected by hybrid energy (learnable per-head ``alpha_w``, §4.3).
+    **adaptive** size ``w(i) = n_min + σ(f(x_i))·(n_max-n_min)`` (§4.2), predicted
+    per token by the learned ``win_gate`` ``f``, joined with a small set of
+    landmarks selected by hybrid energy (learnable per-head ``alpha_w``, §4.3).
 
     Two paths:
       * **packed** (``cu_seqlens`` provided) → Triton kernel ``dsalt_triton_attention``
         in training, with a masked SDPA fallback if Triton is unavailable;
       * **batched** (``[B, T, d]``) → SDPA over a dense mask, used at inference.
 
-    Implementation note: the window is frozen to a constant value (no learnable
-    parameter); the demonstrated adaptivity is that of the per-head ``alpha``.
+    The attention mask uses the hard (rounded/floored) window, so two
+    straight-through terms are added to the output — value zero, nonzero gradient —
+    to keep both the window predictor ``f`` (§4.2) and ``alpha`` (§4.3) learnable
+    without perturbing the forward numerics.
 
     In ``eval`` it stores in ``_last_P`` the dense attention matrix of the first
     sequence, used by the trainer's rank/entropy/attention-sink metrics.
@@ -222,6 +335,12 @@ class DSALTAttention(nn.Module):
         self.v_proj   = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
+        # §4.2 adaptive local window: learned linear projection f: R^d -> R that
+        # predicts, per token, the window size w(i) = n_min + σ(f(x_i))·(n_max-n_min).
+        # f is computed from the hidden state inherited from the previous layer
+        # (the block input), so there is no circular dependency on this layer.
+        self.win_gate = nn.Linear(d_model, 1, bias=True)
+
         self.alpha_w = nn.Parameter(torch.full((n_heads,), math.log(0.6 / 0.4)))
         self._last_P: torch.Tensor | None = None
 
@@ -232,6 +351,20 @@ class DSALTAttention(nn.Module):
     def _alpha(self) -> torch.Tensor:
         return torch.sigmoid(self.alpha_w)
 
+    def _window_continuous(self, x: torch.Tensor) -> torch.Tensor:
+        """Continuous relaxation w̃(i) of the adaptive window size (§4.2).
+
+        ``w̃(i) = n_min + σ(f(x_i))·(n_max - n_min)`` with ``f`` the per-layer
+        ``win_gate``. Differentiable in ``f``; used both as the (rounded) window
+        passed to the kernel and as the soft-edge signal of the straight-through
+        term that lets gradients reach ``win_gate``.
+
+        ``x`` is the block input (hidden state from layer ``l-1``), so the window
+        of layer ``l`` does not depend on this layer's output.
+        """
+        win_logits = self.win_gate(x).squeeze(-1)          # [T]
+        return self.n_min + torch.sigmoid(win_logits) * (self.n_max - self.n_min)
+
     @torch.no_grad()
     def _rope(self, n: int, device: torch.device):
         max_n = self.rope_cos.shape[0]
@@ -240,8 +373,9 @@ class DSALTAttention(nn.Module):
         return self.rope_cos.to(device), self.rope_sin.to(device)
 
     def _aux_zero(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        # Frozen window: no auxiliary loss on the window. We keep the (out, aux)
-        # signature by returning an inert zero term.
+        # The window/landmark predictors learn through straight-through terms added
+        # to the output (§4.2/§4.3), not through a separate auxiliary loss. We keep
+        # the (out, aux) signature by returning an inert zero term.
         return torch.zeros((), device=device, dtype=dtype)
 
     @torch.no_grad()
@@ -279,7 +413,12 @@ class DSALTAttention(nn.Module):
         q, k     = apply_rotary_emb(q, k, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0))
 
         x_1b    = x[0] if B > 1 else x.squeeze(0)
-        w_sizes = compute_window_sizes(x_1b, self.n_min, self.n_max)
+        # §4.2 adaptive window. Floor is applied only at inference (the common
+        # case for this batched path); in training we keep the rounded relaxation
+        # and route the gradient to win_gate via the straight-through term below.
+        w_tilde = self._window_continuous(x_1b)             # [T], differentiable
+        w_sizes = (w_tilde.detach().floor() if not self.training
+                   else w_tilde.detach().round()).clamp(min=1)
         alpha   = self._alpha()
         aux     = self._aux_zero(x.device, x.dtype)
 
@@ -289,6 +428,13 @@ class DSALTAttention(nn.Module):
         )
 
         out = sparse_attention_forward(q, k, v, attn_mask, self.dropout, self.training)
+
+        if self.training:
+            cu_1b = torch.tensor([0, T], dtype=torch.int32, device=device)
+            v_flat = v[0].transpose(0, 1) if B > 1 else v.squeeze(0).transpose(0, 1)  # [T, H, D]
+            if any(p.requires_grad for p in self.win_gate.parameters()):
+                ste_w = _window_ste_term(w_tilde, v_flat, cu_1b, self.n_min)
+                out = out + (ste_w - ste_w.detach()).view(1, 1, 1, 1)
 
         if not self.training:
             scale    = 1.0 / math.sqrt(self.head_dim)
@@ -317,7 +463,10 @@ class DSALTAttention(nn.Module):
             cos, sin = rope_cs
         q, k = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
 
-        w_sizes = compute_window_sizes(x, self.n_min, self.n_max)
+        # §4.2 adaptive window: continuous w̃(i) (differentiable in win_gate) and
+        # the discrete window actually used to build the (hard) attention mask.
+        w_tilde = self._window_continuous(x)               # [T], differentiable
+        w_sizes = w_tilde.detach().round().clamp(min=1)     # [T], fed to the kernel
         alpha   = self._alpha()
         aux     = self._aux_zero(x.device, x.dtype)
 
@@ -334,11 +483,17 @@ class DSALTAttention(nn.Module):
             out = dsalt_triton_attention(
                 q, k, v, lmk_indices, lmk_bias, w_sizes, cu_seqlens,
             )
-            # Straight-through term: keeps alpha learnable (§4.3) without
-            # perturbing the forward output (term - term.detach() == 0 in value).
-            if self.training and alpha.requires_grad:
-                ste = _landmark_ste_term(alpha, z_x, z_v, lmk_indices, cu_seqlens)
-                out = out + (ste - ste.detach())
+            # Straight-through terms: keep alpha (§4.3) and the window predictor
+            # (§4.2) learnable without perturbing the forward output. Each term is
+            # added as (term - term.detach()), so its value is 0 while its gradient
+            # reaches alpha_w / win_gate respectively.
+            if self.training:
+                if alpha.requires_grad:
+                    ste_a = _landmark_ste_term(alpha, z_x, z_v, lmk_indices, cu_seqlens)
+                    out = out + (ste_a - ste_a.detach())
+                if any(p.requires_grad for p in self.win_gate.parameters()):
+                    ste_w = _window_ste_term(w_tilde, v, cu_seqlens, self.n_min)
+                    out = out + (ste_w - ste_w.detach())
         else:
             attn_mask = _build_mask_packed(
                 x, w_sizes, self.v_proj.weight.detach(),
@@ -348,6 +503,19 @@ class DSALTAttention(nn.Module):
             out = sparse_attention_forward_packed(
                 q, k, v, attn_mask, self.dropout, self.training,
             )
+            # Same straight-through terms as the Triton path (§4.2/§4.3), so the
+            # SDPA fallback also keeps win_gate and alpha learnable.
+            if self.training:
+                if any(p.requires_grad for p in self.win_gate.parameters()):
+                    ste_w = _window_ste_term(w_tilde, v, cu_seqlens, self.n_min)
+                    out = out + (ste_w - ste_w.detach())
+                if alpha.requires_grad:
+                    lmk_idx, z_x, z_v = _select_landmarks_for_ste(
+                        x.detach(), self.v_proj.weight.detach(),
+                        alpha.detach(), w_sizes, cu_seqlens, self.k_lmk,
+                    )
+                    ste_a = _landmark_ste_term(alpha, z_x, z_v, lmk_idx, cu_seqlens)
+                    out = out + (ste_a - ste_a.detach())
 
         if not self.training:
             s0    = int(cu_seqlens[0])
