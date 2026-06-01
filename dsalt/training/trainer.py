@@ -343,9 +343,11 @@ class DSALTTrainer:
         for name, p in base.named_parameters():
             if not p.requires_grad:
                 continue
-            # DSALT predictors (§4.2 window gate, §4.3 alpha): higher lr, no decay,
-            # as in the reference setup. These learn through straight-through terms
-            # and benefit from a faster, unregularised update.
+            # alpha_w (§4.3) and win_gate (§4.2) are selection parameters used only
+            # inside non-differentiable ops (top-k / window mask): they receive no
+            # gradient and stay at init, exactly as in the reference setup. They are
+            # still routed to a no-decay group so a future trainable variant would
+            # be handled sensibly; AdamW simply skips params whose grad is None.
             if "alpha_w" in name or "win_gate" in name:
                 dsalt_params.append(p)
             elif p.ndim < 2 or any(k in name for k in ("norm", "bias", "embed")):
@@ -605,7 +607,7 @@ class DSALTTrainer:
                 self.optimizer.step()
 
             gn_val = grad_norm.item() if grad_norm is not None else 0.0
-            if self.rank == 0:
+            if self.rank == 0 and self.global_step%5==0:
                 print(f"Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
 
             self.scheduler.step()
