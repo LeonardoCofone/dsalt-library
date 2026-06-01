@@ -166,11 +166,24 @@ def compute_metrics(
         attn_sink = last_attn._last_P.float()[:, :, 0].mean().item()
 
     alpha_per_head = []
+    alpha_flat = []
     for li, layer in enumerate(m.layers):
         attn = layer.attn
         if hasattr(attn, "alpha_w"):
-            av = torch.sigmoid(attn.alpha_w).detach().cpu().tolist()
-            alpha_per_head.append(av)
+            a = torch.sigmoid(attn.alpha_w).detach().cpu()
+            alpha_per_head.append(a.tolist())
+            alpha_flat.append(a)
+
+    # Synthetic view of alpha (§4.3 learnable per-head): min/max/mean across all
+    # layers and heads. Lets us see at a glance whether the straight-through is
+    # actually moving alpha away from its init (sigmoid(logit(0.6)) ≈ 0.6).
+    if alpha_flat:
+        a_all      = torch.cat(alpha_flat)
+        alpha_min  = a_all.min().item()
+        alpha_max  = a_all.max().item()
+        alpha_mean = a_all.mean().item()
+    else:
+        alpha_min = alpha_max = alpha_mean = float("nan")
 
     oow_mass_per_layer = []
     for li, layer in enumerate(m.layers):
@@ -204,6 +217,9 @@ def compute_metrics(
         "res_per_layer": res_per_layer,
         "token_dist_per_layer": token_dist_per_layer,
         "alpha_per_head": alpha_per_head,
+        "alpha_min": alpha_min,
+        "alpha_max": alpha_max,
+        "alpha_mean": alpha_mean,
         "oow_mass_per_layer": oow_mass_per_layer,
     }
 
@@ -315,7 +331,8 @@ class DSALTTrainer:
             "noise_norm", "token_dist", "head_spec_std", "attn_sink",
             "sigma2_per_layer", "entropy_per_layer", "noise_per_layer",
             "eff_rank_per_layer", "res_per_layer", "token_dist_per_layer",
-            "alpha_per_head", "oow_mass_per_layer",
+            "alpha_per_head", "alpha_min", "alpha_max", "alpha_mean",
+            "oow_mass_per_layer",
             "val_ppl", "val_steps", "gpu_mem_gb", "it_s", "tok_s",
         ]}
         #print(f"--- [trainer] DSALTTrainer init DONE")
@@ -522,7 +539,9 @@ class DSALTTrainer:
             f"H={_fs(metrics['attn_entropy'])} | "
             f"noise={_fs(metrics['noise_norm'])} | "
             f"sink={_fs(metrics['attn_sink'])} | "
-            f"head_std={_fs(metrics['head_spec_std'])}"
+            f"head_std={_fs(metrics['head_spec_std'])} | "
+            f"α=[{_fs(metrics['alpha_min'])},{_fs(metrics['alpha_max'])}] "
+            f"μ={_fs(metrics['alpha_mean'])}"
         )
         #print(f"--- [trainer] _log_step | {msg}")
 
@@ -540,7 +559,8 @@ class DSALTTrainer:
                   "token_dist", "head_spec_std", "attn_sink",
                   "sigma2_per_layer", "entropy_per_layer", "noise_per_layer",
                   "eff_rank_per_layer", "res_per_layer", "token_dist_per_layer",
-                  "alpha_per_head", "oow_mass_per_layer"]:
+                  "alpha_per_head", "alpha_min", "alpha_max", "alpha_mean",
+                  "oow_mass_per_layer"]:
             self.history[k].append(metrics[k])
 
     def train(self):
@@ -602,8 +622,8 @@ class DSALTTrainer:
                 self.optimizer.step()
 
             gn_val = grad_norm.item() if grad_norm is not None else 0.0
-            if self.rank == 0:
-                print(f"Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
+            #if self.rank == 0:
+                #print(f"Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
 
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)

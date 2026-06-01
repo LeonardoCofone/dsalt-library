@@ -35,26 +35,61 @@ def _hybrid_scores(
     scores, _, _ = hybrid_scores_per_head(x, W_V, alpha, n_heads, dh)
     return scores
 
-def _landmark_bias_grad_alpha(
+def _landmark_ste_term(
     alpha:       torch.Tensor,
     z_x:         torch.Tensor,
     z_v:         torch.Tensor,
     lmk_indices: torch.Tensor,
     cu_seqlens:  torch.Tensor,
 ) -> torch.Tensor:
+    """Straight-through gradient term for the per-head ``alpha`` (§4.3).
+
+    The landmark set is selected by a hard top-k over the hybrid energy score
+    ``s = alpha * z_v + (1 - alpha) * z_x`` (eq. 30), which is non-differentiable
+    in ``alpha`` (it is an ``argmax``). The attention itself stays exactly the
+    paper's ``A(i) = W(i) ∪ L(i)`` (eq. 32): the score does **not** bias the
+    attention logits.
+
+    To keep ``alpha`` learnable as the paper requires, we route a gradient
+    through a straight-through estimator. We return a scalar that depends on
+    ``alpha`` differentiably and equals zero in the forward pass (so it does not
+    perturb the output numerically): the mean ``softmax(s)`` mass that falls on
+    the landmarks actually selected, minus its own detached value. Maximising it
+    pushes each head's ``alpha`` toward the trade-off (output sensitivity vs.
+    representational persistence) that makes the chosen landmarks stand out among
+    the candidates, which is exactly the per-head adaptivity of §4.3.
+
+    Returns a scalar tensor to be added (as ``term - term.detach()``) to the loss
+    path so the forward value is unchanged.
+    """
     T       = z_v.shape[0]
     n_heads = alpha.shape[0]
     device  = z_v.device
 
+    # Live (differentiable) hybrid score for every token and head: [T, H].
     scores_live = alpha * z_v + (1.0 - alpha) * z_x.unsqueeze(1)
 
-    starts  = cu_seqlens[:-1].to(device)
-    abs_idx = (starts[None, :, None] + lmk_indices.clamp(min=0)).clamp(max=T - 1)
-    h_idx   = torch.arange(n_heads, device=device)[:, None, None].expand_as(abs_idx)
-    gathered = scores_live[abs_idx, h_idx]
+    # Per-sequence softmax over candidate tokens, then gather the selected ones.
+    num_seqs = cu_seqlens.shape[0] - 1
+    starts   = cu_seqlens[:-1].to(device)
+    lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+    seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+    seq_off  = torch.arange(T, device=device) - starts[seq_ids]
+    max_len  = int(lens.max())
 
-    bias = torch.nn.functional.logsigmoid(gathered)
-    return torch.where(lmk_indices >= 0, bias, torch.zeros_like(bias))
+    # Pad scores to [H, num_seqs, max_len] so the softmax stays within a sequence.
+    score_pad = torch.full((n_heads, num_seqs, max_len), float("-inf"), device=device)
+    score_pad[:, seq_ids, seq_off] = scores_live.T
+    weights = torch.softmax(score_pad, dim=2)  # [H, num_seqs, max_len]
+
+    # lmk_indices: [H, num_seqs, k_lmk], sequence-local positions (-1 = padding).
+    valid    = lmk_indices >= 0
+    safe_idx = lmk_indices.clamp(min=0, max=max_len - 1)
+    sel_w    = torch.gather(weights, 2, safe_idx)        # [H, num_seqs, k_lmk]
+    sel_w    = torch.where(valid, sel_w, torch.zeros_like(sel_w))
+
+    denom = valid.sum().clamp(min=1)
+    return sel_w.sum() / denom
 
 
 @torch.no_grad()
@@ -292,12 +327,18 @@ class DSALTAttention(nn.Module):
                 alpha.detach().float(), w_sizes,
                 cu_seqlens, self.k_lmk, self.n_min, total_len,
             )
-            lmk_bias = _landmark_bias_grad_alpha(
-                alpha, z_x, z_v, lmk_indices, cu_seqlens,
-            )
+            # The attention matrix is the pure A(i) = W(i) ∪ L(i) of the paper
+            # (eq. 32): the hybrid score only *selects* the landmarks, it does not
+            # bias the logits. We pass a zero bias to the kernel.
+            lmk_bias = torch.zeros_like(lmk_indices, dtype=torch.float32)
             out = dsalt_triton_attention(
                 q, k, v, lmk_indices, lmk_bias, w_sizes, cu_seqlens,
             )
+            # Straight-through term: keeps alpha learnable (§4.3) without
+            # perturbing the forward output (term - term.detach() == 0 in value).
+            if self.training and alpha.requires_grad:
+                ste = _landmark_ste_term(alpha, z_x, z_v, lmk_indices, cu_seqlens)
+                out = out + (ste - ste.detach())
         else:
             attn_mask = _build_mask_packed(
                 x, w_sizes, self.v_proj.weight.detach(),
