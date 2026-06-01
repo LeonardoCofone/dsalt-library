@@ -323,9 +323,12 @@ class DSALTTrainer:
         if self.device.type != "cuda":
             return None
         if mixed_precision == "auto":
-            # bf16 su GPU con supporto nativo (sm_80+: A100/H100/L4/...),
-            # fp16 altrimenti (es. T4 sm_75, dove bf16 è emulato/lento).
-            mixed_precision = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+            # bf16 solo su GPU con supporto HW nativo (sm_80+: A100/H100/L4/...).
+            # NB: torch.cuda.is_bf16_supported() ritorna True anche su sm_75 (T4),
+            # dove bf16 è emulato in SW e non compila → controlliamo la compute
+            # capability direttamente.
+            major, _ = torch.cuda.get_device_capability(self.device)
+            mixed_precision = "bf16" if major >= 8 else "fp16"
         if mixed_precision == "bf16":
             return torch.bfloat16
         if mixed_precision == "fp16":
