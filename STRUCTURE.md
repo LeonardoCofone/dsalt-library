@@ -14,7 +14,8 @@
         │    ├── cross_entropy.py      #cross entropy fused da: # https://github.com/linkedin/Liger-Kernel
         │
         ├── 📁model
-        │    ├── __init__.py          # Inizializzazione del namespace del modello
+        │    ├── __init__.py          # Inizializzazione del namespace del modello  
+        │    ├── config.py            # DSALTConfig + from_config
         │    ├── dsalt_lm.py          # Definizione della classe Language Model (Causal LM head + Wrapper)
         │
         ├── 📁modules

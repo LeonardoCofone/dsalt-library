@@ -4,8 +4,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..kernels.RMSENorm          import RMSENorm
-from ..kernels.cross_entropy     import LigerFusedLinearCrossEntropyFunction
 from ..modules.dsalt_transformer import DSALTTransformerBlock
+from .config                     import DSALTConfig
+
+# Liger (cross-entropy fuso) richiede Triton: opzionale, importato a runtime
+# solo quando loss_fn="liger" è effettivamente richiesto.
+try:
+    from ..kernels.cross_entropy import LigerFusedLinearCrossEntropyFunction
+    _LIGER_OK = True
+except Exception:
+    LigerFusedLinearCrossEntropyFunction = None
+    _LIGER_OK = False
 
 
 def _chunked_cross_entropy(
@@ -49,6 +58,36 @@ _LOSS_FN = {
 
 
 class DSALTLMHeadModel(nn.Module):
+    """Language Model causale basato su DSALT (Dynamic Sparse Attention with Landmark Tokens).
+
+    Stack di :class:`~dsalt.modules.dsalt_transformer.DSALTTransformerBlock` con
+    embedding token, RMSNorm finale e testa LM (opzionalmente legata all'embedding).
+
+    L'input è atteso in formato **packed** (sequenze concatenate + ``cu_seqlens``),
+    il percorso ottimizzato per il training; il forward accetta anche tensori
+    ``[B, T]`` per inferenza.
+
+    Istanziare preferibilmente via :meth:`from_config` con una
+    :class:`~dsalt.model.config.DSALTConfig`.
+
+    Args:
+        vocab_size:         Dimensione del vocabolario.
+        d_model:            Dimensione del modello (deve essere divisibile per ``n_heads``).
+        n_layers:           Numero di blocchi Transformer.
+        n_heads:            Numero di attention head.
+        n_min, n_max:       Estremi della finestra locale adattiva (§4.2).
+        k_lmk:              Numero di landmark token per query (§4.3).
+        max_seq_len:        Lunghezza massima per la cache RoPE.
+        d_ff:               Dimensione FFN; se ``None`` usa ~8/3·d_model arrotondato.
+        dropout:            Probabilità di dropout.
+        yarn_scale:         Fattore di scala posizionale RoPE/YaRN.
+        tie_weights:        Lega i pesi della testa LM all'embedding.
+        padding_idx:        Indice di padding per l'embedding.
+        lm_head_chunk_size: Chunk per la cross-entropy "chunked" (memoria).
+        loss_fn:            ``"chunked"`` (default) o ``"liger"`` (richiede Triton).
+        aux_loss_weight:    Peso della loss ausiliaria sulla finestra/α.
+    """
+
     def __init__(
         self,
         vocab_size:         int,
@@ -70,6 +109,11 @@ class DSALTLMHeadModel(nn.Module):
     ):
         super().__init__()
         assert loss_fn in _LOSS_FN, f"loss_fn must be one of {list(_LOSS_FN)}"
+        if loss_fn == "liger" and not _LIGER_OK:
+            raise RuntimeError(
+                "loss_fn='liger' richiede il kernel Triton (cross_entropy fuso), "
+                "non disponibile in questo ambiente. Usa loss_fn='chunked'."
+            )
 
         self.d_model            = d_model
         self.n_layers           = n_layers
@@ -102,6 +146,11 @@ class DSALTLMHeadModel(nn.Module):
             self.lm_head.weight = self.embed_tokens.weight
 
         self._init_weights()
+
+    @classmethod
+    def from_config(cls, config: "DSALTConfig") -> "DSALTLMHeadModel":
+        """Istanzia il modello da una :class:`~dsalt.model.config.DSALTConfig`."""
+        return cls(**config.to_dict())
 
     def _init_weights(self):
         nn.init.normal_(self.embed_tokens.weight, std=0.02)

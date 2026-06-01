@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 
 from .dsalt_triton_bwd import dsalt_triton_backward
+from .landmark_tokens_ker import hybrid_scores_per_head
 
 
 _SEQ_BLOCK_MAP_CACHE: dict = {}
@@ -213,14 +214,8 @@ def _build_seq_block_map(
     return result, total_blks
 
 def _score_block(x: torch.Tensor, W_V: torch.Tensor, alpha: torch.Tensor, n_heads: int, dh: int):
-    x_norm = x.norm(dim=-1).float()
-    z_x    = (x_norm - x_norm.mean()) / x_norm.std().clamp(min=1e-6)
-    xwv_h  = (x @ W_V.T).view(x.shape[0], n_heads, dh).norm(dim=-1).float()
-    mu_v   = xwv_h.mean(0, keepdim=True)
-    std_v  = xwv_h.std(0, keepdim=True).clamp(min=1e-6)
-    z_v    = (xwv_h - mu_v) / std_v
-    scores = alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)
-    return scores, z_x, z_v
+    # Fonte unica della formula: vedi kernels.landmark_tokens_ker
+    return hybrid_scores_per_head(x, W_V, alpha, n_heads, dh)
 
 
 def _compute_landmark_indices(

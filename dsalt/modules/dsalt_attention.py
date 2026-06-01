@@ -14,6 +14,7 @@ from ..kernels.sparse_attn import (
     sparse_attention_forward,
     sparse_attention_forward_packed,
 )
+from ..kernels.landmark_tokens_ker import hybrid_scores_per_head
 
 try:
     from ..kernels.dsalt_triton_attn import dsalt_triton_attention, _compute_landmark_indices
@@ -29,18 +30,10 @@ def _hybrid_scores(
     alpha: torch.Tensor,
     dh:    int,
 ) -> torch.Tensor:
-    T, d    = x.shape
-    n_heads = alpha.shape[0]
-
-    x_norm = x.norm(dim=-1)
-    z_x    = (x_norm - x_norm.mean()) / x_norm.std().clamp(min=1e-6)
-
-    xwv   = (x @ W_V.T).view(T, n_heads, dh).norm(dim=-1)
-    mu_v  = xwv.mean(0, keepdim=True)
-    std_v = xwv.std(0, keepdim=True).clamp(min=1e-6)
-    z_v   = (xwv - mu_v) / std_v
-
-    return alpha * z_v + (1 - alpha) * z_x.unsqueeze(1)
+    # Fonte unica della formula: vedi kernels.landmark_tokens_ker
+    n_heads      = alpha.shape[0]
+    scores, _, _ = hybrid_scores_per_head(x, W_V, alpha, n_heads, dh)
+    return scores
 
 def _landmark_bias_grad_alpha(
     alpha:       torch.Tensor,
@@ -145,6 +138,26 @@ def _build_mask_packed(
 
 
 class DSALTAttention(nn.Module):
+    """Attenzione sparsa DSALT: finestra locale adattiva + landmark token globali (§4).
+
+    L'insieme di attenzione di ogni query è ``A(i) = W(i) ∪ L(i)``: una finestra
+    locale causale di dimensione adattiva (predetta da ``window_proj``) unita a un
+    piccolo insieme di landmark selezionati per energia ibrida (``alpha_w``
+    per-head apprendibile, §4.3).
+
+    Due percorsi:
+      * **packed** (``cu_seqlens`` fornito) → kernel Triton ``dsalt_triton_attention``
+        in training, con fallback SDPA mascherato se Triton non è disponibile;
+      * **batched** (``[B, T, d]``) → SDPA su maschera densa, usato in inferenza.
+
+    Nota implementativa: in questa versione la dimensione della finestra entra
+    nel kernel **detached** (finestra "congelata" al valore d'init); l'adattività
+    dimostrata è quella di ``alpha`` per-head. Vedi ``COSE_CAMBIATE_DALLA_TEORIA.md``.
+
+    In ``eval`` salva in ``_last_P`` la matrice di attenzione densa della prima
+    sequenza, usata dalle metriche di rank/entropy/attention-sink del trainer.
+    """
+
     def __init__(
         self,
         d_model:     int,
@@ -310,34 +323,41 @@ class DSALTAttention(nn.Module):
             w0     = w_sizes_soft[s0:e0].detach()
             alpha0 = alpha.detach()
 
-            lmk_idx, _, _ = _compute_landmark_indices(
-                x[s0:e0].float().detach(),
-                self.v_proj.weight.float().detach(),
-                alpha0.float(),
-                w0.float(),
-                cu0,
-                self.k_lmk,
-                self.n_min,
-                T0,
-            )
+            if _TRITON_OK:
+                lmk_idx, _, _ = _compute_landmark_indices(
+                    x[s0:e0].float().detach(),
+                    self.v_proj.weight.float().detach(),
+                    alpha0.float(),
+                    w0.float(),
+                    cu0,
+                    self.k_lmk,
+                    self.n_min,
+                    T0,
+                )
 
-            rows = torch.arange(T0, device=device)
-            cols = torch.arange(T0, device=device)
-            w0l  = w0.long()
-            in_win = (
-                (cols.unsqueeze(0) >= (rows.unsqueeze(1) - w0l.unsqueeze(1) + 1)) &
-                (cols.unsqueeze(0) <= rows.unsqueeze(1))
-            )
+                rows = torch.arange(T0, device=device)
+                cols = torch.arange(T0, device=device)
+                w0l  = w0.long()
+                in_win = (
+                    (cols.unsqueeze(0) >= (rows.unsqueeze(1) - w0l.unsqueeze(1) + 1)) &
+                    (cols.unsqueeze(0) <= rows.unsqueeze(1))
+                )
 
-            lmk_abs   = lmk_idx[:, 0, :]
-            in_lmk    = torch.zeros(self.n_heads, T0, T0, dtype=torch.bool, device=device)
-            h_range   = torch.arange(self.n_heads, device=device)
-            for h in range(self.n_heads):
-                valid_pos = lmk_abs[h]
-                causal    = valid_pos.unsqueeze(0) <= rows.unsqueeze(1)
-                in_lmk[h].scatter_(1, valid_pos.unsqueeze(0).expand(T0, -1), causal)
+                lmk_abs   = lmk_idx[:, 0, :]
+                in_lmk    = torch.zeros(self.n_heads, T0, T0, dtype=torch.bool, device=device)
+                for h in range(self.n_heads):
+                    valid_pos = lmk_abs[h]
+                    causal    = valid_pos.unsqueeze(0) <= rows.unsqueeze(1)
+                    in_lmk[h].scatter_(1, valid_pos.unsqueeze(0).expand(T0, -1), causal)
 
-            full_mask = in_win.unsqueeze(0) | in_lmk
+                full_mask = in_win.unsqueeze(0) | in_lmk
+            else:
+                # Fallback senza Triton: maschera densa condivisa tra le head [T0, T0]
+                full_mask = _build_mask_packed(
+                    x[s0:e0], w0, self.v_proj.weight.detach(),
+                    alpha0, cu0, T0, self.k_lmk, self.head_dim, device,
+                ).unsqueeze(0).expand(self.n_heads, T0, T0)
+
             sc        = torch.matmul(q0, k0.transpose(-2, -1)) * scale
             additive  = sc.new_full((self.n_heads, T0, T0), float("-inf")).masked_fill_(full_mask, 0.0)
             self._last_P = torch.softmax(sc + additive, dim=-1).detach()
