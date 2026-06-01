@@ -1,15 +1,23 @@
-import time
 import torch
-import torch.nn as nn
 
 
 def compute_window_sizes(
     x_prev: torch.Tensor,
-    proj:   nn.Linear,
     n_min:  int,
     n_max:  int,
 ) -> torch.Tensor:
-    return n_min + torch.sigmoid(proj(x_prev).squeeze(-1)) * (n_max - n_min)
+    """Dimensione della finestra locale per token.
+
+    In questa versione la finestra è **congelata** al valore caratterizzato
+    ``(n_min + n_max) // 2`` (§4.2): nessun parametro apprendibile, nessuna
+    dipendenza dal grado di adattività per-token. L'adattività dimostrata del
+    modello è quella di ``alpha`` per-head nella selezione dei landmark (§4.3).
+
+    Restituisce un tensore costante ``[T]`` allineato a ``x_prev``.
+    """
+    T = x_prev.shape[0]
+    w = (n_min + n_max) // 2
+    return torch.full((T,), float(w), device=x_prev.device, dtype=torch.float32)
 
 
 def build_local_window_mask(

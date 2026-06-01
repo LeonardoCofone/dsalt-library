@@ -227,7 +227,7 @@ class DSALTTrainer:
         val_every: int = 500,
         save_every: int = 1000,
         save_dir: str = "./checkpoints_dsalt",
-        mixed_precision: str = "bf16",
+        mixed_precision: str = "auto",
         gradient_checkpointing: bool = False,
         compile_model: bool = False,
         ddp_backend: str = "nccl",
@@ -320,13 +320,16 @@ class DSALTTrainer:
         #print(f"--- [trainer] DSALTTrainer init DONE")
 
     def _resolve_amp_dtype(self, mixed_precision: str) -> torch.dtype | None:
-        if mixed_precision == "bf16" and self.device.type == "cuda":
-            #print(f"--- [trainer] AMP: bf16 selezionato")
+        if self.device.type != "cuda":
+            return None
+        if mixed_precision == "auto":
+            # bf16 su GPU con supporto nativo (sm_80+: A100/H100/L4/...),
+            # fp16 altrimenti (es. T4 sm_75, dove bf16 è emulato/lento).
+            mixed_precision = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+        if mixed_precision == "bf16":
             return torch.bfloat16
-        if mixed_precision == "fp16" and self.device.type == "cuda":
-            #print(f"--- [trainer] AMP: fp16 selezionato")
+        if mixed_precision == "fp16":
             return torch.float16
-        #print(f"--- [trainer] AMP: disabilitato (mixed_precision='{mixed_precision}' device={self.device.type})")
         return None
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
@@ -336,7 +339,7 @@ class DSALTTrainer:
         for name, p in base.named_parameters():
             if not p.requires_grad:
                 continue
-            if any(kw in name for kw in ["win_gate", "alpha_w", "window_proj"]):
+            if "alpha_w" in name:
                 dsalt_params.append(p)
             elif p.ndim < 2 or any(k in name for k in ("norm", "bias", "embed")):
                 nodecay.append(p)

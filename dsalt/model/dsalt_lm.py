@@ -85,7 +85,8 @@ class DSALTLMHeadModel(nn.Module):
         padding_idx:        Indice di padding per l'embedding.
         lm_head_chunk_size: Chunk per la cross-entropy "chunked" (memoria).
         loss_fn:            ``"chunked"`` (default) o ``"liger"`` (richiede Triton).
-        aux_loss_weight:    Peso della loss ausiliaria sulla finestra/α.
+        aux_loss_weight:    Peso del termine ausiliario (inerte: finestra congelata,
+                            mantenuto per compatibilità della firma).
     """
 
     def __init__(

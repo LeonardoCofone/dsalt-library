@@ -141,7 +141,7 @@ class DSALTAttention(nn.Module):
     """Attenzione sparsa DSALT: finestra locale adattiva + landmark token globali (§4).
 
     L'insieme di attenzione di ogni query è ``A(i) = W(i) ∪ L(i)``: una finestra
-    locale causale di dimensione adattiva (predetta da ``window_proj``) unita a un
+    locale causale di dimensione **fissa** ``(n_min+n_max)//2`` (§4.2) unita a un
     piccolo insieme di landmark selezionati per energia ibrida (``alpha_w``
     per-head apprendibile, §4.3).
 
@@ -150,9 +150,9 @@ class DSALTAttention(nn.Module):
         in training, con fallback SDPA mascherato se Triton non è disponibile;
       * **batched** (``[B, T, d]``) → SDPA su maschera densa, usato in inferenza.
 
-    Nota implementativa: in questa versione la dimensione della finestra entra
-    nel kernel **detached** (finestra "congelata" al valore d'init); l'adattività
-    dimostrata è quella di ``alpha`` per-head. Vedi ``COSE_CAMBIATE_DALLA_TEORIA.md``.
+    Nota implementativa: la finestra è congelata a un valore costante (nessun
+    parametro apprendibile); l'adattività dimostrata è quella di ``alpha``
+    per-head. Vedi ``COSE_CAMBIATE_DALLA_TEORIA.md``.
 
     In ``eval`` salva in ``_last_P`` la matrice di attenzione densa della prima
     sequenza, usata dalle metriche di rank/entropy/attention-sink del trainer.
@@ -184,11 +184,10 @@ class DSALTAttention(nn.Module):
         self.yarn_scale  = yarn_scale
         self.layer_idx   = layer_idx
 
-        self.q_proj      = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj      = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj      = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj    = nn.Linear(d_model, d_model, bias=False)
-        self.window_proj = nn.Linear(d_model, 1, bias=True)
+        self.q_proj   = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj   = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj   = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
         self.alpha_w = nn.Parameter(torch.full((n_heads,), math.log(0.6 / 0.4)))
         self._last_P: torch.Tensor | None = None
@@ -207,9 +206,10 @@ class DSALTAttention(nn.Module):
             return self.rope_cos[:n].to(device), self.rope_sin[:n].to(device)
         return self.rope_cos.to(device), self.rope_sin.to(device)
 
-    def _window_aux(self, w_sizes_soft: torch.Tensor) -> torch.Tensor:
-        alpha = self._alpha()
-        return (w_sizes_soft.mean() * alpha.mean())
+    def _aux_zero(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        # Finestra congelata: nessuna loss ausiliaria sulla finestra. Manteniamo
+        # la firma (out, aux) ritornando un termine nullo inerte.
+        return torch.zeros((), device=device, dtype=dtype)
 
     @torch.no_grad()
     def warmup(self, device: torch.device) -> None:
@@ -245,13 +245,13 @@ class DSALTAttention(nn.Module):
         cos, sin = self._rope(T, device)
         q, k     = apply_rotary_emb(q, k, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0))
 
-        x_1b         = x[0] if B > 1 else x.squeeze(0)
-        w_sizes_soft = compute_window_sizes(x_1b, self.window_proj, self.n_min, self.n_max)
-        alpha        = self._alpha()
-        aux          = self._window_aux(w_sizes_soft)
+        x_1b    = x[0] if B > 1 else x.squeeze(0)
+        w_sizes = compute_window_sizes(x_1b, self.n_min, self.n_max)
+        alpha   = self._alpha()
+        aux     = self._aux_zero(x.device, x.dtype)
 
         attn_mask = _build_mask_batched(
-            x_1b, w_sizes_soft.detach(), self.v_proj.weight.detach(),
+            x_1b, w_sizes, self.v_proj.weight.detach(),
             alpha.detach(), self.k_lmk, T, device,
         )
 
@@ -284,25 +284,25 @@ class DSALTAttention(nn.Module):
             cos, sin = rope_cs
         q, k = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
 
-        w_sizes_soft = compute_window_sizes(x, self.window_proj, self.n_min, self.n_max)
-        alpha        = self._alpha()
-        aux          = self._window_aux(w_sizes_soft)
+        w_sizes = compute_window_sizes(x, self.n_min, self.n_max)
+        alpha   = self._alpha()
+        aux     = self._aux_zero(x.device, x.dtype)
 
         if _TRITON_OK:
             lmk_indices, z_x, z_v = _compute_landmark_indices(
                 x.detach(), self.v_proj.weight.detach(),
-                alpha.detach().float(), w_sizes_soft.detach(),
+                alpha.detach().float(), w_sizes,
                 cu_seqlens, self.k_lmk, self.n_min, total_len,
             )
             lmk_bias = _landmark_bias_grad_alpha(
                 alpha, z_x, z_v, lmk_indices, cu_seqlens,
             )
             out = dsalt_triton_attention(
-                q, k, v, lmk_indices, lmk_bias, w_sizes_soft.detach(), cu_seqlens,
+                q, k, v, lmk_indices, lmk_bias, w_sizes, cu_seqlens,
             )
         else:
             attn_mask = _build_mask_packed(
-                x, w_sizes_soft.detach(), self.v_proj.weight.detach(),
+                x, w_sizes, self.v_proj.weight.detach(),
                 alpha.detach(), cu_seqlens, total_len,
                 self.k_lmk, self.head_dim, device,
             )
@@ -320,7 +320,7 @@ class DSALTAttention(nn.Module):
             T0    = e0 - s0
 
             cu0    = torch.tensor([0, T0], dtype=torch.int32, device=device)
-            w0     = w_sizes_soft[s0:e0].detach()
+            w0     = w_sizes[s0:e0]
             alpha0 = alpha.detach()
 
             if _TRITON_OK:
