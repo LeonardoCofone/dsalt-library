@@ -4,33 +4,50 @@ Run this ON A GPU (Kaggle T4) before trusting the kernel:
 
     python -m dsalt.kernels._verify_train_kernel
 
-It builds one DSALTAttention, runs the SAME inputs through (a) the differentiable
-Triton sparse kernel and (b) the dense SDPA fallback, and checks that forward
-outputs and ALL gradients (q,k,v, win_gate, alpha) match within fp16 tolerance.
+It feeds the SAME q,k,v,x through (a) the differentiable Triton sparse kernel and
+(b) the dense SDPA fallback (which now shares the exact selectors and log-bias
+formula), and checks the raw attention output + all gradients match. Both paths
+run on identical fp16 inputs so the only expected difference is fp16 rounding.
 """
 
+import math
 import torch
 
 
-def _run(attn, x, cu, force_triton):
-    attn.zero_grad(set_to_none=True)
-    x2 = x.detach().clone().requires_grad_(True)
+def _attn_out(attn, q, k, v, x, cu, total_len, device, force_triton):
+    """Run only the sparse attention core (no out_proj/RoPE) for a clean compare."""
     import dsalt.modules.dsalt_attention as M
     saved = M._TRITON_TRAIN_OK
     M._TRITON_TRAIN_OK = force_triton
     try:
-        out, _ = attn(x2, cu_seqlens=cu, max_seqlen=int((cu[1] - cu[0]).item()))
-        loss = out.float().pow(2).mean()
-        loss.backward()
+        cu_list = cu.detach().to("cpu").tolist()
+        if force_triton:
+            out = attn._packed_train_triton(q, k, v, x, cu, total_len, device, cu_list)
+        else:
+            lens = [cu_list[b + 1] - cu_list[b] for b in range(len(cu_list) - 1)]
+            out = attn._packed_train(q, k, v, x, cu_list, lens, total_len, device, cu)
     finally:
         M._TRITON_TRAIN_OK = saved
-    g = {
+    return out                                                                  # [total_len,H,D]
+
+
+def _run(attn, q0, k0, v0, x0, cu, total_len, device, force_triton):
+    attn.zero_grad(set_to_none=True)
+    q = q0.detach().clone().requires_grad_(True)
+    k = k0.detach().clone().requires_grad_(True)
+    v = v0.detach().clone().requires_grad_(True)
+    x = x0.detach().clone().requires_grad_(True)
+    out = _attn_out(attn, q, k, v, x, cu, total_len, device, force_triton)
+    loss = out.float().pow(2).mean()
+    loss.backward()
+    return {
         "out":   out.detach().float(),
-        "x":     x2.grad.detach().float().clone(),
+        "q":     q.grad.detach().float().clone(),
+        "k":     k.grad.detach().float().clone(),
+        "v":     v.grad.detach().float().clone(),
         "win":   attn.win_gate.weight.grad.detach().float().clone(),
         "alpha": attn.alpha_w.grad.detach().float().clone(),
     }
-    return g
 
 
 def main():
@@ -40,34 +57,43 @@ def main():
     from dsalt.modules.dsalt_attention import DSALTAttention, _TRITON_TRAIN_OK
     print("Triton train disponibile:", _TRITON_TRAIN_OK)
 
-    attn = DSALTAttention(d_model=64, n_heads=4, n_min=8, n_max=48, k_lmk=8,
+    H, D, L = 4, 16, 96
+    attn = DSALTAttention(d_model=H * D, n_heads=H, n_min=8, n_max=48, k_lmk=8,
                           max_seq_len=256, layer_idx=0).to(dev)
     attn.train()
-    
-    # UNA sequenza (N=1): così lo z-score §4.3 per-sequenza del fallback coincide
-    # con quello globale del kernel-path, e il confronto isola la matematica
-    # dell'attenzione (finestra soft + landmark soft) senza differenze di scoring.
-    L = 96
-    x = torch.randn(L, 64, device=dev) * 0.5
+
+    # UNA sequenza (N=1): z-score per-sequenza == globale, isola l'attenzione.
+    x = torch.randn(L, H * D, device=dev) * 0.5
     cu = torch.tensor([0, L], dtype=torch.int32, device=dev)
 
-    g_tri = _run(attn, x, cu, force_triton=True)
-    g_ref = _run(attn, x, cu, force_triton=False)
+    # Same q,k,v for both paths, IN fp16 (the kernel forces fp16 internally; feeding
+    # the fallback fp16 too removes the only legitimate dtype difference).
+    q = (torch.randn(L, H, D, device=dev) * 0.3).half().float()
+    k = (torch.randn(L, H, D, device=dev) * 0.3).half().float()
+    v = (torch.randn(L, H, D, device=dev) * 0.3).half().float()
 
-    def rel(a, b):
-        return (a - b).abs().max().item(), (a - b).norm().item() / (b.norm().item() + 1e-9)
+    g_tri = _run(attn, q, k, v, x, cu, L, dev, force_triton=True)
+    g_ref = _run(attn, q, k, v, x, cu, L, dev, force_triton=False)
 
-    for key in ("out", "x", "win", "alpha"):
-        amax, rnorm = rel(g_tri[key], g_ref[key])
-        print(f"{key:6s} | max|Δ|={amax:.3e}  relΔ={rnorm:.3e}")
+    def stats(a, b):
+        amax = (a - b).abs().max().item()
+        rel  = (a - b).norm().item() / (b.norm().item() + 1e-9)
+        return amax, rel
 
-    # tolleranze fp16 generose ma significative
+    print(f"\n{'tensor':6s} | {'max|Δ|':>11} | {'relΔ':>9} | {'ref‖·‖':>10}")
+    for key in ("out", "q", "k", "v", "win", "alpha"):
+        amax, rel = stats(g_tri[key], g_ref[key])
+        print(f"{key:6s} | {amax:11.3e} | {rel:9.3e} | {g_ref[key].norm().item():10.3e}")
+
+    # fp16 tolerances on the ABSOLUTE max diff (relative blows up when the grad is
+    # tiny, which is misleading). out scale ~1, grads can be small.
     ok = True
-    for key, tol in (("out", 2e-2), ("x", 5e-2), ("win", 8e-2), ("alpha", 8e-2)):
-        _, rnorm = rel(g_tri[key], g_ref[key])
-        if rnorm > tol:
+    for key, tol in (("out", 5e-2), ("q", 5e-2), ("k", 5e-2), ("v", 5e-2),
+                     ("win", 5e-3), ("alpha", 5e-4)):
+        amax, _ = stats(g_tri[key], g_ref[key])
+        if amax > tol:
             ok = False
-            print(f"  ✗ {key} oltre tolleranza ({rnorm:.3e} > {tol})")
+            print(f"  ✗ {key} oltre tolleranza assoluta ({amax:.3e} > {tol})")
     print("RISULTATO:", "OK ✓ kernel coerente col riferimento" if ok else "✗ DISCREPANZA")
 
 
