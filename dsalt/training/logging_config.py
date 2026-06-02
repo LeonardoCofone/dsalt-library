@@ -172,6 +172,10 @@ class _StepFormatter(logging.Formatter):
         sink   = _fmt_val(p.get("sink",     "nan"),                  color=YELLOW)
         hstd   = _fmt_val(p.get("head_std", p.get("hstd", "nan")),   color=MAGENTA)
         lr_s   = f"{MAGENTA}{p.get('lr', '?')}{RESET}"
+        # §4.2 window (min/mean/max) and §4.3 alpha (min/mean/max): shown raw
+        # as already-formatted "a/b/c" triplets, not numerically reformatted.
+        win_s   = f"{CYAN}{p.get('win',   'nan'):>{_W_VAL}}{RESET}"
+        alpha_s = f"{GREEN}{p.get('alpha', 'nan'):>{_W_VAL}}{RESET}"
 
         speed_s = f"{CYAN}{it_s:6.2f} it/s{RESET}" if it_s   > 0 else f"{DIM}  ?.?? it/s{RESET}"
         tok_s_s = f"{CYAN}{_fmt_tok_s(tok_s)} tok/s{RESET}" if tok_s > 0 else f"{DIM}  ? tok/s{RESET}"
@@ -200,6 +204,7 @@ class _StepFormatter(logging.Formatter):
             f"  {_cell('residual', res)}{G}{_cell('entropy H', H)}",
             f"  {_cell('noise', noise)}{G}{_cell('sink',      sink)}",
             f"  {_cell('head_std', hstd)}{G}{_cell('lr',      lr_s)}",
+            f"  {_cell('win μ', win_s)}{G}{_cell('alpha μ', alpha_s)}",
         ]
 
         return "\n".join(["", sep, hdr, sep] + rows + [sep])
