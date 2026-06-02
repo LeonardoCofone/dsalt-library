@@ -51,10 +51,11 @@ class DSALTTransformerBlock(nn.Module):
         max_seqlen:             int | None          = None,
         gradient_checkpointing: bool                = False,
         rope_cs:                tuple | None         = None,
+        cu_list:                list | None          = None,
     ) -> torch.Tensor:
         if gradient_checkpointing and self.training:
             def custom_attn(h):
-                attn_out, layer_aux = self.attn(h, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rope_cs=rope_cs)
+                attn_out, layer_aux = self.attn(h, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rope_cs=rope_cs, cu_list=cu_list)
                 nonlocal aux
                 aux = layer_aux
                 return attn_out
@@ -67,7 +68,7 @@ class DSALTTransformerBlock(nn.Module):
             x_ffn = torch.utils.checkpoint.checkpoint(self.ffn, ffn_normed, use_reentrant=False)
             x = x + x_ffn
         else:
-            x_attn, aux = self.attn(self.attn_norm(x), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rope_cs=rope_cs)
+            x_attn, aux = self.attn(self.attn_norm(x), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rope_cs=rope_cs, cu_list=cu_list)
             x = x + x_attn
             x_ffn = self.ffn(self.ffn_norm(x))
             x = x + x_ffn

@@ -21,6 +21,12 @@ try:
 except Exception:
     _TRITON_OK = False
 
+try:
+    from ..kernels.dsalt_triton_train import dsalt_triton_train_attention
+    _TRITON_TRAIN_OK = True
+except Exception:
+    _TRITON_TRAIN_OK = False
+
 
 @torch.no_grad()
 def _hybrid_scores(
@@ -198,7 +204,7 @@ class DSALTAttention(nn.Module):
         # is forced to exactly 0 (hard core), so the forward ≈ the hard A(i)=W∪L and
         # the w̃ gradient is concentrated on the boundary.
         self.tau_win  = 1.0
-        self.tau_lmk  = 1.0
+        self.tau_lmk  = 2.0 
         self.win_edge = 4
 
         self._last_P: torch.Tensor | None = None
@@ -324,9 +330,10 @@ class DSALTAttention(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None          = None,
         rope_cs:    tuple | None         = None,
+        cu_list:    list | None          = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if cu_seqlens is not None:
-            return self._packed(x, cu_seqlens, x.shape[0], x.device, rope_cs)
+            return self._packed(x, cu_seqlens, x.shape[0], x.device, rope_cs, cu_list)
         B, T, _ = x.shape
         return self._batched(x, B, T, x.device)
 
@@ -400,6 +407,47 @@ class DSALTAttention(nn.Module):
         # -inf where there is no landmark, σ(s/τ) weight where selected (diff. in α).
         lmk_logbias = self._soft_landmark_logbias(scores, lmk_mask, T)           # [H,T,T]
         return win_logbias, lmk_logbias
+
+    def _packed_train_triton(self, q, k, v, x, cu_seqlens, total_len, device):
+        """Differentiable sparse training via the Triton kernel (GPU only).
+
+        Prepares the three tensors the kernel needs and lets autograd route their
+        gradients to the predictors:
+          * ``w_cont`` ``[total_len]`` continuous window (diff in ``win_gate``);
+          * ``lmk_pos`` ``[H,num_seqs,k]`` hard landmark indices (selection only,
+            detached, computed exactly like the inference kernel);
+          * ``lmk_logw`` ``[H,num_seqs,k]`` = log σ(s_j(α)/τ_lmk) at the selected
+            landmarks (diff in ``alpha`` via the hybrid score).
+        """
+        from ..kernels.dsalt_triton_attn import _compute_landmark_indices
+
+        w_cont = self._window_continuous(x)                                       # [total_len] diff
+        alpha  = self._alpha()                                                     # [H] diff
+        # hard landmark selection (detached): reuse the inference selector, which
+        # excludes per-query in-window candidates and returns [H,num_seqs,k].
+        with torch.no_grad():
+            w_disc = w_cont.floor().clamp(min=1)
+            lmk_pos, _, _ = _compute_landmark_indices(
+                x.detach(), self.v_proj.weight.detach(), alpha.detach().float(),
+                w_disc, cu_seqlens, self.k_lmk, self.n_min, total_len,
+            )                                                                     # [H,num_seqs,k]
+        # differentiable score at the selected landmarks → log σ(s/τ) weight.
+        scores, _, _ = hybrid_scores_per_head(                                     # [total_len,H] diff in α
+            x, self.v_proj.weight, alpha, self.n_heads, self.head_dim,
+        )
+        num_seqs = cu_seqlens.shape[0] - 1
+        starts   = cu_seqlens[:-1].to(device)
+        safe_pos = lmk_pos.clamp(min=0)                                            # [H,S,k]
+        abs_pos  = starts[None, :, None] + safe_pos                               # [H,S,k] token index
+        head_ix  = torch.arange(self.n_heads, device=device)[:, None, None]
+        s_sel    = scores[abs_pos, head_ix]                                        # [H,S,k] diff in α
+        lmk_logw = torch.log(torch.sigmoid(s_sel / self.tau_lmk).clamp(min=1e-20))
+        lmk_logw = torch.where(lmk_pos >= 0, lmk_logw, torch.full_like(lmk_logw, float("-inf")))
+
+        return dsalt_triton_train_attention(
+            q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
+            tau_win=self.tau_win, win_edge=float(self.win_edge),
+        )
 
     def _packed_train(self, q, k, v, x, cu, lens, total_len, device):
         """Differentiable training attention over packed sequences, sync-free.
@@ -492,7 +540,7 @@ class DSALTAttention(nn.Module):
 
         return torch.maximum(win_lb.unsqueeze(1), lmk_lb)                          # [N,H,L,L]
 
-    def _packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, total_len: int, device: torch.device, rope_cs: tuple | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def _packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, total_len: int, device: torch.device, rope_cs: tuple | None = None, cu_list: list | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         q = self.q_proj(x).view(total_len, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(total_len, self.n_heads, self.head_dim)
         v = self.v_proj(x).view(total_len, self.n_heads, self.head_dim)
@@ -517,13 +565,17 @@ class DSALTAttention(nn.Module):
         # carry those gradients. Slower than Triton but exact and gradcheck-verified.
         # INFERENCE: fall through to the fast Triton (or SDPA) selector path below.
         if self.training:
-            # Read cu_seqlens once on the host (a single D2H sync for the whole
-            # layer); drive everything with plain python ints so the body launches
-            # NO blocking .item() calls.
-            cu   = cu_seqlens.detach().to("cpu", non_blocking=False).tolist()
+            self._last_P = None
+            # Fast path: differentiable sparse Triton kernel (only w(i)+k tokens per
+            # query, no dense [N,H,L,L]). Carries the gradients to win_gate (soft
+            # window edge) and alpha (soft landmark weight) directly in the kernel.
+            if _TRITON_TRAIN_OK and device.type == "cuda":
+                out = self._packed_train_triton(q, k, v, x, cu_seqlens, total_len, device)
+                return self.out_proj(out.view(total_len, self.d_model)), aux
+            # Fallback (CPU / no Triton): dense SDPA path, same math, gradcheck-tested.
+            cu   = cu_list if cu_list is not None else cu_seqlens.detach().to("cpu").tolist()
             lens = [cu[b + 1] - cu[b] for b in range(len(cu) - 1)]
             out  = self._packed_train(q, k, v, x, cu, lens, total_len, device)
-            self._last_P = None
             return self.out_proj(out.view(total_len, self.d_model)), aux
 
         # ---- inference (selectors, no gradient) ----

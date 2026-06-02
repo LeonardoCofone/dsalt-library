@@ -186,6 +186,7 @@ class DSALTLMHeadModel(nn.Module):
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
 
         rope_cs = None
+        cu_list = None
         if cu_seqlens is not None:
             device   = input_ids.device
             attn0    = self.layers[0].attn
@@ -196,6 +197,12 @@ class DSALTLMHeadModel(nn.Module):
             total_len = input_ids.shape[0]
             pos_ids  = torch.arange(total_len, device=device) - starts[seq_ids]
             rope_cs  = (attn0.rope_cos[pos_ids], attn0.rope_sin[pos_ids])
+            # Single host copy of cu_seqlens for the whole step (all layers share it).
+            # Done here, early, so the one unavoidable D2H sync happens while the GPU
+            # queue is still shallow — instead of once per layer mid-stream (which the
+            # profiler showed costing ~160ms total). Plain python ints downstream → no
+            # per-layer .item()/.to('cpu').
+            cu_list = cu_seqlens.detach().to("cpu").tolist()
 
         for layer in self.layers:
             x, layer_aux = layer(
@@ -204,6 +211,7 @@ class DSALTLMHeadModel(nn.Module):
                 max_seqlen=max_seqlen,
                 gradient_checkpointing=gradient_checkpointing,
                 rope_cs=rope_cs,
+                cu_list=cu_list,
             )
             aux_loss = aux_loss + layer_aux
 
