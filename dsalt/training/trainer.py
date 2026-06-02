@@ -338,34 +338,30 @@ class DSALTTrainer:
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         base = _unwrap_model(self.model)
-        decay, nodecay, dsalt_params = [], [], []
+        decay, nodecay = [], []
 
+        # win_gate (§4.2) and alpha_w (§4.3) are selection-only: they live inside
+        # non-differentiable ops (window mask / top-k) and would never receive a
+        # gradient. They are registered as *buffers* (not Parameters), so they do
+        # not appear here at all — and crucially do not break DDP's reduction,
+        # which raises on any registered Parameter that gets no grad.
         for name, p in base.named_parameters():
             if not p.requires_grad:
                 continue
-            # alpha_w (§4.3) and win_gate (§4.2) are selection parameters used only
-            # inside non-differentiable ops (top-k / window mask): they receive no
-            # gradient and stay at init, exactly as in the reference setup. They are
-            # still routed to a no-decay group so a future trainable variant would
-            # be handled sensibly; AdamW simply skips params whose grad is None.
-            if "alpha_w" in name or "win_gate" in name:
-                dsalt_params.append(p)
-            elif p.ndim < 2 or any(k in name for k in ("norm", "bias", "embed")):
+            if p.ndim < 2 or any(k in name for k in ("norm", "bias", "embed")):
                 nodecay.append(p)
             else:
                 decay.append(p)
 
         n_decay    = sum(p.numel() for p in decay)
         n_nodecay  = sum(p.numel() for p in nodecay)
-        n_dsalt    = sum(p.numel() for p in dsalt_params)
-        #print(f"--- [trainer] _build_optimizer | decay={n_decay:,} nodecay={n_nodecay:,} dsalt_special={n_dsalt:,}")
-        #print(f"--- [trainer] _build_optimizer | lr={self.lr:.2e} dsalt_lr={self.lr*2:.2e} wd={self.weight_decay}")
+        #print(f"--- [trainer] _build_optimizer | decay={n_decay:,} nodecay={n_nodecay:,}")
+        #print(f"--- [trainer] _build_optimizer | lr={self.lr:.2e} wd={self.weight_decay}")
 
         opt = torch.optim.AdamW(
             [
                 {"params": decay,        "weight_decay": self.weight_decay, "lr": self.lr},
                 {"params": nodecay,      "weight_decay": 0.0,               "lr": self.lr},
-                {"params": dsalt_params, "weight_decay": 0.0,               "lr": self.lr * 2.0},
             ],
             betas=(0.9, 0.95),
             eps=1e-8,

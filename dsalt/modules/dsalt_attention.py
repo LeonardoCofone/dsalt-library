@@ -171,12 +171,17 @@ class DSALTAttention(nn.Module):
         # §4.2 adaptive local window: linear projection f: R^d -> R that predicts,
         # per token, the window size w(i) = n_min + σ(f(x_i))·(n_max-n_min), from the
         # previous-layer hidden state (the block input) — no circular dependency.
-        # Used as a (non-differentiable) selector, so it stays at its init.
-        self.win_gate = nn.Linear(d_model, 1, bias=True)
+        # Used as a (non-differentiable) selector, so it stays at its init: we store
+        # f as *buffers*, not Parameters, so it never enters the optimizer nor DDP's
+        # gradient reduction (which would otherwise raise on a param that gets no
+        # grad). Weights match nn.Linear's default init for reproducibility.
+        bound = 1.0 / math.sqrt(d_model)
+        self.register_buffer("win_gate_w", torch.empty(d_model).uniform_(-bound, bound))
+        self.register_buffer("win_gate_b", torch.empty(()).uniform_(-bound, bound))
 
         # §4.3 per-head balance of the hybrid landmark score, init to σ⁻¹(0.6).
-        # Also a selection-only parameter (top-k is non-differentiable).
-        self.alpha_w = nn.Parameter(torch.full((n_heads,), math.log(0.6 / 0.4)))
+        # Also a selection-only buffer (top-k is non-differentiable).
+        self.register_buffer("alpha_w", torch.full((n_heads,), math.log(0.6 / 0.4)))
         self._last_P: torch.Tensor | None = None
 
         cos, sin = build_rope_cache(max_seq_len, self.head_dim, torch.device("cpu"), scale=yarn_scale)
@@ -200,7 +205,7 @@ class DSALTAttention(nn.Module):
 
         Returns an integer-valued float tensor ``[T]`` (≥ 1).
         """
-        win_logits = self.win_gate(x).squeeze(-1)                                  # [T]
+        win_logits = x @ self.win_gate_w + self.win_gate_b                         # [T]
         w_cont     = self.n_min + torch.sigmoid(win_logits) * (self.n_max - self.n_min)
         w_disc     = w_cont.floor() if floor else w_cont.round()
         return w_disc.clamp(min=1)
