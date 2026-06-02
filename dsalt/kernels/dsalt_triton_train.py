@@ -39,6 +39,41 @@ from .autotune import get_tuned_config, _heuristic_config
 
 _BWD_MAX_BLOCK_N = 32
 
+# Triton's MMA on sm_75 (T4) requires every tl.dot dimension ≥ 16 (M,N,K).
+# The landmark tile contracts/produces along the K_LMK axis, so when the model
+# uses k_lmk < 16 the two landmark dots (q·lk_k → N=K_LMK, p_lmk·lk_v → K=K_LMK)
+# violate the constraint. We pad the landmark axis up to this minimum with
+# invalid landmarks (pos=-1, logw=0) that the kernel masks out (valid_lmk=False),
+# so the math is unchanged and only the tile shape grows.
+_MIN_DOT = 16
+
+
+def _pad_landmarks(lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk):
+    """Pad the landmark axis to ≥ _MIN_DOT so tl.dot is legal on T4.
+
+    Returns the padded (lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk_pad). Padded
+    slots get pos=-1 (→ masked out) and logw=0 / kv=0 (never contribute).
+    """
+    if k_lmk >= _MIN_DOT:
+        return lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk
+    pad = _MIN_DOT - k_lmk
+    n_heads, num_seqs = lmk_pos_i.shape[0], lmk_pos_i.shape[1]
+    hd = lmk_K.shape[-1]
+    dev = lmk_K.device
+    lmk_K = torch.cat(
+        [lmk_K, torch.zeros(n_heads, num_seqs, pad, hd, device=dev, dtype=lmk_K.dtype)], dim=2
+    ).contiguous()
+    lmk_V = torch.cat(
+        [lmk_V, torch.zeros(n_heads, num_seqs, pad, hd, device=dev, dtype=lmk_V.dtype)], dim=2
+    ).contiguous()
+    lmk_pos_i = torch.cat(
+        [lmk_pos_i, torch.full((n_heads, num_seqs, pad), -1, device=dev, dtype=lmk_pos_i.dtype)], dim=2
+    ).contiguous()
+    lmk_logw_c = torch.cat(
+        [lmk_logw_c, torch.zeros(n_heads, num_seqs, pad, device=dev, dtype=lmk_logw_c.dtype)], dim=2
+    ).contiguous()
+    return lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, _MIN_DOT
+
 
 # --------------------------------------------------------------------------- #
 #  forward
@@ -426,20 +461,25 @@ def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
     lp  = lmk_pos.detach()
     lw  = lmk_logw.detach()
 
+    # Fresh leaf each call so .backward() never accumulates a stale graph.
+    def run():
+        wd = w_d.clone().requires_grad_(True)
+        o = DSALTTrainFunction.apply(
+            q_c, k_c, v_c, lp, lw, wd, cu_seqlens, tau_win, win_edge, cu_list,
+        )
+        o.sum().backward()
+
     results = []
     for cfg in _train_candidates(head_dim, device):
         _TRAIN_TUNED[key] = cfg  # so the inner .apply uses this candidate
         try:
-            def run():
-                o = DSALTTrainFunction.apply(
-                    q_c, k_c, v_c, lp, lw,
-                    w_d.requires_grad_(True), cu_seqlens, tau_win, win_edge, cu_list,
-                )
-                o.sum().backward()
             ms = _bench_step(run)
             results.append((cfg, ms, None))
         except Exception as e:
-            results.append((cfg, None, type(e).__name__))
+            # keep a short slice of the real message — class name alone hides
+            # whether it is smem-overflow, an illegal dot, or a launch error.
+            msg = f"{type(e).__name__}: {str(e).strip().splitlines()[-1][:40]}" if str(e).strip() else type(e).__name__
+            results.append((cfg, None, msg))
         finally:
             del _TRAIN_TUNED[key]
 
@@ -491,6 +531,11 @@ class DSALTTrainFunction(torch.autograd.Function):
         lmk_pos_i = lmk_pos.to(torch.int32).contiguous()
         lmk_logw_c = lmk_logw.detach().to(torch.float32).contiguous()
 
+        # Pad the landmark axis to ≥16 so the landmark tl.dot is legal on T4.
+        lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk_pad = _pad_landmarks(
+            lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk
+        )
+
         _train_fwd_kernel[(total_blk, n_heads)](
             q_c, k_c, v_c, out, lse,
             w_c, lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, cu_int, seq_block_map,
@@ -504,12 +549,13 @@ class DSALTTrainFunction(torch.autograd.Function):
             lmk_pos_i.stride(0), lmk_pos_i.stride(1), lmk_pos_i.stride(2),
             lmk_logw_c.stride(0), lmk_logw_c.stride(1), lmk_logw_c.stride(2),
             scale=scale, tau_win=float(tau_win), win_edge=float(win_edge),
-            HEAD_DIM=HEAD_DIM_C, K_LMK=k_lmk,
+            HEAD_DIM=HEAD_DIM_C, K_LMK=k_lmk_pad,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
             num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
         )
 
         ctx.save_for_backward(q_c, k_c, v_c, out, lse, lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, w_c)
+        ctx.k_lmk_pad     = k_lmk_pad
         ctx.cu_seqlens    = cu_seqlens
         ctx.seq_block_map = seq_block_map
         ctx.total_blk     = total_blk
@@ -538,7 +584,7 @@ class DSALTTrainFunction(torch.autograd.Function):
         dk = torch.zeros(total_len, n_heads, head_dim, device=device, dtype=torch.float32)
         dv = torch.zeros(total_len, n_heads, head_dim, device=device, dtype=torch.float32)
         d_w   = torch.zeros(total_len, n_heads, device=device, dtype=torch.float32)
-        d_logw = torch.zeros(n_heads, num_seqs, ctx.k_lmk, device=device, dtype=torch.float32)
+        d_logw = torch.zeros(n_heads, num_seqs, ctx.k_lmk_pad, device=device, dtype=torch.float32)
         delta = torch.empty(total_len, n_heads, device=device, dtype=torch.float32)
 
         BLOCK_M = ctx.BLOCK_M
@@ -579,12 +625,14 @@ class DSALTTrainFunction(torch.autograd.Function):
             d_w.stride(0), d_w.stride(1),
             delta.stride(0), delta.stride(1),
             scale=ctx.scale, tau_win=ctx.tau_win, win_edge=ctx.win_edge,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=ctx.HEAD_DIM_C, K_LMK=ctx.k_lmk,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=ctx.HEAD_DIM_C, K_LMK=ctx.k_lmk_pad,
             num_warps=num_warps, num_stages=num_stages,
         )
 
         # d_w is summed over heads inside the kernel → per-token gradient of w̃.
         d_w_tok = d_w.sum(dim=1)                                              # [total_len]
+        # Trim the padded landmark slots back to the real k_lmk for autograd.
+        d_logw = d_logw[:, :, :ctx.k_lmk]
         od = ctx.out_dtype
         return (
             dq.to(od), dk.to(od), dv.to(od),
