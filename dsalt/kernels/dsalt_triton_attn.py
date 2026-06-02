@@ -13,8 +13,13 @@ _SEQ_BLOCK_MAP_CACHE: dict = {}
 _SEQ_META_CACHE: dict = {}
 
 
-def _seq_meta(cu_seqlens: torch.Tensor, total: int, device: torch.device):
-    key = (int(cu_seqlens[-1]), cu_seqlens.shape[0] - 1)
+def _seq_meta(cu_seqlens: torch.Tensor, total: int, device: torch.device, cu_list: list | None = None):
+    # Build the cache key from the host-side cu_list when available (no D2H sync);
+    # fall back to a scalar read only when called standalone (tests).
+    if cu_list is not None:
+        key = (int(cu_list[-1]), len(cu_list) - 1)
+    else:
+        key = (int(cu_seqlens[-1]), cu_seqlens.shape[0] - 1)
     if key in _SEQ_META_CACHE:
         return _SEQ_META_CACHE[key]
     num_seqs = cu_seqlens.shape[0] - 1
@@ -22,7 +27,10 @@ def _seq_meta(cu_seqlens: torch.Tensor, total: int, device: torch.device):
     starts   = cu_seqlens[:-1].to(device)
     seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
     seq_off  = torch.arange(total, device=device) - starts[seq_ids]
-    max_len  = int(lens.max())
+    if cu_list is not None:
+        max_len = max(cu_list[b + 1] - cu_list[b] for b in range(len(cu_list) - 1))
+    else:
+        max_len = int(lens.max())
     val = (num_seqs, lens, starts, seq_ids, seq_off, max_len)
     _SEQ_META_CACHE[key] = val
     return val
@@ -187,14 +195,16 @@ def _build_seq_block_map(
     cu_seqlens: torch.Tensor,
     block_m:    int,
     device:     torch.device,
+    cu_list:    list | None = None,
 ) -> tuple[torch.Tensor, int]:
     num_seqs  = cu_seqlens.shape[0] - 1
-    total_len = int(cu_seqlens[-1])
+    # Key from host-side cu_list when available → no D2H sync on the hot path.
+    total_len = int(cu_list[-1]) if cu_list is not None else int(cu_seqlens[-1])
     key = (total_len, num_seqs, block_m)
     if key in _SEQ_BLOCK_MAP_CACHE:
         return _SEQ_BLOCK_MAP_CACHE[key]
 
-    cu_cpu     = cu_seqlens.detach().to("cpu")
+    cu_cpu     = torch.tensor(cu_list, dtype=torch.long) if cu_list is not None else cu_seqlens.detach().to("cpu")
     lens       = cu_cpu[1:] - cu_cpu[:-1]
     blocks_per = (lens + block_m - 1) // block_m
     total_blks = int(blocks_per.sum())
@@ -221,10 +231,11 @@ def _compute_landmark_indices(
     k_lmk:      int,
     n_min:      int,
     total_len:  int,
+    cu_list:    list | None = None,
 ) -> torch.Tensor:
     device   = x.device
     total    = x.shape[0]
-    num_seqs, lens, starts, seq_ids, seq_off, max_len = _seq_meta(cu_seqlens, total, device)
+    num_seqs, lens, starts, seq_ids, seq_off, max_len = _seq_meta(cu_seqlens, total, device, cu_list)
 
     n_heads = alpha.shape[0]
     dh      = W_V.shape[0] // n_heads
@@ -235,9 +246,15 @@ def _compute_landmark_indices(
     covered_h  = covered.unsqueeze(1).expand(-1, n_heads)
     scores_fil = scores.masked_fill(covered_h, float("-inf"))
 
-    uniform = bool((lens == lens[0]).all())
+    # Uniform-length detection from host-side cu_list (no sync) when available.
+    if cu_list is not None:
+        seq_lens = [cu_list[b + 1] - cu_list[b] for b in range(len(cu_list) - 1)]
+        uniform  = len(seq_lens) > 0 and all(s == seq_lens[0] for s in seq_lens)
+        L        = seq_lens[0] if uniform else 0
+    else:
+        uniform = bool((lens == lens[0]).all())
+        L = int(lens[0]) if uniform else 0
     if uniform:
-        L = int(lens[0])
         sp = scores_fil.T.view(n_heads, num_seqs, L)
         k_eff = min(k_lmk, L)
         top_val, top_lc = torch.topk(sp, k_eff, dim=2, sorted=False)

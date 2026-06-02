@@ -408,7 +408,7 @@ class DSALTAttention(nn.Module):
         lmk_logbias = self._soft_landmark_logbias(scores, lmk_mask, T)           # [H,T,T]
         return win_logbias, lmk_logbias
 
-    def _packed_train_triton(self, q, k, v, x, cu_seqlens, total_len, device):
+    def _packed_train_triton(self, q, k, v, x, cu_seqlens, total_len, device, cu_list=None):
         """Differentiable sparse training via the Triton kernel (GPU only).
 
         Prepares the three tensors the kernel needs and lets autograd route their
@@ -418,6 +418,7 @@ class DSALTAttention(nn.Module):
             detached, computed exactly like the inference kernel);
           * ``lmk_logw`` ``[H,num_seqs,k]`` = log σ(s_j(α)/τ_lmk) at the selected
             landmarks (diff in ``alpha`` via the hybrid score).
+        ``cu_list`` (host copy of cu_seqlens) is threaded through to avoid D2H syncs.
         """
         from ..kernels.dsalt_triton_attn import _compute_landmark_indices
 
@@ -429,7 +430,7 @@ class DSALTAttention(nn.Module):
             w_disc = w_cont.floor().clamp(min=1)
             lmk_pos, _, _ = _compute_landmark_indices(
                 x.detach(), self.v_proj.weight.detach(), alpha.detach().float(),
-                w_disc, cu_seqlens, self.k_lmk, self.n_min, total_len,
+                w_disc, cu_seqlens, self.k_lmk, self.n_min, total_len, cu_list,
             )                                                                     # [H,num_seqs,k]
         # differentiable score at the selected landmarks → log σ(s/τ) weight.
         scores, _, _ = hybrid_scores_per_head(                                     # [total_len,H] diff in α
@@ -446,7 +447,7 @@ class DSALTAttention(nn.Module):
 
         return dsalt_triton_train_attention(
             q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
-            tau_win=self.tau_win, win_edge=float(self.win_edge),
+            tau_win=self.tau_win, win_edge=float(self.win_edge), cu_list=cu_list,
         )
 
     def _packed_train(self, q, k, v, x, cu, lens, total_len, device):
@@ -570,7 +571,7 @@ class DSALTAttention(nn.Module):
             # query, no dense [N,H,L,L]). Carries the gradients to win_gate (soft
             # window edge) and alpha (soft landmark weight) directly in the kernel.
             if _TRITON_TRAIN_OK and device.type == "cuda":
-                out = self._packed_train_triton(q, k, v, x, cu_seqlens, total_len, device)
+                out = self._packed_train_triton(q, k, v, x, cu_seqlens, total_len, device, cu_list)
                 return self.out_proj(out.view(total_len, self.d_model)), aux
             # Fallback (CPU / no Triton): dense SDPA path, same math, gradcheck-tested.
             cu   = cu_list if cu_list is not None else cu_seqlens.detach().to("cpu").tolist()

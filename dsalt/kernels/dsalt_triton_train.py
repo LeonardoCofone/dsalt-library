@@ -364,20 +364,111 @@ def _train_bwd_kernel(
 # --------------------------------------------------------------------------- #
 #  python wrappers
 # --------------------------------------------------------------------------- #
+# Training-kernel tuned configs, keyed by (head_dim, sm_major, sm_minor). Kept
+# separate from the inference autotune: the training fwd+bwd has a different
+# register/smem profile (extra d_w accumulation), so its optimum can differ.
+_TRAIN_TUNED: dict = {}
+
+
 def _resolve_cfg(head_dim: int, device: torch.device) -> dict:
+    major, minor = torch.cuda.get_device_capability(device)
+    key = (int(head_dim), int(major), int(minor))
+    if key in _TRAIN_TUNED:
+        return _TRAIN_TUNED[key]
+    # fall back to the inference-tuned config, then the heuristic
     tuned = get_tuned_config(head_dim, device)
     return tuned if tuned is not None else _heuristic_config(head_dim, device)
+
+
+def _train_candidates(head_dim: int, device: torch.device) -> list[dict]:
+    """Candidate configs for the training kernel — broader than inference.
+
+    More BLOCK_M options and a wider warp sweep (2/4/8), still smem-filtered.
+    Answers 'are 4 candidates too few?': here we explore up to ~12.
+    """
+    from .autotune import _fits_shared_memory
+    base = _heuristic_config(head_dim, device)
+    major, _ = torch.cuda.get_device_capability(device)
+    bm0 = base["BLOCK_M"]
+    block_ms = sorted({max(16, bm0 // 2), bm0, min(128, bm0 * 2), min(128, bm0 * 4)})
+    stage_opts = (2, 3) if major >= 8 else (2,)
+    warp_opts  = (2, 4, 8)
+    seen, configs = set(), []
+    for bm in block_ms:
+        bn = min(bm, 64)
+        for nw in warp_opts:
+            for ns in stage_opts:
+                cfg = {"BLOCK_M": bm, "BLOCK_N": bn, "num_warps": nw, "num_stages": ns}
+                key = (bm, bn, nw, ns)
+                if key in seen or not _fits_shared_memory(cfg, head_dim, device):
+                    continue
+                seen.add(key)
+                configs.append(cfg)
+    return configs
+
+
+def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
+                          cu_seqlens, tau_win, win_edge, cu_list):
+    """Tune the training kernel once per (head_dim, GPU), measuring a full fwd+bwd."""
+    major, minor = torch.cuda.get_device_capability(device)
+    key = (int(head_dim), int(major), int(minor))
+    if key in _TRAIN_TUNED:
+        return
+
+    from .autotune import _bench_step, _is_main_process, _print_table
+
+    total_len, n_heads, hd = q.shape
+    in_dtype = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else torch.float16
+    q_c = q.detach().contiguous().to(in_dtype)
+    k_c = k.detach().contiguous().to(in_dtype)
+    v_c = v.detach().contiguous().to(in_dtype)
+    w_d = w_cont.detach()
+    lp  = lmk_pos.detach()
+    lw  = lmk_logw.detach()
+
+    results = []
+    for cfg in _train_candidates(head_dim, device):
+        _TRAIN_TUNED[key] = cfg  # so the inner .apply uses this candidate
+        try:
+            def run():
+                o = DSALTTrainFunction.apply(
+                    q_c, k_c, v_c, lp, lw,
+                    w_d.requires_grad_(True), cu_seqlens, tau_win, win_edge, cu_list,
+                )
+                o.sum().backward()
+            ms = _bench_step(run)
+            results.append((cfg, ms, None))
+        except Exception as e:
+            results.append((cfg, None, type(e).__name__))
+        finally:
+            del _TRAIN_TUNED[key]
+
+    valid = [(c, t) for (c, t, e) in results if t is not None]
+    best_cfg = min(valid, key=lambda x: x[1])[0] if valid else _heuristic_config(head_dim, device)
+    best_ms  = min((t for _, t, _ in results if t is not None), default=None)
+    _TRAIN_TUNED[key] = best_cfg
+    if _is_main_process():
+        print("  [DSALT train-kernel autotune]")
+        _print_table(head_dim, device, results, best_cfg, best_ms)
 
 
 class DSALTTrainFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
-                tau_win, win_edge):
+                tau_win, win_edge, cu_list=None):
         total_len, n_heads, head_dim = q.shape
         device     = q.device
         scale      = 1.0 / math.sqrt(head_dim)
         HEAD_DIM_C = triton.next_power_of_2(head_dim)
         k_lmk      = lmk_pos.shape[-1]
+
+        # Autotune the TRAINING kernel once per (head_dim, GPU) on the first batch,
+        # so training uses a config measured on its own fwd+bwd (not the inference
+        # kernel's). Runs at step 0, before the steady state.
+        _maybe_autotune_train(
+            head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
+            float(tau_win), float(win_edge), cu_list,
+        )
 
         in_dtype = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else torch.float16
         q_c = q.contiguous().to(in_dtype)
@@ -394,7 +485,7 @@ class DSALTTrainFunction(torch.autograd.Function):
 
         with torch.no_grad():
             lmk_K, lmk_V = _build_landmark_kv(k_c, v_c, lmk_pos, cu_seqlens, k_lmk, n_heads, head_dim)
-            seq_block_map, total_blk = _build_seq_block_map(cu_seqlens, BLOCK_M, device)
+            seq_block_map, total_blk = _build_seq_block_map(cu_seqlens, BLOCK_M, device, cu_list)
 
         cu_int    = cu_seqlens.to(torch.int32).contiguous()
         lmk_pos_i = lmk_pos.to(torch.int32).contiguous()
@@ -501,11 +592,12 @@ class DSALTTrainFunction(torch.autograd.Function):
             d_logw.to(od),        # → α via autograd on log σ(s/τ)
             d_w_tok.to(od),       # → win_gate via autograd on w̃
             None, None, None,     # cu_seqlens, tau_win, win_edge
+            None,                 # cu_list (host helper, no grad)
         )
 
 
 def dsalt_triton_train_attention(q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
-                                 tau_win=1.0, win_edge=4.0):
+                                 tau_win=1.0, win_edge=4.0, cu_list=None):
     """Differentiable sparse DSALT attention for training.
 
     ``lmk_logw`` (the per-landmark log σ(s/τ) weight, differentiable in α) and
@@ -514,5 +606,5 @@ def dsalt_triton_train_attention(q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
     routes ``d_logw``/``d_w̃`` back to them through autograd.
     """
     return DSALTTrainFunction.apply(
-        q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens, tau_win, win_edge,
+        q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens, tau_win, win_edge, cu_list,
     )
