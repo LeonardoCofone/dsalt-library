@@ -30,7 +30,7 @@ import triton
 _TUNED_CONFIG: dict = {}
 
 
-def _is_main_process() -> bool:
+def _is_main_process(device: torch.device | None = None) -> bool:
     """True only on the main rank (or always, when not under DDP).
 
     Every rank still benchmarks its own GPU, timings may differ from card to
@@ -38,6 +38,13 @@ def _is_main_process() -> bool:
     directly from the environment (``torch.distributed`` or the ``torchrun``
     env vars) so as not to depend on the ``training`` package and to avoid
     circular imports in the kernels.
+
+    Under ``mp.spawn`` (e.g. Kaggle) the autotune may fire on the very first
+    forward, *before* ``init_process_group``: there ``is_initialized()`` is
+    still ``False`` and ``RANK``/``LOCAL_RANK`` may be unset, so every worker
+    would fall through to ``True`` and print a duplicate table. As a last
+    resort we key off the CUDA device ordinal — distinct per worker in DDP —
+    and treat only ``cuda:0`` as main.
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank() == 0
@@ -45,7 +52,11 @@ def _is_main_process() -> bool:
         val = os.environ.get(var)
         if val is not None:
             return int(val) == 0
-    return True
+    # No torch.distributed and no env rank: fall back to the device ordinal so
+    # mp.spawn workers don't each print before init_process_group.
+    dev = device if device is not None else torch.device("cuda", torch.cuda.current_device())
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    return int(idx) == 0
 
 
 def _device_key(head_dim: int, device: torch.device) -> tuple:
@@ -198,7 +209,7 @@ def autotune_blocks(head_dim: int, device: torch.device, make_runner, verbose: b
 
     # Under DDP every rank benchmarks its own GPU, but only the main one prints:
     # no duplicated tables (one per device).
-    if verbose and _is_main_process():
+    if verbose and _is_main_process(device):
         _print_table(head_dim, device, results, best_cfg, best_ms)
 
     return best_cfg

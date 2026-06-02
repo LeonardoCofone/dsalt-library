@@ -574,7 +574,7 @@ def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
     best_cfg = min(valid, key=lambda x: x[1])[0] if valid else _heuristic_config(head_dim, device)
     best_ms  = min((t for _, t, _ in results if t is not None), default=None)
     _TRAIN_TUNED[key] = best_cfg
-    if _is_main_process():
+    if _is_main_process(device):
         print("  [DSALT train-kernel autotune]")
         _print_table(head_dim, device, results, best_cfg, best_ms)
 

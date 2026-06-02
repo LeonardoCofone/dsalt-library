@@ -5,6 +5,9 @@ __pycache__/
 MIO.md
 PROBLEMI.md
 
+dsalt/kernels/_verify_train_kernel.py
+profile_cuda.py
+
 # C extensions
 *.so
 
@@ -149,6 +152,8 @@ wandb/
 
 COSE_CAMBIATE_DALLA_TEORIA.md
 last_version_6.pdf
+.CLAUDE.md
+CLAUDE.md
 
 # Claude AI
 .claude/
