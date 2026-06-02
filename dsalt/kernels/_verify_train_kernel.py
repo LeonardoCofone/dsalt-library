@@ -43,7 +43,7 @@ def main():
     attn = DSALTAttention(d_model=64, n_heads=4, n_min=8, n_max=48, k_lmk=8,
                           max_seq_len=256, layer_idx=0).to(dev)
     attn.train()
-
+    
     # UNA sequenza (N=1): così lo z-score §4.3 per-sequenza del fallback coincide
     # con quello globale del kernel-path, e il confronto isola la matematica
     # dell'attenzione (finestra soft + landmark soft) senza differenze di scoring.

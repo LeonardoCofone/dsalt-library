@@ -461,13 +461,19 @@ def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
     lp  = lmk_pos.detach()
     lw  = lmk_logw.detach()
 
-    # Fresh leaf each call so .backward() never accumulates a stale graph.
+    # Fresh leaves each call so .backward() has something to flow into and never
+    # accumulates a stale graph. q/k/v also need grad or the output graph is empty
+    # → "element 0 does not require grad".
     def run():
-        wd = w_d.clone().requires_grad_(True)
-        o = DSALTTrainFunction.apply(
-            q_c, k_c, v_c, lp, lw, wd, cu_seqlens, tau_win, win_edge, cu_list,
-        )
-        o.sum().backward()
+        with torch.enable_grad():
+            qg = q_c.clone().requires_grad_(True)
+            kg = k_c.clone().requires_grad_(True)
+            vg = v_c.clone().requires_grad_(True)
+            wd = w_d.clone().requires_grad_(True)
+            o = DSALTTrainFunction.apply(
+                qg, kg, vg, lp, lw, wd, cu_seqlens, tau_win, win_edge, cu_list,
+            )
+            o.sum().backward()
 
     results = []
     for cfg in _train_candidates(head_dim, device):

@@ -14,9 +14,11 @@ from ..kernels.sparse_attn import (
     sparse_attention_forward_packed,
 )
 from ..kernels.landmark_tokens_ker import hybrid_scores_per_head
+# Selectors are triton-free → always importable (CPU fallback / verification).
+from ..kernels.selectors import _compute_landmark_indices
 
 try:
-    from ..kernels.dsalt_triton_attn import dsalt_triton_attention, _compute_landmark_indices
+    from ..kernels.dsalt_triton_attn import dsalt_triton_attention
     _TRITON_OK = True
 except Exception:
     _TRITON_OK = False
@@ -420,124 +422,117 @@ class DSALTAttention(nn.Module):
             landmarks (diff in ``alpha`` via the hybrid score).
         ``cu_list`` (host copy of cu_seqlens) is threaded through to avoid D2H syncs.
         """
-        from ..kernels.dsalt_triton_attn import _compute_landmark_indices
+        w_cont, lmk_pos, lmk_logw = self._train_selectors(x, cu_seqlens, total_len, device, cu_list)
+        return dsalt_triton_train_attention(
+            q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
+            tau_win=self.tau_win, win_edge=float(self.win_edge), cu_list=cu_list,
+        )
 
+    def _train_selectors(self, x, cu_seqlens, total_len, device, cu_list=None):
+        """Shared selector prelude for BOTH the Triton kernel and the dense fallback.
+
+        Returns ``(w_cont [total_len], lmk_pos [H,S,k], lmk_logw [H,S,k])`` — the
+        SAME tensors both paths must consume, so the dense verification reference
+        and the kernel select identical landmarks (the previous mismatch came from
+        the fallback using its own top-k instead of these).
+        """
         w_cont = self._window_continuous(x)                                       # [total_len] diff
         alpha  = self._alpha()                                                     # [H] diff
-        # hard landmark selection (detached): reuse the inference selector, which
-        # excludes per-query in-window candidates and returns [H,num_seqs,k].
         with torch.no_grad():
             w_disc = w_cont.floor().clamp(min=1)
             lmk_pos, _, _ = _compute_landmark_indices(
                 x.detach(), self.v_proj.weight.detach(), alpha.detach().float(),
                 w_disc, cu_seqlens, self.k_lmk, self.n_min, total_len, cu_list,
             )                                                                     # [H,num_seqs,k]
-        # differentiable score at the selected landmarks → log σ(s/τ) weight.
         scores, _, _ = hybrid_scores_per_head(                                     # [total_len,H] diff in α
             x, self.v_proj.weight, alpha, self.n_heads, self.head_dim,
         )
-        num_seqs = cu_seqlens.shape[0] - 1
         starts   = cu_seqlens[:-1].to(device)
         safe_pos = lmk_pos.clamp(min=0)                                            # [H,S,k]
-        abs_pos  = starts[None, :, None] + safe_pos                               # [H,S,k] token index
+        abs_pos  = starts[None, :, None] + safe_pos                               # [H,S,k]
         head_ix  = torch.arange(self.n_heads, device=device)[:, None, None]
         s_sel    = scores[abs_pos, head_ix]                                        # [H,S,k] diff in α
         lmk_logw = torch.log(torch.sigmoid(s_sel / self.tau_lmk).clamp(min=1e-20))
         lmk_logw = torch.where(lmk_pos >= 0, lmk_logw, torch.full_like(lmk_logw, float("-inf")))
+        return w_cont, lmk_pos, lmk_logw
 
-        return dsalt_triton_train_attention(
-            q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
-            tau_win=self.tau_win, win_edge=float(self.win_edge), cu_list=cu_list,
-        )
+    def _packed_train(self, q, k, v, x, cu, lens, total_len, device, cu_seqlens=None):
+        """Dense differentiable training attention — reference for the Triton kernel.
 
-    def _packed_train(self, q, k, v, x, cu, lens, total_len, device):
-        """Differentiable training attention over packed sequences, sync-free.
-
-        When all sequences have the same length (the common PG-19 case, fixed
-        ``seq_len``) the whole batch is reshaped to ``[N, L, …]`` and attended in a
-        SINGLE batched SDPA call — no python loop, no per-sequence kernel launches.
-        Otherwise it falls back to a python loop driven by the host-side ``lens``
-        (still one D2H sync total, none inside the loop). Returns ``[total_len,H,D]``.
+        Builds the SAME log-bias the Triton kernel computes (hard band ``d≤w̃`` +
+        soft edge; landmarks at the kernel-selected ``lmk_pos`` weighted by
+        ``lmk_logw``; union = elementwise max) and runs it through SDPA. Consuming
+        the kernel's exact selectors (via :meth:`_train_selectors`) is what makes
+        this a faithful reference — uniform-length only (the verify/PG-19 case).
         """
         H, D = self.n_heads, self.head_dim
         uniform = len(lens) > 0 and all(l == lens[0] for l in lens)
-
-        if uniform:
-            N, L = len(lens), lens[0]
-            qb = q.view(N, L, H, D).transpose(1, 2)                                # [N,H,L,D]
-            kb = k.view(N, L, H, D).transpose(1, 2)
-            vb = v.view(N, L, H, D).transpose(1, 2)
-            xb = x.view(N, L, self.d_model)                                        # [N,L,d]
-            logbias = self._diff_logbias_batched(xb, L, device)                   # [N,H,L,L]
-            ob = torch.nn.functional.scaled_dot_product_attention(
-                qb, kb, vb, attn_mask=logbias.to(qb.dtype),
-                dropout_p=self.dropout if self.dropout > 0 else 0.0,
-            )                                                                     # [N,H,L,D]
-            return ob.transpose(1, 2).reshape(total_len, H, D)
-
-        out = torch.empty_like(v)                                                  # [total_len,H,D]
-        for b in range(len(lens)):
-            s, Tb = cu[b], lens[b]
-            if Tb == 0:
-                continue
-            e  = s + Tb
-            qb = q[s:e].transpose(0, 1).unsqueeze(0)                               # [1,H,Tb,D]
-            kb = k[s:e].transpose(0, 1).unsqueeze(0)
-            vb = v[s:e].transpose(0, 1).unsqueeze(0)
-            logbias = self._diff_logbias_batched(x[s:e].unsqueeze(0), Tb, device)  # [1,H,Tb,Tb]
-            ob = torch.nn.functional.scaled_dot_product_attention(
-                qb, kb, vb, attn_mask=logbias.to(qb.dtype),
-                dropout_p=self.dropout if self.dropout > 0 else 0.0,
+        if cu_seqlens is None:
+            cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=device)
+        if not uniform:
+            raise NotImplementedError(
+                "_packed_train dense fallback supports uniform-length packing only "
+                "(used for CPU tests / kernel verification)."
             )
-            out[s:e] = ob.squeeze(0).transpose(0, 1)
-        return out
 
-    def _diff_logbias_batched(self, x: torch.Tensor, L: int, device: torch.device) -> torch.Tensor:
-        """Batched union log-bias ``[N,H,L,L]`` for ``x`` ``[N,L,d]`` (no head loop).
+        N, L = len(lens), lens[0]
+        # Same selectors the kernel uses → identical landmarks & weights.
+        w_cont, lmk_pos, lmk_logw = self._train_selectors(x, cu_seqlens, total_len, device, cu)
+        logbias = self._dense_logbias_from_kernel(w_cont, lmk_pos, lmk_logw, N, L, device)  # [N,H,L,L]
 
-        Same math as :meth:`_diff_logbias` (soft window edge + α-reweighted hard
-        landmarks, combined by elementwise max) but fully vectorised over the batch
-        and head axes, so the whole packed minibatch is one set of kernels.
+        qb = q.view(N, L, H, D).transpose(1, 2)                                    # [N,H,L,D]
+        kb = k.view(N, L, H, D).transpose(1, 2)
+        vb = v.view(N, L, H, D).transpose(1, 2)
+        ob = torch.nn.functional.scaled_dot_product_attention(
+            qb, kb, vb, attn_mask=logbias.to(qb.dtype),
+            dropout_p=self.dropout if self.dropout > 0 else 0.0,
+        )                                                                         # [N,H,L,D]
+        return ob.transpose(1, 2).reshape(total_len, H, D)
+
+    def _dense_logbias_from_kernel(self, w_cont, lmk_pos, lmk_logw, N, L, device):
+        """Dense ``[N,H,L,L]`` log-bias replicating the Triton kernel math exactly.
+
+        * window: hard band ``0 ≤ d ≤ w̃`` with soft edge ``log σ((w̃−d)/τ_win)``
+          (0 in the core ``d ≤ w̃−win_edge``);
+        * landmarks: at the (per-head, per-seq) ``lmk_pos`` add ``lmk_logw``, valid
+          only where ``lmk_pos ≤ i`` and ``lmk_pos < i − w̃`` (outside the band);
+        * union = elementwise max of the two.
         """
-        N = x.shape[0]
-        H, dh = self.n_heads, self.head_dim
-        w_cont = self._window_continuous(x)                                        # [N,L] diff in win_gate
-        alpha  = self._alpha()                                                     # [H]   diff in alpha
-        # §4.3 hybrid score, standardised PER SEQUENCE (z-score over the L tokens of
-        # each sequence, not globally — must match the per-sequence semantics of
-        # hybrid_scores_per_head). Vectorised over the batch axis N.
-        x_norm = x.norm(dim=-1).float()                                            # [N,L]
-        z_x    = (x_norm - x_norm.mean(1, keepdim=True)) / x_norm.std(1, keepdim=True).clamp(min=1e-6)
-        xwv    = (x @ self.v_proj.weight.T).view(N, L, H, dh).norm(dim=-1).float() # [N,L,H]
-        z_v    = (xwv - xwv.mean(1, keepdim=True)) / xwv.std(1, keepdim=True).clamp(min=1e-6)
-        scores = alpha * z_v + (1.0 - alpha) * z_x.unsqueeze(-1)                   # [N,L,H] diff in α
+        H = self.n_heads
+        w_seq = w_cont.view(N, L)                                                  # [N,L] per query i
+        idx   = torch.arange(L, device=device)
+        d     = (idx.unsqueeze(1) - idx.unsqueeze(0)).float()                      # [L,L] = i - j
 
-        idx = torch.arange(L, device=device)
-        d   = (idx.unsqueeze(1) - idx.unsqueeze(0)).float()                        # [L,L] = i - j
-
-        # --- soft window edge (trains win_gate), batched over N ---
-        w_i = w_cont.unsqueeze(-1)                                                 # [N,L,1] over key j
-        g   = torch.sigmoid((w_i - d.unsqueeze(0)) / self.tau_win)                # [N,L,L]
-        win_lb = torch.log(g.clamp(min=1e-20))
+        # --- window band (trains win_gate) ---
+        w_i    = w_seq.unsqueeze(-1)                                               # [N,L,1]
+        z      = (w_i - d.unsqueeze(0)) / self.tau_win
+        win_lb = torch.log(torch.sigmoid(z).clamp(min=1e-20))
         core   = d.unsqueeze(0) <= (w_i - self.win_edge)
         win_lb = torch.where(core, torch.zeros_like(win_lb), win_lb)
-        win_lb = win_lb.masked_fill((d < 0).unsqueeze(0), float("-inf"))          # [N,L,L]
+        in_band = (d.unsqueeze(0) >= 0) & (d.unsqueeze(0) <= w_i)
+        win_lb = win_lb.masked_fill(~in_band, float("-inf"))                       # [N,L,L]
 
-        # --- hard landmark selection + soft α weight (trains alpha_w), batched ---
-        with torch.no_grad():
-            w_disc = w_cont.floor().clamp(min=1)                                   # [N,L]
-            k_act  = min(self.k_lmk, L)
-            sel    = torch.zeros(N, self.n_heads, L, dtype=torch.bool, device=device)
-            if k_act > 0:
-                # top-k over the key axis (dim=1) per (batch, head)
-                _, top = torch.topk(scores, k_act, dim=1, sorted=False)           # [N,k,H]
-                sel.scatter_(2, top.transpose(1, 2), True)                         # [N,H,L]
-            causal_outwin = (d >= 0).unsqueeze(0) & (d >= w_disc.unsqueeze(-1))    # [N,L,L]
-            lmk_mask = sel.unsqueeze(2) & causal_outwin.unsqueeze(1)              # [N,H,L,L]
-
-        w_lmk = torch.log(torch.sigmoid(scores / self.tau_lmk).clamp(min=1e-20))  # [N,L,H]
-        w_lmk = w_lmk.permute(0, 2, 1).unsqueeze(2).expand(N, self.n_heads, L, L)  # [N,H,L,L] over key j
-        lmk_lb = torch.where(lmk_mask, w_lmk, torch.full_like(w_lmk, float("-inf")))
+        # --- landmarks (trains alpha) ---
+        # For each query i and selected landmark key p: bias = lmk_logw if the
+        # landmark is causal (p ≤ i) and outside the band (p < i − w̃(i)), else -inf.
+        # Built without in-place ops (autograd-safe): each landmark kk produces a
+        # [N,H,L,L] term placed at its column j==p, combined by elementwise max.
+        lmk_lb = torch.full((N, H, L, L), float("-inf"), device=device)
+        k_lmk  = lmk_pos.shape[-1]
+        i_idx  = idx.view(1, 1, L).float()                                         # [1,1,L] query i
+        wl     = w_seq.view(N, 1, L)                                               # [N,1,L] w̃(i)
+        for kk in range(k_lmk):
+            pos  = lmk_pos[:, :, kk].transpose(0, 1)                               # [N,H]
+            logw = lmk_logw[:, :, kk].transpose(0, 1)                              # [N,H]
+            pos_c = pos.clamp(min=0)
+            posf  = pos_c.float().view(N, H, 1)                                    # [N,H,1]
+            ok = (pos >= 0).view(N, H, 1) & (posf <= i_idx) & (posf < (i_idx - wl))  # [N,H,L] over query i
+            col  = pos_c.view(N, H, 1, 1).expand(N, H, L, 1)                       # key column j==p
+            val  = torch.where(ok, logw.view(N, H, 1), torch.full((1, 1, 1), float("-inf"), device=device))
+            term = torch.full((N, H, L, L), float("-inf"), device=device).scatter(
+                3, col, val.unsqueeze(-1)
+            )                                                                     # out-of-place
+            lmk_lb = torch.maximum(lmk_lb, term)
 
         return torch.maximum(win_lb.unsqueeze(1), lmk_lb)                          # [N,H,L,L]
 
@@ -576,8 +571,8 @@ class DSALTAttention(nn.Module):
             # Fallback (CPU / no Triton): dense SDPA path, same math, gradcheck-tested.
             cu   = cu_list if cu_list is not None else cu_seqlens.detach().to("cpu").tolist()
             lens = [cu[b + 1] - cu[b] for b in range(len(cu) - 1)]
-            out  = self._packed_train(q, k, v, x, cu, lens, total_len, device)
-            return self.out_proj(out.view(total_len, self.d_model)), aux
+            out  = self._packed_train(q, k, v, x, cu, lens, total_len, device, cu_seqlens)
+            return self.out_proj(out.reshape(total_len, self.d_model)), aux
 
         # ---- inference (selectors, no gradient) ----
         w_sizes = self._window_sizes(x, floor=True)
