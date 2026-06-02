@@ -58,43 +58,48 @@ def main():
     print("Triton train disponibile:", _TRITON_TRAIN_OK)
 
     H, D, L = 4, 16, 96
-    attn = DSALTAttention(d_model=H * D, n_heads=H, n_min=8, n_max=48, k_lmk=8,
-                          max_seq_len=256, layer_idx=0).to(dev)
-    attn.train()
-
-    # UNA sequenza (N=1): z-score per-sequenza == globale, isola l'attenzione.
-    x = torch.randn(L, H * D, device=dev) * 0.5
-    cu = torch.tensor([0, L], dtype=torch.int32, device=dev)
-
-    # Same q,k,v for both paths, IN fp16 (the kernel forces fp16 internally; feeding
-    # the fallback fp16 too removes the only legitimate dtype difference).
-    q = (torch.randn(L, H, D, device=dev) * 0.3).half().float()
-    k = (torch.randn(L, H, D, device=dev) * 0.3).half().float()
-    v = (torch.randn(L, H, D, device=dev) * 0.3).half().float()
-
-    g_tri = _run(attn, q, k, v, x, cu, L, dev, force_triton=True)
-    g_ref = _run(attn, q, k, v, x, cu, L, dev, force_triton=False)
 
     def stats(a, b):
         amax = (a - b).abs().max().item()
         rel  = (a - b).norm().item() / (b.norm().item() + 1e-9)
         return amax, rel
 
-    print(f"\n{'tensor':6s} | {'max|Δ|':>11} | {'relΔ':>9} | {'ref‖·‖':>10}")
-    for key in ("out", "q", "k", "v", "win", "alpha"):
-        amax, rel = stats(g_tri[key], g_ref[key])
-        print(f"{key:6s} | {amax:11.3e} | {rel:9.3e} | {g_ref[key].norm().item():10.3e}")
+    overall_ok = True
+    # k_lmk=16 → no landmark padding; k_lmk=8 → padding active. Comparing both
+    # isolates whether the bug is in _pad_landmarks or in the base forward.
+    for k_lmk in (16, 8):
+        torch.manual_seed(0)
+        attn = DSALTAttention(d_model=H * D, n_heads=H, n_min=8, n_max=48,
+                              k_lmk=k_lmk, max_seq_len=256, layer_idx=0).to(dev)
+        attn.train()
+        x = torch.randn(L, H * D, device=dev) * 0.5
+        cu = torch.tensor([0, L], dtype=torch.int32, device=dev)
+        # same q,k,v for both paths, in fp16 (kernel forces fp16 internally).
+        q = (torch.randn(L, H, D, device=dev) * 0.3).half().float()
+        k = (torch.randn(L, H, D, device=dev) * 0.3).half().float()
+        v = (torch.randn(L, H, D, device=dev) * 0.3).half().float()
 
-    # fp16 tolerances on the ABSOLUTE max diff (relative blows up when the grad is
-    # tiny, which is misleading). out scale ~1, grads can be small.
-    ok = True
-    for key, tol in (("out", 5e-2), ("q", 5e-2), ("k", 5e-2), ("v", 5e-2),
-                     ("win", 5e-3), ("alpha", 5e-4)):
-        amax, _ = stats(g_tri[key], g_ref[key])
-        if amax > tol:
-            ok = False
-            print(f"  ✗ {key} oltre tolleranza assoluta ({amax:.3e} > {tol})")
-    print("RISULTATO:", "OK ✓ kernel coerente col riferimento" if ok else "✗ DISCREPANZA")
+        g_tri = _run(attn, q, k, v, x, cu, L, dev, force_triton=True)
+        g_ref = _run(attn, q, k, v, x, cu, L, dev, force_triton=False)
+
+        pad = "no-pad" if k_lmk >= 16 else "PAD active"
+        print(f"\n=== k_lmk={k_lmk} ({pad}) ===")
+        print(f"{'tensor':6s} | {'max|Δ|':>11} | {'relΔ':>9} | {'ref‖·‖':>10}")
+        for key in ("out", "q", "k", "v", "win", "alpha"):
+            amax, rel = stats(g_tri[key], g_ref[key])
+            print(f"{key:6s} | {amax:11.3e} | {rel:9.3e} | {g_ref[key].norm().item():10.3e}")
+
+        ok = True
+        for key, tol in (("out", 5e-2), ("q", 5e-2), ("k", 5e-2), ("v", 5e-2),
+                         ("win", 5e-3), ("alpha", 5e-4)):
+            amax, _ = stats(g_tri[key], g_ref[key])
+            if amax > tol:
+                ok = False
+                print(f"  ✗ {key} oltre tolleranza assoluta ({amax:.3e} > {tol})")
+        print("  →", "OK ✓" if ok else "✗ DISCREPANZA")
+        overall_ok = overall_ok and ok
+
+    print("\nRISULTATO:", "OK ✓ kernel coerente" if overall_ok else "✗ DISCREPANZA")
 
 
 if __name__ == "__main__":

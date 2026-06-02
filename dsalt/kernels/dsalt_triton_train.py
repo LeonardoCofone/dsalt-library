@@ -164,7 +164,10 @@ def _train_fwd_kernel(
 
         m_new  = tl.maximum(m_i, tl.max(qk, axis=1))
         p      = tl.where(final, tl.exp(qk - m_new[:, None]), 0.0)
-        l_corr = tl.exp(m_i - m_new)
+        # Guard the running-max rescale: when m_i is still -inf (nothing accumulated
+        # yet for this row), m_i - m_new is -inf-(-inf)=nan. Force l_corr=0 there
+        # (l_i/acc are 0 anyway), which is the correct online-softmax behaviour.
+        l_corr = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i - m_new))
         l_i    = l_i * l_corr + tl.sum(p, axis=1)
         acc    = acc * l_corr[:, None] + tl.dot(p.to(k_blk.dtype), tl.trans(v_blk))
         m_i     = m_new
@@ -197,7 +200,7 @@ def _train_fwd_kernel(
 
     m_new   = tl.maximum(m_i, tl.max(qk_lmk, axis=1))
     p_lmk   = tl.where(valid_lmk, tl.exp(qk_lmk - m_new[:, None]), 0.0)
-    l_corr  = tl.exp(m_i - m_new)
+    l_corr  = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i - m_new))
     l_i     = l_i * l_corr + tl.sum(p_lmk, axis=1)
     acc     = acc * l_corr[:, None] + tl.dot(p_lmk.to(lk_v.dtype), tl.trans(lk_v))
     m_i = m_new

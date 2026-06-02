@@ -101,7 +101,8 @@ def _dsalt_fwd_kernel(
 
         m_new  = tl.maximum(m_i, tl.max(qk, axis=1))
         p      = tl.where(final, tl.exp(qk - m_new[:, None]), 0.0)
-        l_corr = tl.exp(m_i - m_new)
+        # Guard -inf-(-inf)=nan when this row had no valid token yet (m_i still -inf).
+        l_corr = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i - m_new))
         l_i    = l_i * l_corr + tl.sum(p, axis=1)
         acc    = acc * l_corr[:, None] + tl.dot(p.to(k_blk.dtype), tl.trans(v_blk))
         m_i     = m_new
@@ -133,7 +134,7 @@ def _dsalt_fwd_kernel(
 
     m_new   = tl.maximum(m_i, tl.max(qk_lmk, axis=1))
     p_lmk   = tl.where(valid_lmk, tl.exp(qk_lmk - m_new[:, None]), 0.0)
-    l_corr  = tl.exp(m_i - m_new)
+    l_corr  = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i - m_new))
     l_i     = l_i * l_corr + tl.sum(p_lmk, axis=1)
     acc     = acc * l_corr[:, None] + tl.dot(p_lmk.to(lk_v.dtype), tl.trans(lk_v))
     m_i = m_new
