@@ -425,7 +425,8 @@ class DSALTAttention(nn.Module):
         w_cont, lmk_pos, lmk_logw = self._train_selectors(x, cu_seqlens, total_len, device, cu_list)
         return dsalt_triton_train_attention(
             q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
-            tau_win=self.tau_win, win_edge=float(self.win_edge), cu_list=cu_list,
+            tau_win=self.tau_win, win_edge=float(self.win_edge),
+            n_max=self.n_max, cu_list=cu_list,
         )
 
     def _train_selectors(self, x, cu_seqlens, total_len, device, cu_list=None):

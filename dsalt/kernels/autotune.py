@@ -80,23 +80,22 @@ def _heuristic_config(head_dim: int, device: torch.device) -> dict:
 
 
 def _candidate_configs(head_dim: int, device: torch.device) -> list[dict]:
-    """Generate the candidates to benchmark.
+    """Generate the candidates to benchmark (shared by inference and training).
 
-    Few and targeted: we vary ``BLOCK_M`` (power of 2 around the heuristic),
-    ``num_warps`` (2/4) and ``num_stages`` (2/3). We keep ``BLOCK_N`` aligned to
-    ``BLOCK_M`` but capped at 64 (the bwd reduces it to 32 anyway, so exploring
-    beyond that is pointless). All combinations are filtered so as not to exceed
-    the estimated shared memory of the current GPU.
+    We vary ``BLOCK_M`` (½/1/2/4× the heuristic, within [16, 128]), ``num_warps``
+    (2/4/8) and ``num_stages`` (2/3 on sm_80+). ``BLOCK_N`` is aligned to
+    ``BLOCK_M`` but capped at 64 (the bwd reduces it to 32 anyway). All filtered by
+    estimated shared memory. Kept identical to the training kernel's candidate set
+    so the two autotune tables are coherent (same count, same sweep).
     """
     base = _heuristic_config(head_dim, device)
     major, _ = torch.cuda.get_device_capability(device)
 
-    # BLOCK_M candidates: the heuristic and its two neighbours (powers of 2), within [16, 128].
     bm0 = base["BLOCK_M"]
-    block_ms = sorted({max(16, bm0 // 2), bm0, min(128, bm0 * 2)})
+    block_ms = sorted({max(16, bm0 // 2), bm0, min(128, bm0 * 2), min(128, bm0 * 4)})
 
     stage_opts = (2, 3) if major >= 8 else (2,)
-    warp_opts = (2, 4)
+    warp_opts = (2, 4, 8)
 
     seen = set()
     configs = []

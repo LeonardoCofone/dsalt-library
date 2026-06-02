@@ -374,21 +374,14 @@ def _train_bwd_kernel(
         ds = tl.where(final, ds_raw * scale, 0.0)
 
         dq += tl.dot(ds, tl.trans(k_blk))
-        dk_blk = tl.dot(tl.trans(ds), q)
-        dv_blk = tl.dot(tl.trans(p), do)
 
         # ∂loss/∂w̃ from the soft edge: ∂bias/∂w̃ = (1-σ(z))·(1/τ), only on the boundary
         dbias_dw = tl.where(in_core, 0.0, (1.0 - sig) / tau_win)
         dw_contrib = tl.where(final, ds_raw * dbias_dw, 0.0)
         dw_i += tl.sum(dw_contrib, axis=1)
-
-        n_tok   = n_start + offs_n
-        store_n = (n_tok < seq_len) & (n_tok < window_end)
-        abs_n   = seq_start + n_tok
-        tl.atomic_add(DK + abs_n[:, None] * stride_dkt + pid_h * stride_dkh + offs_d[None, :] * stride_dkd,
-                      dk_blk, mask=store_n[:, None])
-        tl.atomic_add(DV + abs_n[:, None] * stride_dvt + pid_h * stride_dvh + offs_d[None, :] * stride_dvd,
-                      dv_blk, mask=store_n[:, None])
+        # dk/dv of the band are NOT written here — they are computed key-parallel in
+        # _train_bwd_dkdv_kernel (no atomics). This kernel only does dq, dw, and the
+        # landmark dk/dv (rare atomics, outside the loop).
         n_start += BLOCK_N
 
     tl.store(DQ + (seq_start + m_start + offs_m[:, None]) * stride_dqt
@@ -397,6 +390,107 @@ def _train_bwd_kernel(
     # accumulate ∂loss/∂w̃(i) across heads (one D_w per token)
     tl.atomic_add(D_w + (seq_start + m_start + offs_m) * stride_dwt + pid_h * stride_dwh,
                   dw_i, mask=valid_m)
+
+
+@triton.jit
+def _train_bwd_dkdv_kernel(
+    Q, K, V, DO, DK, DV,
+    LSE, W_cont, Delta, Cu_seqlens, Seq_block_map,
+    stride_qt, stride_qh, stride_qd,
+    stride_kt, stride_kh, stride_kd,
+    stride_vt, stride_vh, stride_vd,
+    stride_dot, stride_doh, stride_dod,
+    stride_dkt, stride_dkh, stride_dkd,
+    stride_dvt, stride_dvh, stride_dvd,
+    stride_lset, stride_lseh,
+    stride_dt, stride_dh,
+    scale:    tl.constexpr,
+    tau_win:  tl.constexpr,
+    win_edge: tl.constexpr,
+    N_MAX:    tl.constexpr,
+    BLOCK_M:  tl.constexpr,
+    BLOCK_N:  tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Key-parallel dk/dv for the WINDOW band — no atomics.
+
+    Each program owns one key block ``[kn, kn+BLOCK_N)`` of one head and loops over
+    the query blocks that can attend to it (a query i attends key j iff
+    ``j ≤ i ≤ j + w̃(i)``, so i ≤ j + N_MAX). dk/dv are accumulated in registers and
+    stored ONCE, no atomic_add (the previous query-parallel scheme wrote the same
+    key from many query blocks → ~5 atomics per block, the backward bottleneck).
+
+    Must run BEFORE the landmark dk/dv atomics in _train_bwd_kernel: this kernel
+    `store`s the band contribution, then the landmark pass `atomic_add`s on top.
+    """
+    pid_kn = tl.program_id(0)
+    pid_h  = tl.program_id(1)
+
+    seq_id    = tl.load(Seq_block_map + pid_kn * 2).to(tl.int32)
+    block_off = tl.load(Seq_block_map + pid_kn * 2 + 1).to(tl.int32)
+    seq_start = tl.load(Cu_seqlens + seq_id).to(tl.int32)
+    seq_end   = tl.load(Cu_seqlens + seq_id + 1).to(tl.int32)
+    seq_len   = seq_end - seq_start
+    n_start   = block_off * BLOCK_N
+
+    offs_n  = tl.arange(0, BLOCK_N)
+    offs_d  = tl.arange(0, HEAD_DIM)
+    offs_m  = tl.arange(0, BLOCK_M)
+    j_abs   = n_start + offs_n
+    valid_n = j_abs < seq_len
+
+    k_blk = tl.load(K + (seq_start + j_abs[:, None]) * stride_kt + pid_h * stride_kh
+                      + offs_d[None, :] * stride_kd, mask=valid_n[:, None], other=0.0).to(tl.float32)
+    v_blk = tl.load(V + (seq_start + j_abs[:, None]) * stride_vt + pid_h * stride_vh
+                      + offs_d[None, :] * stride_vd, mask=valid_n[:, None], other=0.0).to(tl.float32)
+
+    dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+    dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+
+    # Queries i that can see this key block: i ≥ j (causal) and i ≤ j + w̃(i) ≤
+    # j + N_MAX. So scan only [n_start, n_start + BLOCK_N + N_MAX) in BLOCK_M steps
+    # (the band is short → few iterations, no O(L²) scan).
+    m_lo  = n_start
+    m_hi  = tl.minimum(n_start + BLOCK_N + N_MAX, seq_len)
+    m_start = m_lo - (m_lo % BLOCK_M)
+    m_iter = (m_hi - m_start + BLOCK_M - 1) // BLOCK_M
+
+    for _ in range(0, m_iter):
+        i_abs   = m_start + offs_m
+        valid_m = (i_abs < seq_len) & (i_abs >= n_start)
+        q  = tl.load(Q + (seq_start + i_abs[:, None]) * stride_qt + pid_h * stride_qh
+                       + offs_d[None, :] * stride_qd, mask=valid_m[:, None], other=0.0).to(tl.float32)
+        do = tl.load(DO + (seq_start + i_abs[:, None]) * stride_dot + pid_h * stride_doh
+                        + offs_d[None, :] * stride_dod, mask=valid_m[:, None], other=0.0).to(tl.float32)
+        lse = tl.load(LSE + (seq_start + i_abs) * stride_lset + pid_h * stride_lseh,
+                      mask=valid_m, other=float("-inf")).to(tl.float32)
+        delta = tl.load(Delta + (seq_start + i_abs) * stride_dt + pid_h * stride_dh,
+                        mask=valid_m, other=0.0).to(tl.float32)
+        w_cont = tl.load(W_cont + seq_start + i_abs, mask=valid_m, other=1.0).to(tl.float32)
+        row_ok = valid_m & (lse > float("-inf"))
+
+        # logits for this (query block i, key block j): [BLOCK_M, BLOCK_N]
+        d      = (i_abs[:, None] - j_abs[None, :]).to(tl.float32)
+        causal = (j_abs[None, :] <= i_abs[:, None]) & (d <= w_cont[:, None])
+        final  = causal & valid_n[None, :] & row_ok[:, None]
+        z       = (w_cont[:, None] - d) / tau_win
+        logedge = -tl.log(1.0 + tl.exp(-z))
+        in_core = d <= (w_cont[:, None] - win_edge)
+        bias    = tl.where(in_core, 0.0, logedge)
+
+        qk = tl.dot(q, tl.trans(k_blk)) * scale + bias
+        p  = tl.where(final, tl.exp(qk - lse[:, None]), 0.0)                   # [BM,BN]
+        dp = tl.dot(do, tl.trans(v_blk))                                       # [BM,BN]
+        ds = tl.where(final, p * (dp - delta[:, None]) * scale, 0.0)          # [BM,BN]
+
+        dk += tl.dot(tl.trans(ds), q)                                          # [BN,HEAD_DIM]
+        dv += tl.dot(tl.trans(p), do)                                          # [BN,HEAD_DIM]
+        m_start += BLOCK_M
+
+    tl.store(DK + (seq_start + j_abs[:, None]) * stride_dkt + pid_h * stride_dkh
+                + offs_d[None, :] * stride_dkd, dk.to(DK.dtype.element_ty), mask=valid_n[:, None])
+    tl.store(DV + (seq_start + j_abs[:, None]) * stride_dvt + pid_h * stride_dvh
+                + offs_d[None, :] * stride_dvd, dv.to(DV.dtype.element_ty), mask=valid_n[:, None])
 
 
 # --------------------------------------------------------------------------- #
@@ -419,34 +513,18 @@ def _resolve_cfg(head_dim: int, device: torch.device) -> dict:
 
 
 def _train_candidates(head_dim: int, device: torch.device) -> list[dict]:
-    """Candidate configs for the training kernel — broader than inference.
+    """Candidate configs for the training kernel.
 
-    More BLOCK_M options and a wider warp sweep (2/4/8), still smem-filtered.
-    Answers 'are 4 candidates too few?': here we explore up to ~12.
+    Same sweep as the inference autotune (`_candidate_configs`: BLOCK_M ½/1/2/4×,
+    warps 2/4/8, smem-filtered) so the two autotune tables are coherent. Single
+    source of the candidate set → they cannot drift apart.
     """
-    from .autotune import _fits_shared_memory
-    base = _heuristic_config(head_dim, device)
-    major, _ = torch.cuda.get_device_capability(device)
-    bm0 = base["BLOCK_M"]
-    block_ms = sorted({max(16, bm0 // 2), bm0, min(128, bm0 * 2), min(128, bm0 * 4)})
-    stage_opts = (2, 3) if major >= 8 else (2,)
-    warp_opts  = (2, 4, 8)
-    seen, configs = set(), []
-    for bm in block_ms:
-        bn = min(bm, 64)
-        for nw in warp_opts:
-            for ns in stage_opts:
-                cfg = {"BLOCK_M": bm, "BLOCK_N": bn, "num_warps": nw, "num_stages": ns}
-                key = (bm, bn, nw, ns)
-                if key in seen or not _fits_shared_memory(cfg, head_dim, device):
-                    continue
-                seen.add(key)
-                configs.append(cfg)
-    return configs
+    from .autotune import _candidate_configs
+    return _candidate_configs(head_dim, device)
 
 
 def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
-                          cu_seqlens, tau_win, win_edge, cu_list):
+                          cu_seqlens, tau_win, win_edge, n_max, cu_list):
     """Tune the training kernel once per (head_dim, GPU), measuring a full fwd+bwd."""
     major, minor = torch.cuda.get_device_capability(device)
     key = (int(head_dim), int(major), int(minor))
@@ -474,7 +552,7 @@ def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
             vg = v_c.clone().requires_grad_(True)
             wd = w_d.clone().requires_grad_(True)
             o = DSALTTrainFunction.apply(
-                qg, kg, vg, lp, lw, wd, cu_seqlens, tau_win, win_edge, cu_list,
+                qg, kg, vg, lp, lw, wd, cu_seqlens, tau_win, win_edge, n_max, cu_list,
             )
             o.sum().backward()
 
@@ -504,7 +582,7 @@ def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
 class DSALTTrainFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
-                tau_win, win_edge, cu_list=None):
+                tau_win, win_edge, n_max, cu_list=None):
         total_len, n_heads, head_dim = q.shape
         device     = q.device
         scale      = 1.0 / math.sqrt(head_dim)
@@ -516,7 +594,7 @@ class DSALTTrainFunction(torch.autograd.Function):
         # kernel's). Runs at step 0, before the steady state.
         _maybe_autotune_train(
             head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
-            float(tau_win), float(win_edge), cu_list,
+            float(tau_win), float(win_edge), int(n_max), cu_list,
         )
 
         in_dtype = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else torch.float16
@@ -565,6 +643,8 @@ class DSALTTrainFunction(torch.autograd.Function):
 
         ctx.save_for_backward(q_c, k_c, v_c, out, lse, lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, w_c)
         ctx.k_lmk_pad     = k_lmk_pad
+        ctx.n_max         = int(n_max)
+        ctx.cu_list       = cu_list
         ctx.cu_seqlens    = cu_seqlens
         ctx.seq_block_map = seq_block_map
         ctx.total_blk     = total_blk
@@ -614,6 +694,26 @@ class DSALTTrainFunction(torch.autograd.Function):
             total_len=total_len, HEAD_DIM=ctx.HEAD_DIM_C, BLOCK_M=BLOCK_M, num_warps=4,
         )
 
+        # dk/dv of the band: key-parallel, NO atomics. Must run BEFORE the main
+        # kernel (which atomic_adds the landmark dk/dv on top of this band store).
+        kn_block_map, total_kn = _build_seq_block_map(ctx.cu_seqlens, BLOCK_N, device, ctx.cu_list)
+        _train_bwd_dkdv_kernel[(total_kn, n_heads)](
+            q_c, k_c, v_c, do_f, dk, dv,
+            lse, w_c, delta, cu_int, kn_block_map,
+            q_c.stride(0), q_c.stride(1), q_c.stride(2),
+            k_c.stride(0), k_c.stride(1), k_c.stride(2),
+            v_c.stride(0), v_c.stride(1), v_c.stride(2),
+            do_f.stride(0), do_f.stride(1), do_f.stride(2),
+            dk.stride(0), dk.stride(1), dk.stride(2),
+            dv.stride(0), dv.stride(1), dv.stride(2),
+            lse.stride(0), lse.stride(1),
+            delta.stride(0), delta.stride(1),
+            scale=ctx.scale, tau_win=ctx.tau_win, win_edge=ctx.win_edge,
+            N_MAX=ctx.n_max,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=ctx.HEAD_DIM_C,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+
         _train_bwd_kernel[(ctx.total_blk, n_heads)](
             q_c, k_c, v_c, do_f, dq, dk, dv, d_w,
             lse, w_c, lmk_K.to(in_dtype), lmk_V.to(in_dtype), lmk_pos_i, lmk_logw_c, d_logw,
@@ -649,19 +749,21 @@ class DSALTTrainFunction(torch.autograd.Function):
             d_logw.to(od),        # → α via autograd on log σ(s/τ)
             d_w_tok.to(od),       # → win_gate via autograd on w̃
             None, None, None,     # cu_seqlens, tau_win, win_edge
+            None,                 # n_max (constexpr, no grad)
             None,                 # cu_list (host helper, no grad)
         )
 
 
 def dsalt_triton_train_attention(q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
-                                 tau_win=1.0, win_edge=4.0, cu_list=None):
+                                 tau_win=1.0, win_edge=4.0, n_max=256, cu_list=None):
     """Differentiable sparse DSALT attention for training.
 
     ``lmk_logw`` (the per-landmark log σ(s/τ) weight, differentiable in α) and
     ``w_cont`` (the continuous per-token window, differentiable in win_gate) carry
     the gradients of §4.3 / §4.2; the function returns the attention output and
-    routes ``d_logw``/``d_w̃`` back to them through autograd.
+    routes ``d_logw``/``d_w̃`` back to them through autograd. ``n_max`` bounds the
+    key-parallel dk/dv scan in the backward.
     """
     return DSALTTrainFunction.apply(
-        q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens, tau_win, win_edge, cu_list,
+        q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens, tau_win, win_edge, n_max, cu_list,
     )
