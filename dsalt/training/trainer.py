@@ -648,7 +648,7 @@ class DSALTTrainer:
                 self.optimizer.step()
 
             gn_val = grad_norm.item() if grad_norm is not None else 0.0
-            if self.rank == 0 and self.global_step%50==0:
+            if self.rank == 0 and self.global_step%5==0:
                 print(f"Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
 
             self.scheduler.step()

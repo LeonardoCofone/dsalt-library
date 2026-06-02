@@ -388,21 +388,109 @@ class DSALTAttention(nn.Module):
             idx    = torch.arange(T, device=device)
             d      = idx.unsqueeze(1) - idx.unsqueeze(0)                          # [T,T] = i - j
             k_act  = min(self.k_lmk, T)
-            lmk_mask = torch.zeros(self.n_heads, T, T, dtype=torch.bool, device=device)
+            # is-landmark-key per head [H,T], fully vectorised (no python head loop)
+            sel_hk = torch.zeros(self.n_heads, T, dtype=torch.bool, device=device)
             if k_act > 0:
                 _, top = torch.topk(scores.detach(), k_act, dim=0, sorted=False)  # [k,H] key indices
-                for h in range(self.n_heads):
-                    cols = top[:, h]                                              # [k] selected keys
-                    sel  = torch.zeros(T, dtype=torch.bool, device=device)
-                    sel[cols] = True                                             # [T] is-landmark key
-                    sel_ij  = sel.unsqueeze(0).expand(T, T)                      # [T,T] over query i
-                    causal  = d >= 0                                             # j <= i
-                    out_win = d >= w_disc.unsqueeze(1)                           # j outside W(i): i-j ≥ w(i)
-                    lmk_mask[h] = sel_ij & causal & out_win
+                sel_hk.scatter_(1, top.transpose(0, 1), True)                     # [H,T]
+            # per-query validity (causal + outside the window) is head-independent
+            valid_ij = (d >= 0) & (d >= w_disc.unsqueeze(1))                      # [T,T]
+            lmk_mask = sel_hk.unsqueeze(1) & valid_ij.unsqueeze(0)               # [H,T,T]
 
         # -inf where there is no landmark, σ(s/τ) weight where selected (diff. in α).
         lmk_logbias = self._soft_landmark_logbias(scores, lmk_mask, T)           # [H,T,T]
         return win_logbias, lmk_logbias
+
+    def _packed_train(self, q, k, v, x, cu, lens, total_len, device):
+        """Differentiable training attention over packed sequences, sync-free.
+
+        When all sequences have the same length (the common PG-19 case, fixed
+        ``seq_len``) the whole batch is reshaped to ``[N, L, …]`` and attended in a
+        SINGLE batched SDPA call — no python loop, no per-sequence kernel launches.
+        Otherwise it falls back to a python loop driven by the host-side ``lens``
+        (still one D2H sync total, none inside the loop). Returns ``[total_len,H,D]``.
+        """
+        H, D = self.n_heads, self.head_dim
+        uniform = len(lens) > 0 and all(l == lens[0] for l in lens)
+
+        if uniform:
+            N, L = len(lens), lens[0]
+            qb = q.view(N, L, H, D).transpose(1, 2)                                # [N,H,L,D]
+            kb = k.view(N, L, H, D).transpose(1, 2)
+            vb = v.view(N, L, H, D).transpose(1, 2)
+            xb = x.view(N, L, self.d_model)                                        # [N,L,d]
+            logbias = self._diff_logbias_batched(xb, L, device)                   # [N,H,L,L]
+            ob = torch.nn.functional.scaled_dot_product_attention(
+                qb, kb, vb, attn_mask=logbias.to(qb.dtype),
+                dropout_p=self.dropout if self.dropout > 0 else 0.0,
+            )                                                                     # [N,H,L,D]
+            return ob.transpose(1, 2).reshape(total_len, H, D)
+
+        out = torch.empty_like(v)                                                  # [total_len,H,D]
+        for b in range(len(lens)):
+            s, Tb = cu[b], lens[b]
+            if Tb == 0:
+                continue
+            e  = s + Tb
+            qb = q[s:e].transpose(0, 1).unsqueeze(0)                               # [1,H,Tb,D]
+            kb = k[s:e].transpose(0, 1).unsqueeze(0)
+            vb = v[s:e].transpose(0, 1).unsqueeze(0)
+            logbias = self._diff_logbias_batched(x[s:e].unsqueeze(0), Tb, device)  # [1,H,Tb,Tb]
+            ob = torch.nn.functional.scaled_dot_product_attention(
+                qb, kb, vb, attn_mask=logbias.to(qb.dtype),
+                dropout_p=self.dropout if self.dropout > 0 else 0.0,
+            )
+            out[s:e] = ob.squeeze(0).transpose(0, 1)
+        return out
+
+    def _diff_logbias_batched(self, x: torch.Tensor, L: int, device: torch.device) -> torch.Tensor:
+        """Batched union log-bias ``[N,H,L,L]`` for ``x`` ``[N,L,d]`` (no head loop).
+
+        Same math as :meth:`_diff_logbias` (soft window edge + α-reweighted hard
+        landmarks, combined by elementwise max) but fully vectorised over the batch
+        and head axes, so the whole packed minibatch is one set of kernels.
+        """
+        N = x.shape[0]
+        H, dh = self.n_heads, self.head_dim
+        w_cont = self._window_continuous(x)                                        # [N,L] diff in win_gate
+        alpha  = self._alpha()                                                     # [H]   diff in alpha
+        # §4.3 hybrid score, standardised PER SEQUENCE (z-score over the L tokens of
+        # each sequence, not globally — must match the per-sequence semantics of
+        # hybrid_scores_per_head). Vectorised over the batch axis N.
+        x_norm = x.norm(dim=-1).float()                                            # [N,L]
+        z_x    = (x_norm - x_norm.mean(1, keepdim=True)) / x_norm.std(1, keepdim=True).clamp(min=1e-6)
+        xwv    = (x @ self.v_proj.weight.T).view(N, L, H, dh).norm(dim=-1).float() # [N,L,H]
+        z_v    = (xwv - xwv.mean(1, keepdim=True)) / xwv.std(1, keepdim=True).clamp(min=1e-6)
+        scores = alpha * z_v + (1.0 - alpha) * z_x.unsqueeze(-1)                   # [N,L,H] diff in α
+
+        idx = torch.arange(L, device=device)
+        d   = (idx.unsqueeze(1) - idx.unsqueeze(0)).float()                        # [L,L] = i - j
+
+        # --- soft window edge (trains win_gate), batched over N ---
+        w_i = w_cont.unsqueeze(-1)                                                 # [N,L,1] over key j
+        g   = torch.sigmoid((w_i - d.unsqueeze(0)) / self.tau_win)                # [N,L,L]
+        win_lb = torch.log(g.clamp(min=1e-20))
+        core   = d.unsqueeze(0) <= (w_i - self.win_edge)
+        win_lb = torch.where(core, torch.zeros_like(win_lb), win_lb)
+        win_lb = win_lb.masked_fill((d < 0).unsqueeze(0), float("-inf"))          # [N,L,L]
+
+        # --- hard landmark selection + soft α weight (trains alpha_w), batched ---
+        with torch.no_grad():
+            w_disc = w_cont.floor().clamp(min=1)                                   # [N,L]
+            k_act  = min(self.k_lmk, L)
+            sel    = torch.zeros(N, self.n_heads, L, dtype=torch.bool, device=device)
+            if k_act > 0:
+                # top-k over the key axis (dim=1) per (batch, head)
+                _, top = torch.topk(scores, k_act, dim=1, sorted=False)           # [N,k,H]
+                sel.scatter_(2, top.transpose(1, 2), True)                         # [N,H,L]
+            causal_outwin = (d >= 0).unsqueeze(0) & (d >= w_disc.unsqueeze(-1))    # [N,L,L]
+            lmk_mask = sel.unsqueeze(2) & causal_outwin.unsqueeze(1)              # [N,H,L,L]
+
+        w_lmk = torch.log(torch.sigmoid(scores / self.tau_lmk).clamp(min=1e-20))  # [N,L,H]
+        w_lmk = w_lmk.permute(0, 2, 1).unsqueeze(2).expand(N, self.n_heads, L, L)  # [N,H,L,L] over key j
+        lmk_lb = torch.where(lmk_mask, w_lmk, torch.full_like(w_lmk, float("-inf")))
+
+        return torch.maximum(win_lb.unsqueeze(1), lmk_lb)                          # [N,H,L,L]
 
     def _packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, total_len: int, device: torch.device, rope_cs: tuple | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         q = self.q_proj(x).view(total_len, self.n_heads, self.head_dim)
@@ -429,24 +517,12 @@ class DSALTAttention(nn.Module):
         # carry those gradients. Slower than Triton but exact and gradcheck-verified.
         # INFERENCE: fall through to the fast Triton (or SDPA) selector path below.
         if self.training:
-            num_seqs = cu_seqlens.shape[0] - 1
-            scale    = 1.0 / math.sqrt(self.head_dim)
-            out      = torch.empty_like(v)                                         # [total_len,H,D]
-            for b in range(num_seqs):
-                s, e = int(cu_seqlens[b]), int(cu_seqlens[b + 1])
-                Tb   = e - s
-                if Tb == 0:
-                    continue
-                qb = q[s:e].transpose(0, 1)                                        # [H,Tb,D]
-                kb = k[s:e].transpose(0, 1)
-                vb = v[s:e].transpose(0, 1)
-                win_lb, lmk_lb = self._diff_logbias(x[s:e], Tb, device)            # [Tb,Tb],[H,Tb,Tb]
-                logbias = torch.maximum(win_lb.unsqueeze(0), lmk_lb)               # [H,Tb,Tb]
-                sc = torch.matmul(qb, kb.transpose(-2, -1)).float() * scale        # [H,Tb,Tb]
-                P  = torch.softmax(sc + logbias, dim=-1)
-                if self.dropout > 0:
-                    P = torch.dropout(P, self.dropout, train=True)
-                out[s:e] = torch.matmul(P.to(vb.dtype), vb).transpose(0, 1)        # [Tb,H,D]
+            # Read cu_seqlens once on the host (a single D2H sync for the whole
+            # layer); drive everything with plain python ints so the body launches
+            # NO blocking .item() calls.
+            cu   = cu_seqlens.detach().to("cpu", non_blocking=False).tolist()
+            lens = [cu[b + 1] - cu[b] for b in range(len(cu) - 1)]
+            out  = self._packed_train(q, k, v, x, cu, lens, total_len, device)
             self._last_P = None
             return self.out_proj(out.view(total_len, self.d_model)), aux
 
