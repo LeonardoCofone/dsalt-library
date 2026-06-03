@@ -201,6 +201,29 @@ def compute_metrics(
         w_all   = torch.cat(win_vals_all)
         win_min, win_mean, win_max = w_all.min().item(), w_all.mean().item(), w_all.max().item()
 
+    # --- diagnostic: kernel key-block scan cost (the real it/s driver) ---
+    # The Triton fwd/bwd scan key blocks back to ``window_start = m_start -
+    # w_max_block + 1`` where ``w_max_block`` is the MAX of w̃ over each BLOCK_M
+    # block of queries (kernels/dsalt_triton_train.py:132). So ONE wide query in
+    # a block widens the scan for all 32. This metric reproduces that: it averages
+    # the per-block win-MAX across all query blocks, which is what actually grows
+    # as heads specialise — NOT the global mean. ``scan_ratio`` normalises it by
+    # the global win-mean so >1 quantifies the per-block MAX inflation tax.
+    scan_block_max = float("nan")
+    scan_ratio     = float("nan")
+    if win_vals_all:
+        _BM = 32  # matches the kernel's BLOCK_M tiling granularity for the scan
+        block_maxes = []
+        for w in win_vals_all:
+            T = w.numel()
+            pad = (-T) % _BM
+            wp = w if pad == 0 else torch.cat([w, w.new_zeros(pad)])
+            block_maxes.append(wp.view(-1, _BM).max(dim=1).values)
+        bm_all = torch.cat(block_maxes).float()
+        scan_block_max = bm_all.mean().item()
+        if win_mean and win_mean > 0:
+            scan_ratio = scan_block_max / win_mean
+
     oow_mass_per_layer = []
     for li, layer in enumerate(m.layers):
         attn = layer.attn
@@ -240,6 +263,8 @@ def compute_metrics(
         "win_mean": win_mean,
         "win_max": win_max,
         "win_per_layer": win_per_layer,
+        "scan_block_max": scan_block_max,
+        "scan_ratio": scan_ratio,
         "oow_mass_per_layer": oow_mass_per_layer,
     }
 
@@ -353,6 +378,7 @@ class DSALTTrainer:
             "eff_rank_per_layer", "res_per_layer", "token_dist_per_layer",
             "alpha_per_head", "alpha_min", "alpha_mean", "alpha_max",
             "win_min", "win_mean", "win_max", "win_per_layer",
+            "scan_block_max", "scan_ratio",
             "oow_mass_per_layer",
             "val_ppl", "val_steps", "gpu_mem_gb", "it_s", "tok_s",
         ]}
@@ -566,6 +592,7 @@ class DSALTTrainer:
             f"sink={_fs(metrics['attn_sink'])} | "
             f"head_std={_fs(metrics['head_spec_std'])} | "
             f"win={metrics['win_min']:.0f}/{metrics['win_mean']:.1f}/{metrics['win_max']:.0f} | "
+            f"scan={metrics['scan_block_max']:.1f} (×{metrics['scan_ratio']:.2f}) | "
             f"alpha={metrics['alpha_min']:.3f}/{metrics['alpha_mean']:.3f}/{metrics['alpha_max']:.3f}"
         )
         #print(f"--- [trainer] _log_step | {msg}")
@@ -586,6 +613,7 @@ class DSALTTrainer:
                   "eff_rank_per_layer", "res_per_layer", "token_dist_per_layer",
                   "alpha_per_head", "alpha_min", "alpha_mean", "alpha_max",
                   "win_min", "win_mean", "win_max", "win_per_layer",
+                  "scan_block_max", "scan_ratio",
                   "oow_mass_per_layer"]:
             self.history[k].append(metrics[k])
 
@@ -648,8 +676,8 @@ class DSALTTrainer:
                 self.optimizer.step()
 
             gn_val = grad_norm.item() if grad_norm is not None else 0.0
-            if self.rank == 0 and self.global_step%5==0:
-                print(f"Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
+            #if self.rank == 0 and self.global_step%5==0:
+                #print(f"Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
 
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
