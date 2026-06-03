@@ -592,7 +592,7 @@ class DSALTTrainer:
             f"sink={_fs(metrics['attn_sink'])} | "
             f"head_std={_fs(metrics['head_spec_std'])} | "
             f"win={metrics['win_min']:.0f}/{metrics['win_mean']:.1f}/{metrics['win_max']:.0f} | "
-            f"scan={metrics['scan_block_max']:.1f} (×{metrics['scan_ratio']:.2f}) | "
+            f"scan={metrics['scan_block_max']:.1f} x{metrics['scan_ratio']:.2f} | "
             f"alpha={metrics['alpha_min']:.3f}/{metrics['alpha_mean']:.3f}/{metrics['alpha_max']:.3f}"
         )
         #print(f"--- [trainer] _log_step | {msg}")
