@@ -37,7 +37,17 @@ from .dsalt_triton_attn import (
 from .landmark_tokens_ker import hybrid_scores_per_head
 from .autotune import get_tuned_config, _heuristic_config
 
+# Cap on BLOCK_N for the main bwd kernel (_train_bwd_kernel): it still does the
+# landmark dk/dv via atomic_add, so a larger key tile inflates smem/registers for
+# little gain. The band dk/dv now lives in the key-parallel _train_bwd_dkdv_kernel
+# (zero atomics): that one scales well with a bigger key tile (fewer programs,
+# larger dots, better occupancy), so it gets its own, larger cap below.
 _BWD_MAX_BLOCK_N = 32
+# The key-parallel dk/dv kernel has no atomics and benefits from a larger key
+# tile. We let it use up to this value (still ≥16 for legal T4 dots), decoupled
+# from the main bwd kernel's BLOCK_N. Tuned empirically on T4: the band dk/dv was
+# the single heaviest kernel (~68ms) and is GEMM-bound, not atomic-bound.
+_BWD_DKDV_BLOCK_N = 64
 
 # Triton's MMA on sm_75 (T4) requires every tl.dot dimension ≥ 16 (M,N,K).
 # The landmark tile contracts/produces along the K_LMK axis, so when the model
@@ -696,7 +706,12 @@ class DSALTTrainFunction(torch.autograd.Function):
 
         # dk/dv of the band: key-parallel, NO atomics. Must run BEFORE the main
         # kernel (which atomic_adds the landmark dk/dv on top of this band store).
-        kn_block_map, total_kn = _build_seq_block_map(ctx.cu_seqlens, BLOCK_N, device, ctx.cu_list)
+        # Uses its own (larger) key tile, decoupled from the main bwd's BLOCK_N:
+        # no atomics here, so a bigger tile = fewer programs + larger dots. The
+        # block_map must be built with the SAME BLOCK_N the kernel is launched with.
+        dkdv_block_n = min(ctx.BLOCK_N if ctx.BLOCK_N > _BWD_MAX_BLOCK_N else _BWD_DKDV_BLOCK_N,
+                           _BWD_DKDV_BLOCK_N)
+        kn_block_map, total_kn = _build_seq_block_map(ctx.cu_seqlens, dkdv_block_n, device, ctx.cu_list)
         _train_bwd_dkdv_kernel[(total_kn, n_heads)](
             q_c, k_c, v_c, do_f, dk, dv,
             lse, w_c, delta, cu_int, kn_block_map,
@@ -710,7 +725,7 @@ class DSALTTrainFunction(torch.autograd.Function):
             delta.stride(0), delta.stride(1),
             scale=ctx.scale, tau_win=ctx.tau_win, win_edge=ctx.win_edge,
             N_MAX=ctx.n_max,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=ctx.HEAD_DIM_C,
+            BLOCK_M=BLOCK_M, BLOCK_N=dkdv_block_n, HEAD_DIM=ctx.HEAD_DIM_C,
             num_warps=num_warps, num_stages=num_stages,
         )
 
