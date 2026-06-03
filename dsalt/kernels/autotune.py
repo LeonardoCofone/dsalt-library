@@ -90,14 +90,19 @@ def _heuristic_config(head_dim: int, device: torch.device) -> dict:
     }
 
 
-def _candidate_configs(head_dim: int, device: torch.device) -> list[dict]:
-    """Generate the candidates to benchmark (shared by inference and training).
+def _candidate_configs(head_dim: int, device: torch.device,
+                       with_bwd_tile: bool = False) -> list[dict]:
+    """Generate the candidates to benchmark (autotune phase 1).
 
     We vary ``BLOCK_M`` (½/1/2/4× the heuristic, within [16, 128]), ``num_warps``
     (2/4/8) and ``num_stages`` (2/3 on sm_80+). ``BLOCK_N`` is aligned to
-    ``BLOCK_M`` but capped at 64 (the bwd reduces it to 32 anyway). All filtered by
-    estimated shared memory. Kept identical to the training kernel's candidate set
-    so the two autotune tables are coherent (same count, same sweep).
+    ``BLOCK_M`` but capped at 64. All filtered by estimated shared memory.
+
+    ``with_bwd_tile`` (training only): seed every candidate with the safe baseline
+    backward key tile ``BLOCK_N_BWD = 32``. The *best* backward tile is searched in
+    a cheap PHASE 2 afterwards (`_bwd_tile_candidates`), once the forward axes are
+    fixed — this keeps phase 1 small (no BLOCK_N_BWD × warps blow-up) while still
+    choosing the bwd tile per device (T4→32, A100/H100→maybe 64/128).
     """
     base = _heuristic_config(head_dim, device)
     major, _ = torch.cuda.get_device_capability(device)
@@ -120,33 +125,83 @@ def _candidate_configs(head_dim: int, device: torch.device) -> list[dict]:
                     continue
                 if not _fits_shared_memory(cfg, head_dim, device):
                     continue
+                if with_bwd_tile:
+                    cfg["BLOCK_N_BWD"] = 32
                 seen.add(key)
                 configs.append(cfg)
 
     # Ensures the heuristic is always among the candidates.
     base_key = (base["BLOCK_M"], base["BLOCK_N"], base["num_warps"], base["num_stages"])
     if base_key not in seen:
+        if with_bwd_tile:
+            base = {**base, "BLOCK_N_BWD": 32}
         configs.append(base)
     return configs
 
 
-def _fits_shared_memory(cfg: dict, head_dim: int, device: torch.device) -> bool:
-    """Conservative estimate of a config's shared-memory footprint.
+def _bwd_tile_candidates(cfg: dict, head_dim: int, device: torch.device) -> list[dict]:
+    """Phase-2 candidates: vary only ``BLOCK_N_BWD`` around a fixed phase-1 config.
 
-    The kernel keeps the tiles ``q[BM, D]``, ``k/v[BN, D]`` and the accumulators
-    in registers/smem. We estimate the peak as ``(BM + 2*BN) * D`` elements at
-    4 bytes (fp32 accumulators) and compare it with the GPU's per-block smem.
-    Prudential margin: we use 75% of the declared maximum.
+    Given the winning forward config, try the backward key tile over {32, 64, 128}
+    filtered by the backward smem budget on THIS device. T4 (HEAD_DIM small) keeps
+    only 32; A100/H100 also get 64/128. Cheap: at most 3 benchmarks. Returns the
+    list including the incumbent (32) so the search never regresses below it.
     """
-    head_dim_c = triton.next_power_of_2(head_dim)
-    est_bytes = (cfg["BLOCK_M"] + 2 * cfg["BLOCK_N"]) * head_dim_c * 4
+    bm = cfg["BLOCK_M"]
+    tiles = [n for n in (32, 64, 128)
+             if n >= 16 and _bwd_tile_fits_smem(bm, n, head_dim, device)]
+    if 32 not in tiles:
+        tiles = [32] + tiles
+    out = []
+    for n in tiles:
+        out.append({**cfg, "BLOCK_N_BWD": n})
+    return out
+
+
+def _smem_budget(device: torch.device) -> int:
+    """Usable per-block shared memory in bytes (75% of the declared max).
+
+    Read dynamically from the device so the same code adapts across GPUs: T4
+    (sm_75) exposes ~64 KB, A100/H100 far more. The 75% margin leaves room for
+    the compiler's own scratch/spill.
+    """
     try:
         props = torch.cuda.get_device_properties(device)
         smem_max = getattr(props, "shared_memory_per_block_optin", None) \
             or props.shared_memory_per_block
     except Exception:
         smem_max = 48 * 1024  # conservative default
-    return est_bytes <= int(0.75 * smem_max)
+    return int(0.75 * smem_max)
+
+
+def _fits_shared_memory(cfg: dict, head_dim: int, device: torch.device) -> bool:
+    """Conservative estimate of a config's shared-memory footprint (forward).
+
+    The kernel keeps the tiles ``q[BM, D]``, ``k/v[BN, D]`` and the accumulators
+    in registers/smem. We estimate the peak as ``(BM + 2*BN) * D`` elements at
+    4 bytes (fp32 accumulators) and compare it with the GPU's per-block smem.
+    """
+    head_dim_c = triton.next_power_of_2(head_dim)
+    est_bytes = (cfg["BLOCK_M"] + 2 * cfg["BLOCK_N"]) * head_dim_c * 4
+    return est_bytes <= _smem_budget(device)
+
+
+def _bwd_tile_fits_smem(block_m: int, block_n_bwd: int, head_dim: int,
+                        device: torch.device) -> bool:
+    """Whether a backward key tile of ``block_n_bwd`` fits in shared memory.
+
+    The dk/dv kernel holds the tiles ``q/do[BM, D]`` and ``k/v[BN, D]`` in smem;
+    the ``dk/dv`` accumulators live in registers (not smem). So the smem estimate
+    is ``(2*BM + 2*BN) * D`` fp32 elements — same shape as the forward, just with
+    two query-side tiles (q and do). This is only a *pre-filter* to drop configs
+    that clearly cannot fit; the real benchmark still runs each survivor and a
+    config that overruns registers/smem fails there and is discarded. The filter
+    is read from the device, so a large BLOCK_N is dropped on T4 (HEAD_DIM=16) but
+    allowed on A100 — never hard-coded to one GPU.
+    """
+    head_dim_c = triton.next_power_of_2(head_dim)
+    est_bytes = (2 * block_m + 2 * block_n_bwd) * head_dim_c * 4
+    return est_bytes <= _smem_budget(device)
 
 
 def _bench_step(run_fwd_bwd, n_warmup: int = 3, n_iter: int = 10) -> float:
@@ -218,10 +273,13 @@ def autotune_blocks(head_dim: int, device: torch.device, make_runner, verbose: b
 def _print_table(head_dim, device, results, best_cfg, best_ms):
     name = torch.cuda.get_device_name(device)
     major, minor = torch.cuda.get_device_capability(device)
+    # Show the backward key tile column only when it is being tuned (training).
+    has_bwd = any("BLOCK_N_BWD" in c for c, _, _ in results)
     print("\n" + "─" * 68)
     print(f"  DSALT autotune  |  head_dim={head_dim}  |  {name} (sm_{major}{minor})")
     print("─" * 68)
-    print(f"  {'BLOCK_M':>8} {'BLOCK_N':>8} {'warps':>6} {'stages':>7} {'ms/step':>10}")
+    bwd_hdr = f" {'bwdN':>6}" if has_bwd else ""
+    print(f"  {'BLOCK_M':>8} {'BLOCK_N':>8}{bwd_hdr} {'warps':>6} {'stages':>7} {'ms/step':>10}")
     print("  " + "-" * 64)
 
     def _sort_key(r):
@@ -232,12 +290,14 @@ def _print_table(head_dim, device, results, best_cfg, best_ms):
         is_best = cfg == best_cfg and ms is not None
         mark = "  ←best" if is_best else ""
         time_str = f"{ms:10.4f}" if ms is not None else f"{err:>10}"
-        print(f"  {cfg['BLOCK_M']:>8} {cfg['BLOCK_N']:>8} {cfg['num_warps']:>6} "
+        bwd_col = f" {cfg.get('BLOCK_N_BWD', ''):>6}" if has_bwd else ""
+        print(f"  {cfg['BLOCK_M']:>8} {cfg['BLOCK_N']:>8}{bwd_col} {cfg['num_warps']:>6} "
               f"{cfg['num_stages']:>7} {time_str}{mark}")
 
     print("  " + "-" * 64)
     if best_ms is not None:
-        print(f"  choice: BLOCK_M={best_cfg['BLOCK_M']} BLOCK_N={best_cfg['BLOCK_N']} "
+        bwd_str = f" BLOCK_N_BWD={best_cfg['BLOCK_N_BWD']}" if "BLOCK_N_BWD" in best_cfg else ""
+        print(f"  choice: BLOCK_M={best_cfg['BLOCK_M']} BLOCK_N={best_cfg['BLOCK_N']}{bwd_str} "
               f"num_warps={best_cfg['num_warps']} num_stages={best_cfg['num_stages']} "
               f"({best_ms:.4f} ms/step)")
     else:

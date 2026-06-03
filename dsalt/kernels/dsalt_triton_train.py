@@ -37,17 +37,14 @@ from .dsalt_triton_attn import (
 from .landmark_tokens_ker import hybrid_scores_per_head
 from .autotune import get_tuned_config, _heuristic_config
 
-# Cap on BLOCK_N for the main bwd kernel (_train_bwd_kernel): it still does the
-# landmark dk/dv via atomic_add, so a larger key tile inflates smem/registers for
-# little gain. The band dk/dv now lives in the key-parallel _train_bwd_dkdv_kernel
-# (zero atomics): that one scales well with a bigger key tile (fewer programs,
-# larger dots, better occupancy), so it gets its own, larger cap below.
+# FALLBACK backward key tile, used only when the resolved config has no tuned
+# ``BLOCK_N_BWD`` (e.g. an inference-tuned config reused as fallback). The real
+# value is chosen PER DEVICE by the autotune (`_candidate_configs(with_bwd_tile=True)`
+# sweeps 32/64/128, smem-filtered). Why a conservative fallback: MEASURED on T4,
+# bumping the dk/dv kernel from 32 to 64 DOUBLED its time (68→146ms) — at HEAD_DIM=16
+# the larger key tile blows shared memory and kills occupancy. On A100/H100 the
+# autotune is free to pick 64/128; nothing here is hard-coded to one GPU.
 _BWD_MAX_BLOCK_N = 32
-# The key-parallel dk/dv kernel has no atomics and benefits from a larger key
-# tile. We let it use up to this value (still ≥16 for legal T4 dots), decoupled
-# from the main bwd kernel's BLOCK_N. Tuned empirically on T4: the band dk/dv was
-# the single heaviest kernel (~68ms) and is GEMM-bound, not atomic-bound.
-_BWD_DKDV_BLOCK_N = 64
 
 # Triton's MMA on sm_75 (T4) requires every tl.dot dimension ≥ 16 (M,N,K).
 # The landmark tile contracts/produces along the K_LMK axis, so when the model
@@ -525,12 +522,14 @@ def _resolve_cfg(head_dim: int, device: torch.device) -> dict:
 def _train_candidates(head_dim: int, device: torch.device) -> list[dict]:
     """Candidate configs for the training kernel.
 
-    Same sweep as the inference autotune (`_candidate_configs`: BLOCK_M ½/1/2/4×,
-    warps 2/4/8, smem-filtered) so the two autotune tables are coherent. Single
-    source of the candidate set → they cannot drift apart.
+    Same base sweep as the inference autotune (`_candidate_configs`: BLOCK_M
+    ½/1/2/4×, warps 2/4/8, smem-filtered) but with ``with_bwd_tile=True`` so the
+    backward key tile ``BLOCK_N_BWD`` is ALSO tuned per device (32/64/128, filtered
+    by the heavier backward smem budget). T4 will keep 32; A100/H100 can pick a
+    larger tile — measured, never hard-coded.
     """
     from .autotune import _candidate_configs
-    return _candidate_configs(head_dim, device)
+    return _candidate_configs(head_dim, device, with_bwd_tile=True)
 
 
 def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
@@ -583,6 +582,29 @@ def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
     valid = [(c, t) for (c, t, e) in results if t is not None]
     best_cfg = min(valid, key=lambda x: x[1])[0] if valid else _heuristic_config(head_dim, device)
     best_ms  = min((t for _, t, _ in results if t is not None), default=None)
+
+    # PHASE 2: with the forward axes fixed, search the backward key tile
+    # (BLOCK_N_BWD) per device. Cheap (≤3 benches) and only meaningful when the
+    # winning config actually has the field (training path). On T4 only 32 fits;
+    # bigger GPUs may pick 64/128. This is what keeps the bwd tile DYNAMIC instead
+    # of a hard-coded cap. We re-measure 32 here too so the comparison is apples-to-
+    # apples (same machine state) and never regresses below the phase-1 result.
+    if valid and "BLOCK_N_BWD" in best_cfg:
+        from .autotune import _bwd_tile_candidates
+        for cand in _bwd_tile_candidates(best_cfg, head_dim, device):
+            _TRAIN_TUNED[key] = cand
+            try:
+                ms = _bench_step(run)
+                results.append((cand, ms, None))
+            except Exception as e:
+                msg = f"{type(e).__name__}: {str(e).strip().splitlines()[-1][:40]}" if str(e).strip() else type(e).__name__
+                results.append((cand, None, msg))
+            finally:
+                del _TRAIN_TUNED[key]
+        valid = [(c, t) for (c, t, e) in results if t is not None]
+        best_cfg = min(valid, key=lambda x: x[1])[0]
+        best_ms  = min((t for _, t, _ in results if t is not None), default=None)
+
     _TRAIN_TUNED[key] = best_cfg
     if _is_main_process(device):
         print("  [DSALT train-kernel autotune]")
@@ -615,6 +637,10 @@ class DSALTTrainFunction(torch.autograd.Function):
         cfg     = _resolve_cfg(head_dim, device)
         BLOCK_M = cfg["BLOCK_M"]
         BLOCK_N = cfg["BLOCK_N"]
+        # Backward key tile: tuned per device (autotune sweeps BLOCK_N_BWD over
+        # 32/64/128, smem-filtered). Falls back to the legacy cap for configs that
+        # predate the field (e.g. an inference-tuned config reused as fallback).
+        BLOCK_N_BWD = cfg.get("BLOCK_N_BWD", min(BLOCK_N, _BWD_MAX_BLOCK_N))
 
         out = torch.zeros_like(q_c)
         lse = torch.empty((total_len, n_heads), device=device, dtype=torch.float32)
@@ -661,6 +687,7 @@ class DSALTTrainFunction(torch.autograd.Function):
         ctx.scale         = scale
         ctx.BLOCK_M       = BLOCK_M
         ctx.BLOCK_N       = BLOCK_N
+        ctx.BLOCK_N_BWD   = BLOCK_N_BWD
         ctx.HEAD_DIM_C    = HEAD_DIM_C
         ctx.k_lmk         = k_lmk
         ctx.tau_win       = float(tau_win)
@@ -687,7 +714,8 @@ class DSALTTrainFunction(torch.autograd.Function):
         delta = torch.empty(total_len, n_heads, device=device, dtype=torch.float32)
 
         BLOCK_M = ctx.BLOCK_M
-        BLOCK_N = min(ctx.BLOCK_N, _BWD_MAX_BLOCK_N)
+        # Backward key tile chosen by the autotune (per device), not a fixed cap.
+        BLOCK_N = ctx.BLOCK_N_BWD
         cu_int  = ctx.cu_seqlens.to(torch.int32).contiguous()
 
         from .autotune import get_tuned_config
@@ -706,12 +734,9 @@ class DSALTTrainFunction(torch.autograd.Function):
 
         # dk/dv of the band: key-parallel, NO atomics. Must run BEFORE the main
         # kernel (which atomic_adds the landmark dk/dv on top of this band store).
-        # Uses its own (larger) key tile, decoupled from the main bwd's BLOCK_N:
-        # no atomics here, so a bigger tile = fewer programs + larger dots. The
-        # block_map must be built with the SAME BLOCK_N the kernel is launched with.
-        dkdv_block_n = min(ctx.BLOCK_N if ctx.BLOCK_N > _BWD_MAX_BLOCK_N else _BWD_DKDV_BLOCK_N,
-                           _BWD_DKDV_BLOCK_N)
-        kn_block_map, total_kn = _build_seq_block_map(ctx.cu_seqlens, dkdv_block_n, device, ctx.cu_list)
+        # BLOCK_N here is the autotuned backward key tile (BLOCK_N_BWD): 32 on T4,
+        # potentially 64/128 on bigger GPUs. The block_map must match this BLOCK_N.
+        kn_block_map, total_kn = _build_seq_block_map(ctx.cu_seqlens, BLOCK_N, device, ctx.cu_list)
         _train_bwd_dkdv_kernel[(total_kn, n_heads)](
             q_c, k_c, v_c, do_f, dk, dv,
             lse, w_c, delta, cu_int, kn_block_map,
@@ -725,7 +750,7 @@ class DSALTTrainFunction(torch.autograd.Function):
             delta.stride(0), delta.stride(1),
             scale=ctx.scale, tau_win=ctx.tau_win, win_edge=ctx.win_edge,
             N_MAX=ctx.n_max,
-            BLOCK_M=BLOCK_M, BLOCK_N=dkdv_block_n, HEAD_DIM=ctx.HEAD_DIM_C,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=ctx.HEAD_DIM_C,
             num_warps=num_warps, num_stages=num_stages,
         )
 
