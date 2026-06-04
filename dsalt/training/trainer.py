@@ -360,20 +360,6 @@ class DSALTTrainer:
             mem = torch.cuda.memory_allocated(self.device) / 1e9
             #print(f"--- [trainer] GPU mem dopo .to(device): {mem:.3f}GB")
 
-        # Compile BEFORE wrapping in DDP. The DSALT Triton kernels are marked
-        # `torch._dynamo.disable` (opaque), so the compiler fuses the eager code
-        # around them (RoPE, selectors, RMSNorm, residuals, FFN, loss) — where the
-        # eager launch overhead lives — while the kernels run unchanged. We compile
-        # the bare module first so DDP's allreduce hooks wrap the compiled graph,
-        # not the other way round. fullgraph=False allows the clean graph-breaks at
-        # each opaque kernel; a hard failure falls back to eager (compile is a perf
-        # knob, never a correctness gate).
-        if compile_model and hasattr(torch, "compile"):
-            try:
-                model = torch.compile(model, fullgraph=False)
-            except Exception as e:  # pragma: no cover - environment dependent
-                print(f"[trainer] torch.compile failed ({type(e).__name__}); running eager.")
-
         if world_size > 1:
             #print(f"--- [trainer] wrapping in DDP | backend={ddp_backend} device_ids=[{local_rank}]")
             model = DDP(
@@ -384,6 +370,24 @@ class DSALTTrainer:
                 gradient_as_bucket_view=True,
             )
             #print(f"--- [trainer] DDP wrapping DONE")
+
+        # Compile AFTER wrapping in DDP — the PyTorch-recommended order for
+        # DDP + torch.compile. Compiling the bare module first and then wrapping in
+        # DDP broke the autograd graph here (loss lost its grad_fn: "element 0 ...
+        # does not require grad") because of the interaction between DDP's allreduce
+        # hooks, the compiled graph, and the opaque custom autograd Function
+        # (DSALTTrainFunction). With DDP outside, Dynamo's `DDPOptimizer` splits the
+        # graph at the allreduce buckets and the custom Function stays a clean
+        # graph-break. The DSALT Triton kernels are `torch._dynamo.disable`'d
+        # (opaque), so compile still fuses all the eager code around them (RoPE,
+        # selectors, RMSNorm, residuals, FFN, loss) — where the launch overhead
+        # lives. fullgraph=False allows those graph-breaks; a hard compile failure
+        # falls back to eager (compile is a perf knob, never a correctness gate).
+        if compile_model and hasattr(torch, "compile"):
+            try:
+                model = torch.compile(model, fullgraph=False)
+            except Exception as e:  # pragma: no cover - environment dependent
+                print(f"[trainer] torch.compile failed ({type(e).__name__}); running eager.")
 
         self.model = model
 
