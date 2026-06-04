@@ -10,6 +10,7 @@
         │    ├── dsalt_triton_attn.py # Triton forward kernel + autograd Function
         │    ├── dsalt_triton_bwd.py  # Triton backward kernel
         │    ├── autotune.py            # One-shot block-size autotuning (per head_dim, GPU)  
+        │    ├── loss_autotune.py       # Autotune for the loss calculation  
         │    ├── dsalt_triton_train.py  # train triton  
         │    ├── selectors.py           # Pure-PyTorch selector 
         │    ├── cross_entropy.py      # Fused cross-entropy, adapted from https://github.com/linkedin/Liger-Kernel
@@ -58,4 +59,5 @@ dsalt_triton_bwd.py    -> used in dsalt_triton_attn.py
 autotune.py            -> used in dsalt_triton_attn.py and dsalt_triton_bwd.py  
 RMSENorm.py            -> used in dsalt_transformer.py and dsalt_lm.py  
 dsalt_triton_train.py  -> used in dsalt_attention.py  
-selectors.py           -> used in dsalt_attention.py and dsalt_triton_attn.py
+selectors.py           -> used in dsalt_attention.py and dsalt_triton_attn.py  
+loss_autotune.py       -> used in dsalt_lm.py

@@ -51,7 +51,10 @@ def _liger_cross_entropy(
     return loss
 
 
+# Valid loss_fn values. "auto" is resolved per-(device, vocab) at first forward
+# via loss_autotune (chunked on T4, liger on A100+), then cached.
 _LOSS_FN = {
+    "auto":    None,
     "liger":   _liger_cross_entropy,
     "chunked": _chunked_cross_entropy,
 }
@@ -105,7 +108,7 @@ class DSALTLMHeadModel(nn.Module):
         tie_weights:        bool       = True,
         padding_idx:        int | None = None,
         lm_head_chunk_size: int        = 2048,
-        loss_fn:            str        = "chunked",
+        loss_fn:            str        = "auto",
         aux_loss_weight:    float      = 0.0,
     ):
         super().__init__()
@@ -163,12 +166,34 @@ class DSALTLMHeadModel(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
+    def _resolve_loss_fn(self, flat_x: torch.Tensor, flat_labels: torch.Tensor) -> tuple[str, int]:
+        """Resolve ``loss_fn="auto"`` to a concrete (loss_fn, chunk_size) per GPU.
+
+        Measured once per ``(device, vocab)`` then cached — same one-shot pattern
+        as the kernel block-size autotune. For explicit ``"chunked"``/``"liger"``
+        this is a no-op passthrough. Never hard-codes a device: ``"auto"`` picks
+        whatever wins on the card actually running (chunked on T4, liger on A100+).
+        """
+        if self.loss_fn != "auto":
+            return self.loss_fn, self.lm_head_chunk_size
+        from ..kernels.loss_autotune import autotune_loss
+        choice = autotune_loss(
+            flat_x, self.lm_head.weight, flat_labels,
+            vocab=self.vocab_size,
+            chunked_fn=_chunked_cross_entropy,
+            liger_fn=_liger_cross_entropy if _LIGER_OK else None,
+            liger_ok=_LIGER_OK,
+            default_chunk=self.lm_head_chunk_size,
+        )
+        return choice["loss_fn"], (choice["chunk_size"] or self.lm_head_chunk_size)
+
     def _compute_loss(self, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         flat_x      = x.view(-1, self.d_model)
         flat_labels = labels.view(-1)
-        if self.loss_fn == "liger":
+        loss_fn, chunk = self._resolve_loss_fn(flat_x, flat_labels)
+        if loss_fn == "liger":
             return _liger_cross_entropy(flat_x, self.lm_head.weight, flat_labels)
-        return _chunked_cross_entropy(flat_x, self.lm_head.weight, flat_labels, self.lm_head_chunk_size)
+        return _chunked_cross_entropy(flat_x, self.lm_head.weight, flat_labels, chunk)
 
     def forward(
         self,

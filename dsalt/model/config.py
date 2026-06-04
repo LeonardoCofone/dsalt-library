@@ -42,7 +42,7 @@ class DSALTConfig:
     tie_weights:        bool       = True
     padding_idx:        int | None = None
     lm_head_chunk_size: int        = 2048
-    loss_fn:            str        = "chunked"
+    loss_fn:            str        = "auto"
     aux_loss_weight:    float      = 0.0
 
     def __post_init__(self) -> None:
@@ -54,8 +54,8 @@ class DSALTConfig:
             raise ValueError(f"required 0 <= n_min <= n_max, got n_min={self.n_min} n_max={self.n_max}")
         if self.k_lmk < 0:
             raise ValueError(f"k_lmk must be >= 0, got {self.k_lmk}")
-        if self.loss_fn not in ("chunked", "liger"):
-            raise ValueError(f"loss_fn must be 'chunked' or 'liger', got {self.loss_fn!r}")
+        if self.loss_fn not in ("auto", "chunked", "liger"):
+            raise ValueError(f"loss_fn must be 'auto', 'chunked' or 'liger', got {self.loss_fn!r}")
 
     # --- serialization ---
     def to_dict(self) -> dict:
