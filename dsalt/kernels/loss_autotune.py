@@ -135,6 +135,7 @@ def autotune_loss(
 
     n_tok = x.shape[0]
     results: list[tuple[str, int | None, float]] = []
+    main = _is_main_process(device)
 
     # Isolated leaves (clones requiring grad) so the bench's fwd+bwd never touches
     # the live forward graph or its tensors' grads.
@@ -142,14 +143,30 @@ def autotune_loss(
     w_leaf = weight.detach().clone().requires_grad_(True)
     lbl    = labels.detach()
 
+    # Progress log (only on the main rank), in the same spirit as the kernel
+    # block-size autotune: one line per benchmarked candidate so the user sees
+    # the tuner working instead of a silent stall on the first forward.
+    chunk_cands = _chunk_candidates(n_tok, vocab)
+    n_cands = len(chunk_cands) + 1  # + liger
+    if main:
+        name = torch.cuda.get_device_name(device)
+        print(f"\n  DSALT loss autotune | vocab={vocab} | n_tok={n_tok} | {name}")
+        print(f"  measuring {n_cands} candidate(s) (fwd+bwd, isolated leaves)…")
+
     # chunked: sweep chunk_size candidates derived from the runtime token count.
-    for cs in _chunk_candidates(n_tok, vocab):
+    for i, cs in enumerate(chunk_cands, start=1):
         ms = _bench(lambda cs=cs: chunked_fn(x_leaf, w_leaf, lbl, cs), x_leaf, w_leaf)
         results.append(("chunked", cs, ms))
+        if main:
+            ms_s = "OOM/fail" if ms == float("inf") else f"{ms:8.4f} ms"
+            print(f"    [{i}/{n_cands}] chunked  chunk={cs:<8} {ms_s}")
 
     # liger: single fused config (its own internal block sizing is shape-driven).
     ms = _bench(lambda: liger_fn(x_leaf, w_leaf, lbl), x_leaf, w_leaf)
     results.append(("liger", None, ms))
+    if main:
+        ms_s = "OOM/fail" if ms == float("inf") else f"{ms:8.4f} ms"
+        print(f"    [{n_cands}/{n_cands}] liger    chunk={'-':<8} {ms_s}")
 
     x_leaf.grad = None
     w_leaf.grad = None
@@ -171,23 +188,30 @@ def autotune_loss(
 
 def _print_table(device, vocab, results, choice) -> None:
     name = torch.cuda.get_device_name(device)
-    line = "─" * 64
-    print(f"\n{line}")
-    print(f"  DSALT loss autotune  |  vocab={vocab}  |  {name}")
-    print(line)
-    print(f"   {'loss_fn':<10}{'chunk':>10}{'ms/call':>12}")
-    print("  " + "-" * 50)
+    major, minor = torch.cuda.get_device_capability(device)
+    print("\n" + "─" * 68)
+    print(f"  DSALT loss autotune  |  vocab={vocab}  |  {name} (sm_{major}{minor})")
+    print("─" * 68)
+    print(f"  {'loss_fn':>10} {'chunk':>10} {'ms/step':>12}")
+    print("  " + "-" * 64)
     best_ms = min((m for *_, m in results if m != float("inf")), default=None)
-    for fn, cs, ms in sorted(results, key=lambda r: (r[2] if r[2] != float("inf") else 1e18)):
+
+    def _sort_key(r):
+        ms = r[2]
+        return (ms == float("inf"), ms if ms != float("inf") else 0.0)
+
+    for fn, cs, ms in sorted(results, key=_sort_key):
         cs_s = "-" if cs is None else str(cs)
         if ms == float("inf"):
-            ms_s = "OOM/fail"
+            ms_s = f"{'OOM/fail':>12}"
+            mark = ""
         else:
-            ms_s = f"{ms:.4f}"
-            if ms == best_ms:
-                ms_s += "  ←best"
-        print(f"   {fn:<10}{cs_s:>10}{ms_s:>12}")
-    print("  " + "-" * 50)
+            ms_s = f"{ms:12.4f}"
+            mark = "  ←best" if ms == best_ms else ""
+        print(f"  {fn:>10} {cs_s:>10} {ms_s}{mark}")
+
+    print("  " + "-" * 64)
     cs_s = "-" if choice["chunk_size"] is None else str(choice["chunk_size"])
-    print(f"  choice: loss_fn={choice['loss_fn']} chunk_size={cs_s}")
-    print(line)
+    best_str = f" ({best_ms:.4f} ms/step)" if best_ms is not None else ""
+    print(f"  choice: loss_fn={choice['loss_fn']} chunk_size={cs_s}{best_str}")
+    print("─" * 68 + "\n")
