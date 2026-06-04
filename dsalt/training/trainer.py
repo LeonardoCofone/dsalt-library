@@ -319,6 +319,15 @@ class DSALTTrainer:
         self.logger = get_logger("dsalt.trainer", log_dir=str(self.save_dir))
         self.device = get_device(local_rank)
 
+        # Portable perf knobs: TF32 speeds up fp32 GEMMs (FFN/lm_head matmuls) on
+        # Ampere+ (A100/H100/L4) — inert on T4 (sm_75 has no TF32), so harmless on
+        # Kaggle but a real win the day this runs on a newer GPU. cudnn.benchmark
+        # picks the fastest conv/algo per shape (shapes here are fixed-length).
+        if self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32       = True
+            torch.backends.cudnn.benchmark        = True
+
         self._amp_dtype = self._resolve_amp_dtype(mixed_precision)
         self._use_amp   = self._amp_dtype is not None
         self._scaler    = (
@@ -453,8 +462,9 @@ class DSALTTrainer:
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         max_seqlen = int(max_seqlen)
         #print(f"--- [trainer] _extract_batch | ids={tuple(ids.shape)} labels={tuple(labels.shape)} cu_seqlens={tuple(cu_seqlens.shape)} max_seqlen={max_seqlen}")
-        n_valid = (labels != -100).sum().item()
-        #print(f"--- [trainer] _extract_batch | valid tokens={n_valid}/{labels.numel()} | cu_seqlens={cu_seqlens.tolist()}")
+        # NOTE: removed a per-batch ``(labels != -100).sum().item()`` that only fed a
+        # commented-out debug print — ``.item()`` forces a D2H sync that stalls the
+        # GPU queue every batch. Pure waste; the loss already counts valid tokens.
         return ids, labels, cu_seqlens, max_seqlen
 
     def _forward_step(self, batch) -> torch.Tensor:
