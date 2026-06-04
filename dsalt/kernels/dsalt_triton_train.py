@@ -794,6 +794,20 @@ class DSALTTrainFunction(torch.autograd.Function):
         )
 
 
+# torch.compile / Dynamo must treat the hand-written Triton autograd Function as
+# an OPAQUE op: it cannot trace through `DSALTTrainFunction.apply` (custom backward
+# + raw Triton launches) and would otherwise graph-break or fail. Wrapping the
+# entry point with `torch._dynamo.disable` forces a clean graph-break exactly here,
+# so the compiler still fuses everything AROUND it (RoPE, selectors, norm, residual,
+# FFN, loss) — which is where the eager overhead lives — while the kernel runs
+# unchanged. Guarded getattr so the lib still imports on torch builds without
+# `_dynamo` (the decorator then degrades to identity).
+def _dynamo_opaque(fn):
+    disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
+    return disable(fn) if disable is not None else fn
+
+
+@_dynamo_opaque
 def dsalt_triton_train_attention(q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
                                  tau_win=1.0, win_edge=4.0, n_max=256, cu_list=None):
     """Differentiable sparse DSALT attention for training.
@@ -803,6 +817,9 @@ def dsalt_triton_train_attention(q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
     the gradients of §4.3 / §4.2; the function returns the attention output and
     routes ``d_logw``/``d_w̃`` back to them through autograd. ``n_max`` bounds the
     key-parallel dk/dv scan in the backward.
+
+    Marked ``torch._dynamo.disable`` (opaque to torch.compile): the compiler fuses
+    the eager code around it but never traces the custom Function / Triton launches.
     """
     return DSALTTrainFunction.apply(
         q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens, tau_win, win_edge, n_max, cu_list,

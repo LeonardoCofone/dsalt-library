@@ -325,6 +325,15 @@ class DSALTAttentionFunction(torch.autograd.Function):
             None, d_bias.to(ctx.out_dtype), None, None,
         )
 
+# Opaque to torch.compile/Dynamo: the inference kernel is a custom autograd
+# Function with raw Triton launches — the compiler must graph-break here and never
+# trace inside. Guarded getattr so the lib still imports without `torch._dynamo`.
+def _dynamo_opaque(fn):
+    disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
+    return disable(fn) if disable is not None else fn
+
+
+@_dynamo_opaque
 def dsalt_triton_attention(
     q:           torch.Tensor,
     k:           torch.Tensor,

@@ -30,7 +30,12 @@ def _chunked_cross_entropy(
     for start in range(0, total, chunk_size):
         end = min(start + chunk_size, total)
         y_c = labels[start:end]
-        logits = F.linear(x[start:end], weight).float()
+        # No explicit ``.float()``: F.cross_entropy already upcasts the logits to
+        # fp32 internally for the log_softmax, so a manual fp32 copy of the
+        # ``[chunk, vocab]`` logits was pure overhead (profiled at ~24.6ms / step on
+        # T4, the dominant aten::copy_). Passing the fp16 logits straight in keeps
+        # the same numerics (fp32 softmax) without materialising the fp32 tensor.
+        logits = F.linear(x[start:end], weight)
         loss = F.cross_entropy(logits, y_c, ignore_index=-100, reduction="sum")
         loss_acc  += loss
         valid_acc += (y_c != -100).sum()
@@ -87,7 +92,13 @@ class DSALTLMHeadModel(nn.Module):
         tie_weights:        Tie the LM head weights to the embedding.
         padding_idx:        Padding index for the embedding.
         lm_head_chunk_size: Chunk for the "chunked" cross-entropy (memory).
-        loss_fn:            ``"chunked"`` (default) or ``"liger"`` (requires Triton).
+        loss_fn:            ``"chunked"`` (default, memory-frugal), ``"liger"``
+                            (fused Triton, wins on A100+), or ``"auto"`` (measure
+                            per-GPU). NOTE: ``"chunked"`` with a large chunk is
+                            fastest on T4 but materialises ``[chunk, vocab]`` fp32
+                            logits — a big memory peak. ``"auto"`` picks by speed
+                            only; prefer it on big-VRAM GPUs where ``liger`` (no
+                            logits materialisation) wins, not on T4.
         aux_loss_weight:    Weight of the auxiliary term (inert: frozen window,
                             kept for signature compatibility).
     """
@@ -108,7 +119,7 @@ class DSALTLMHeadModel(nn.Module):
         tie_weights:        bool       = True,
         padding_idx:        int | None = None,
         lm_head_chunk_size: int        = 2048,
-        loss_fn:            str        = "auto",
+        loss_fn:            str        = "chunked",
         aux_loss_weight:    float      = 0.0,
     ):
         super().__init__()

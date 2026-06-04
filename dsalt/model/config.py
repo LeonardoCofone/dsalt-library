@@ -42,7 +42,7 @@ class DSALTConfig:
     tie_weights:        bool       = True
     padding_idx:        int | None = None
     lm_head_chunk_size: int        = 2048
-    loss_fn:            str        = "auto"
+    loss_fn:            str        = "chunked"
     aux_loss_weight:    float      = 0.0
 
     def __post_init__(self) -> None:

@@ -21,11 +21,21 @@ from .logging_config import get_logger, StepTimer
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
-    if isinstance(model, DDP):
-        return model.module
-    if hasattr(model, "_orig_mod"):
-        inner = model._orig_mod
-        return inner.module if isinstance(inner, DDP) else inner
+    """Strip DDP and torch.compile wrappers in any nesting order.
+
+    We now compile BEFORE DDP (DDP outside, ``_orig_mod`` inside), but older code
+    compiled after (``_orig_mod`` outside, DDP inside). Peel both wrappers in a loop
+    so the real module is returned regardless of order.
+    """
+    seen = 0
+    while seen < 4:  # at most DDP+compile, bounded loop guards against cycles
+        if isinstance(model, DDP):
+            model = model.module
+        elif hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        else:
+            break
+        seen += 1
     return model
 
 
@@ -350,6 +360,20 @@ class DSALTTrainer:
             mem = torch.cuda.memory_allocated(self.device) / 1e9
             #print(f"--- [trainer] GPU mem dopo .to(device): {mem:.3f}GB")
 
+        # Compile BEFORE wrapping in DDP. The DSALT Triton kernels are marked
+        # `torch._dynamo.disable` (opaque), so the compiler fuses the eager code
+        # around them (RoPE, selectors, RMSNorm, residuals, FFN, loss) — where the
+        # eager launch overhead lives — while the kernels run unchanged. We compile
+        # the bare module first so DDP's allreduce hooks wrap the compiled graph,
+        # not the other way round. fullgraph=False allows the clean graph-breaks at
+        # each opaque kernel; a hard failure falls back to eager (compile is a perf
+        # knob, never a correctness gate).
+        if compile_model and hasattr(torch, "compile"):
+            try:
+                model = torch.compile(model, fullgraph=False)
+            except Exception as e:  # pragma: no cover - environment dependent
+                print(f"[trainer] torch.compile failed ({type(e).__name__}); running eager.")
+
         if world_size > 1:
             #print(f"--- [trainer] wrapping in DDP | backend={ddp_backend} device_ids=[{local_rank}]")
             model = DDP(
@@ -362,9 +386,6 @@ class DSALTTrainer:
             #print(f"--- [trainer] DDP wrapping DONE")
 
         self.model = model
-
-        if compile_model and hasattr(torch, "compile"):
-            self.model = torch.compile(self.model)
 
         self.train_loader = train_loader
         self.val_loader   = val_loader
