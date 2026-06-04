@@ -57,13 +57,17 @@ def _is_main_process(device: torch.device | None = None) -> bool:
 def _chunk_candidates(n_tok: int, vocab: int) -> list[int]:
     """Candidate ``chunk_size`` values for the chunked loss, derived from runtime.
 
-    Fractions of the real token count (full / 2 / 4 / 8 / 16), clamped to a sane
-    floor and to ``n_tok``. NOT a fixed constant: a big-VRAM GPU keeps the large
-    chunk (fewer kernel launches), a small one falls back to smaller chunks. The
+    Fractions of the real token count (1/16 … full), clamped to a sane floor and
+    to ``n_tok``. NOT a fixed constant: a big-VRAM GPU keeps the large chunk
+    (fewer kernel launches), a small one falls back to smaller chunks. The
     measurement decides — this only enumerates plausible sizes.
+
+    Returned in **ascending** order so the caller can sweep small→large and stop
+    at the first OOM: a larger chunk allocates strictly more (its ``[chunk,
+    vocab]`` fp32 logits grow), so once one OOMs every larger one would too.
     """
     cands: list[int] = []
-    for div in (1, 2, 4, 8, 16):
+    for div in (16, 8, 4, 2, 1):
         c = max(256, (n_tok + div - 1) // div)
         c = min(c, n_tok)
         if c not in cands:
@@ -71,30 +75,37 @@ def _chunk_candidates(n_tok: int, vocab: int) -> list[int]:
     return cands
 
 
-def _bench(loss_call, x_leaf, w_leaf, warmup: int = 2, iters: int = 5) -> float:
-    """CUDA fwd+bwd time (ms) of a loss strategy on isolated leaves; ``inf`` on fail.
+def _bench(loss_call, warmup: int = 2, iters: int = 5) -> float:
+    """CUDA forward-only time (ms) of a loss strategy; ``inf`` on OOM/fail.
 
-    Both strategies are timed forward **and** backward on detached leaves that
-    require grad: this is the fair comparison (Liger computes its gradients inside
-    the forward, gated on ``requires_grad``, so a no-grad bench would under-time it;
-    chunked's backward is a dense softmax-grad that must count too). The leaves are
-    local clones, so nothing touches the live forward graph or its memory.
+    Timed **forward-only** under ``torch.no_grad()`` on detached *views* of the
+    live tensors (no clones, no extra grad buffers): this is the whole point of
+    the design choice — the autotune fires inside the first forward, while the
+    training graph is still alive and VRAM is already tight, so allocating clones
+    of the 50k×512 embedding + their grads is exactly what blew up the T4. A
+    forward-only measure on views adds ~zero memory.
+
+    Forward-only is enough to *rank* the strategies: chunked's cost is dominated
+    by the fp32 logits materialisation + dense softmax (a forward effect), and
+    Liger's whole advantage is *not* materialising those logits — visible in the
+    forward already. The backward tracks the forward for both, so the order is
+    preserved on every GPU (chunked wins on T4, liger wins on A100+).
+
+    ``empty_cache()`` is called on OOM so a failed (too-large) candidate does not
+    leave fragmentation behind for the next candidate or for the real training.
     """
     try:
-        for _ in range(warmup):
-            x_leaf.grad = None
-            w_leaf.grad = None
-            loss_call().backward()
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end   = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            x_leaf.grad = None
-            w_leaf.grad = None
-            loss_call().backward()
-        end.record()
-        torch.cuda.synchronize()
+        with torch.no_grad():
+            for _ in range(warmup):
+                loss_call()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end   = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                loss_call()
+            end.record()
+            torch.cuda.synchronize()
         return start.elapsed_time(end) / iters
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
@@ -137,11 +148,14 @@ def autotune_loss(
     results: list[tuple[str, int | None, float]] = []
     main = _is_main_process(device)
 
-    # Isolated leaves (clones requiring grad) so the bench's fwd+bwd never touches
-    # the live forward graph or its tensors' grads.
-    x_leaf = x.detach().clone().requires_grad_(True)
-    w_leaf = weight.detach().clone().requires_grad_(True)
-    lbl    = labels.detach()
+    # Detached VIEWS of the live tensors — NOT clones. The autotune runs inside
+    # the first forward, with the training graph alive and VRAM already tight;
+    # cloning the 50k×512 embedding + grads is what OOM'd the T4. Forward-only
+    # under no_grad on these views never writes a grad into the real parameter
+    # and allocates ~nothing beyond each candidate's own logits.
+    x_d = x.detach()
+    w_d = weight.detach()
+    lbl = labels.detach()
 
     # Progress log (only on the main rank), in the same spirit as the kernel
     # block-size autotune: one line per benchmarked candidate so the user sees
@@ -151,25 +165,32 @@ def autotune_loss(
     if main:
         name = torch.cuda.get_device_name(device)
         print(f"\n  DSALT loss autotune | vocab={vocab} | n_tok={n_tok} | {name}")
-        print(f"  measuring {n_cands} candidate(s) (fwd+bwd, isolated leaves)…")
+        print(f"  measuring {n_cands} candidate(s) (forward-only, no clones)…")
 
-    # chunked: sweep chunk_size candidates derived from the runtime token count.
+    # chunked: sweep chunk_size candidates small→large; stop at the first OOM
+    # (a larger chunk allocates strictly more, so it would OOM too).
     for i, cs in enumerate(chunk_cands, start=1):
-        ms = _bench(lambda cs=cs: chunked_fn(x_leaf, w_leaf, lbl, cs), x_leaf, w_leaf)
+        ms = _bench(lambda cs=cs: chunked_fn(x_d, w_d, lbl, cs))
         results.append(("chunked", cs, ms))
         if main:
             ms_s = "OOM/fail" if ms == float("inf") else f"{ms:8.4f} ms"
             print(f"    [{i}/{n_cands}] chunked  chunk={cs:<8} {ms_s}")
+        if ms == float("inf"):
+            # Skip the remaining (larger) chunked candidates — all would OOM.
+            for cs_skip in chunk_cands[i:]:
+                results.append(("chunked", cs_skip, float("inf")))
+            break
 
     # liger: single fused config (its own internal block sizing is shape-driven).
-    ms = _bench(lambda: liger_fn(x_leaf, w_leaf, lbl), x_leaf, w_leaf)
+    ms = _bench(lambda: liger_fn(x_d, w_d, lbl))
     results.append(("liger", None, ms))
     if main:
         ms_s = "OOM/fail" if ms == float("inf") else f"{ms:8.4f} ms"
         print(f"    [{n_cands}/{n_cands}] liger    chunk={'-':<8} {ms_s}")
 
-    x_leaf.grad = None
-    w_leaf.grad = None
+    # Release any scratch the candidates left so the real training step starts
+    # from a clean allocator (no fragmentation carried over from the sweep).
+    torch.cuda.empty_cache()
 
     valid = [r for r in results if r[2] != float("inf")]
     if not valid:
