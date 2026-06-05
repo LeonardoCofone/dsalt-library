@@ -203,7 +203,11 @@ class DSALTLMHeadModel(nn.Module):
 
     def _compute_loss(self, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         flat_x      = x.view(-1, self.d_model)
-        flat_labels = labels.view(-1)
+        # F.cross_entropy targets must be int64: its internal ``torch.gather`` rejects
+        # int32 indices ("Expected dtype int64 for index, but got torch.int32"). Eager
+        # was lenient on some paths; under torch.compile Inductor traces the gather and
+        # enforces it. Cast here so both the chunked and liger paths get int64 targets.
+        flat_labels = labels.view(-1).long()
         loss_fn, chunk = self._resolve_loss_fn(flat_x, flat_labels)
         if loss_fn == "liger":
             return _liger_cross_entropy(flat_x, self.lm_head.weight, flat_labels)
