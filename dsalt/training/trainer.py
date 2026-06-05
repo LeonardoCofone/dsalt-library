@@ -1,6 +1,4 @@
 import math
-import os
-import time
 from pathlib import Path
 import contextlib
 
@@ -46,7 +44,6 @@ def compute_metrics(
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
     ) -> dict:
-    t0 = time.perf_counter()
     m = _unwrap_model(model)
     m.eval()
 
@@ -75,7 +72,7 @@ def compute_metrics(
         sv_norm = sv / (sv.sum() + 1e-9)
         eff_rank = torch.exp(-(sv_norm * (sv_norm + 1e-9).log()).sum()).item()
     else:
-        print(f"--- [trainer] compute_metrics | WARNING: _last_P not available (training mode or packed?)")
+        print("[trainer] compute_metrics: _last_P unavailable (training mode / packed) — skipping rank/entropy stats")
 
     for li, layer in enumerate(m.layers):
         attn = layer.attn
@@ -217,7 +214,7 @@ def compute_metrics(
     # block of queries (kernels/dsalt_triton_train.py:132). So ONE wide query in
     # a block widens the scan for all 32. This metric reproduces that: it averages
     # the per-block win-MAX across all query blocks, which is what actually grows
-    # as heads specialise — NOT the global mean. ``scan_ratio`` normalises it by
+    # as heads specialise, NOT the global mean. ``scan_ratio`` normalises it by
     # the global win-mean so >1 quantifies the per-block MAX inflation tax.
     scan_block_max = float("nan")
     scan_ratio     = float("nan")
@@ -330,7 +327,7 @@ class DSALTTrainer:
         self.device = get_device(local_rank)
 
         # Portable perf knobs: TF32 speeds up fp32 GEMMs (FFN/lm_head matmuls) on
-        # Ampere+ (A100/H100/L4) — inert on T4 (sm_75 has no TF32), so harmless on
+        # Ampere+ (A100/H100/L4), inert on T4 (sm_75 has no TF32), so harmless on
         # Kaggle but a real win the day this runs on a newer GPU. cudnn.benchmark
         # picks the fastest conv/algo per shape (shapes here are fixed-length).
         if self.device.type == "cuda":
@@ -345,23 +342,13 @@ class DSALTTrainer:
             if self._use_amp and self._amp_dtype == torch.float16
             else None
         )
-        #print(f"--- [trainer] AMP | _amp_dtype={self._amp_dtype} _use_amp={self._use_amp} scaler={'GradScaler' if self._scaler else 'None'}")
 
         if gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
-            #print(f"--- [trainer] gradient_checkpointing_enable() called")
 
-        #print(f"--- [trainer] moving model to {self.device}")
-        t_to = time.perf_counter()
         model = model.to(self.device)
-        #print(f"--- [trainer] model on device | t={time.perf_counter()-t_to:.2f}s")
-
-        if torch.cuda.is_available():
-            mem = torch.cuda.memory_allocated(self.device) / 1e9
-            #print(f"--- [trainer] GPU mem dopo .to(device): {mem:.3f}GB")
 
         if world_size > 1:
-            #print(f"--- [trainer] wrapping in DDP | backend={ddp_backend} device_ids=[{local_rank}]")
             model = DDP(
                 model,
                 device_ids=[local_rank],
@@ -369,18 +356,17 @@ class DSALTTrainer:
                 find_unused_parameters=False,
                 gradient_as_bucket_view=True,
             )
-            #print(f"--- [trainer] DDP wrapping DONE")
 
-        # Compile AFTER wrapping in DDP — the PyTorch-recommended order for
+        # Compile AFTER wrapping in DDP, the PyTorch-recommended order for
         # DDP + torch.compile. The DSALT Triton kernels are `torch._dynamo.disable`'d
         # (opaque), so compile still fuses all the eager code around them (RoPE,
-        # selectors, RMSNorm, residuals, FFN, loss) — where the launch overhead lives.
+        # selectors, RMSNorm, residuals, FFN, loss), where the launch overhead lives.
         # fullgraph=False allows those graph-breaks; a hard compile failure falls back
         # to eager (compile is a perf knob, never a correctness gate).
         #
         # DDPOptimizer OFF under DDP: Dynamo's `DDPOptimizer` splits the compiled
         # graph at DDP allreduce buckets, but it does NOT cope with our opaque custom
-        # autograd Function (DSALTTrainFunction) sitting mid-graph — the backward link
+        # autograd Function (DSALTTrainFunction) sitting mid-graph, the backward link
         # between the post-kernel subgraph (loss) and the pre-kernel params is severed,
         # so `loss.backward()` raises "element 0 ... does not require grad". Disabling
         # DDPOptimizer keeps a single fused graph with clean graph-breaks at the kernel
@@ -422,7 +408,6 @@ class DSALTTrainer:
             "oow_mass_per_layer",
             "val_ppl", "val_steps", "gpu_mem_gb", "it_s", "tok_s",
         ]}
-        #print(f"--- [trainer] DSALTTrainer init DONE")
 
     def _resolve_amp_dtype(self, mixed_precision: str) -> torch.dtype | None:
         if self.device.type != "cuda":
@@ -462,7 +447,6 @@ class DSALTTrainer:
         n_decay   = sum(p.numel() for p in decay)
         n_nodecay = sum(p.numel() for p in nodecay)
         n_dsalt   = sum(p.numel() for p in dsalt_params)
-        #print(f"--- [trainer] _build_optimizer | decay={n_decay:,} nodecay={n_nodecay:,} dsalt={n_dsalt:,}")
 
         opt = torch.optim.AdamW(
             [
@@ -474,7 +458,6 @@ class DSALTTrainer:
             eps=1e-8,
             fused=self.device.type == "cuda",
         )
-        #print(f"--- [trainer] AdamW built | fused={self.device.type == 'cuda'}")
         return opt
 
     def _build_scheduler(self, optimizer: torch.optim.Optimizer):
@@ -483,7 +466,6 @@ class DSALTTrainer:
                 return float(step) / max(1, self.warmup_steps)
             progress = float(step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
             return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
-        #print(f"--- [trainer] LambdaLR scheduler built | warmup={self.warmup_steps} total={self.total_steps}")
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     def _extract_batch(self, batch):
@@ -492,9 +474,8 @@ class DSALTTrainer:
         labels     = labels.to(self.device, non_blocking=True)
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         max_seqlen = int(max_seqlen)
-        #print(f"--- [trainer] _extract_batch | ids={tuple(ids.shape)} labels={tuple(labels.shape)} cu_seqlens={tuple(cu_seqlens.shape)} max_seqlen={max_seqlen}")
         # NOTE: removed a per-batch ``(labels != -100).sum().item()`` that only fed a
-        # commented-out debug print — ``.item()`` forces a D2H sync that stalls the
+        # commented-out debug print, ``.item()`` forces a D2H sync that stalls the
         # GPU queue every batch. Pure waste; the loss already counts valid tokens.
         return ids, labels, cu_seqlens, max_seqlen
 
@@ -520,15 +501,12 @@ class DSALTTrainer:
 
     @torch.no_grad()
     def _validate(self) -> float:
-        t0 = time.perf_counter()
-        #print(f"--- [trainer] _validate START | step={self.global_step}")
         self.model.eval()
         total_loss, total_tokens = 0.0, 0
 
-        for vi, batch in enumerate(self.val_loader):
+        for batch in self.val_loader:
             ids, labels, cu_seqlens, max_seqlen = self._extract_batch(batch)
             valid_tokens  = (labels != -100).sum().item()
-            #print(f"--- [trainer] _validate batch {vi} | valid_tokens={valid_tokens}")
 
             out           = self.model(
                 ids,
@@ -538,28 +516,23 @@ class DSALTTrainer:
                 gradient_checkpointing=False,
             )
             batch_loss = out["loss"].item()
-            #print(f"--- [trainer] _validate batch {vi} | loss={batch_loss:.4f}")
             total_loss   += batch_loss * valid_tokens
             total_tokens += valid_tokens
 
         self.model.train()
 
         if self.world_size > 1:
-            #print(f"--- [trainer] _validate all_reduce | world_size={self.world_size}")
             t = torch.tensor([total_loss, float(total_tokens)], device=self.device)
             torch.distributed.all_reduce(t)
             total_loss, total_tokens = t[0].item(), t[1].item()
 
         avg_loss = total_loss / max(total_tokens, 1)
         val_ppl  = math.exp(min(avg_loss, 20.0))
-        #print(f"--- [trainer] _validate DONE | avg_loss={avg_loss:.4f} val_ppl={val_ppl:.4f} | t={time.perf_counter()-t0:.4f}s")
         return val_ppl
 
     def _save_checkpoint(self, tag: str) -> None:
         if not self.is_main:
-            #print(f"--- [trainer] _save_checkpoint skip (non main rank={self.rank})")
             return
-        #print(f"--- [trainer] _save_checkpoint | tag={tag} step={self.global_step}")
         ckpt = {
             "step":                 self.global_step,
             "model_state_dict":     _unwrap_model(self.model).state_dict(),
@@ -569,13 +542,10 @@ class DSALTTrainer:
             "history":              self.history,
         }
         path = self.save_dir / f"checkpoint_{tag}.pt"
-        t0   = time.perf_counter()
         torch.save(ckpt, path)
-        #print(f"--- [trainer] checkpoint saved → {path} | t={time.perf_counter()-t0:.2f}s")
         self.logger.info(f"checkpoint saved → {path}")
 
     def load_checkpoint(self, path: str):
-        #print(f"--- [trainer] load_checkpoint | path={path}")
         ckpt = torch.load(path, map_location=self.device)
         _unwrap_model(self.model).load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -583,7 +553,6 @@ class DSALTTrainer:
         self.global_step  = ckpt["step"]
         self.best_val_ppl = ckpt.get("best_val_ppl", float("inf"))
         self.history      = ckpt.get("history", self.history)
-        #print(f"--- [trainer] load_checkpoint DONE | step={self.global_step} best_val_ppl={self.best_val_ppl:.4f}")
         if self.is_main:
             self.logger.info(f"checkpoint resumed from step {self.global_step}")
 
@@ -636,7 +605,6 @@ class DSALTTrainer:
             f"scan={metrics['scan_block_max']:.1f} x{metrics['scan_ratio']:.2f} | "
             f"alpha={metrics['alpha_min']:.3f}/{metrics['alpha_mean']:.3f}/{metrics['alpha_max']:.3f}"
         )
-        #print(f"--- [trainer] _log_step | {msg}")
 
         self.logger.info(msg, extra={"it_s": it_s, "tok_s": tok_s, "mem_gb": mem_gb, "peak_gb": peak_gb, "total_gb": stats.get("total_gb", 0.0)})
 
@@ -718,7 +686,6 @@ class DSALTTrainer:
 
             gn_val = grad_norm.item() if grad_norm is not None else 0.0
             #if self.rank == 0 and self.global_step%5==0:
-                #print(f"Step {self.global_step} | Loss: {accum_loss:.4f} | Grad Norm: {gn_val:.4f}")
 
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)

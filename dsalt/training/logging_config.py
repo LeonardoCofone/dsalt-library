@@ -1,3 +1,11 @@
+"""Training logger: ANSI step formatter, file logging, and a throughput timer.
+
+A custom ``logging.Formatter`` renders each training step as a colored box (loss,
+ppl, representation-health metrics, window/alpha, scan cost, it/s, tok/s, VRAM),
+a banner for ``training start`` and a highlighted line for validation. ``StepTimer``
+provides a windowed it/s and tok/s estimate.
+"""
+
 import logging
 import math
 import sys
@@ -222,6 +230,10 @@ class _DSALTFilter(logging.Filter):
 
 
 def get_logger(name: str, log_dir: str | None = None, level: int = logging.INFO) -> logging.Logger:
+    """Build (once) the DSALT logger: colored stdout + optional ``train.log`` file.
+
+    Idempotent — returns the existing logger if it already has handlers.
+    """
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger
@@ -244,6 +256,8 @@ def get_logger(name: str, log_dir: str | None = None, level: int = logging.INFO)
 
 
 class StepTimer:
+    """Windowed step timer: a rolling-average it/s and instantaneous tok/s."""
+
     def __init__(self, window: int = 50, device: torch.device = None):
         self._window = window
         self._times: list[float] = []

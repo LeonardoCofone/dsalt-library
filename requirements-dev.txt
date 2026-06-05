@@ -1,24 +1,10 @@
-# Development dependencies
--r requirements.txt
-
-# Testing
-pytest>=7.0.0
-pytest-cov>=4.0.0
-
-# Code quality
-black>=22.0.0
-isort>=5.10.0
-flake8>=4.0.0
-mypy>=1.0.0
-
-# Pre-commit hooks
-pre-commit>=2.20.0
-
-# Documentation
-sphinx>=5.0.0
-sphinx-rtd-theme>=1.2.0
-myst-parser>=0.18.0
-
-# Build
-build>=0.10.0
-twine>=4.0.0
+# Development dependencies.
+#
+# Single source of truth = pyproject.toml [project.optional-dependencies].
+# This file just installs the package in editable mode with every dev-relevant
+# extra (dev = test/lint/type tooling, docs = sphinx, build = build/twine).
+#
+#   pip install -e ".[dev,docs,build]"
+#
+# Use the line below (equivalent) to install from this file directly:
+-e .[dev,docs,build]

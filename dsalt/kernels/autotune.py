@@ -43,7 +43,7 @@ def _is_main_process(device: torch.device | None = None) -> bool:
     forward, *before* ``init_process_group``: there ``is_initialized()`` is
     still ``False`` and ``RANK``/``LOCAL_RANK`` may be unset, so every worker
     would fall through to ``True`` and print a duplicate table. As a last
-    resort we key off the CUDA device ordinal — distinct per worker in DDP —
+    resort we key off the CUDA device ordinal, distinct per worker in DDP,
     and treat only ``cuda:0`` as main.
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -101,7 +101,7 @@ def _candidate_configs(head_dim: int, device: torch.device,
     ``with_bwd_tile`` (training only): seed every candidate with the safe baseline
     backward key tile ``BLOCK_N_BWD = 32``. The *best* backward tile is searched in
     a cheap PHASE 2 afterwards (`_bwd_tile_candidates`), once the forward axes are
-    fixed — this keeps phase 1 small (no BLOCK_N_BWD × warps blow-up) while still
+    fixed, this keeps phase 1 small (no BLOCK_N_BWD × warps blow-up) while still
     choosing the bwd tile per device (T4→32, A100/H100→maybe 64/128).
     """
     base = _heuristic_config(head_dim, device)
@@ -192,12 +192,12 @@ def _bwd_tile_fits_smem(block_m: int, block_n_bwd: int, head_dim: int,
 
     The dk/dv kernel holds the tiles ``q/do[BM, D]`` and ``k/v[BN, D]`` in smem;
     the ``dk/dv`` accumulators live in registers (not smem). So the smem estimate
-    is ``(2*BM + 2*BN) * D`` fp32 elements — same shape as the forward, just with
+    is ``(2*BM + 2*BN) * D`` fp32 elements, same shape as the forward, just with
     two query-side tiles (q and do). This is only a *pre-filter* to drop configs
     that clearly cannot fit; the real benchmark still runs each survivor and a
     config that overruns registers/smem fails there and is discarded. The filter
     is read from the device, so a large BLOCK_N is dropped on T4 (HEAD_DIM=16) but
-    allowed on A100 — never hard-coded to one GPU.
+    allowed on A100, never hard-coded to one GPU.
     """
     head_dim_c = triton.next_power_of_2(head_dim)
     est_bytes = (2 * block_m + 2 * block_n_bwd) * head_dim_c * 4

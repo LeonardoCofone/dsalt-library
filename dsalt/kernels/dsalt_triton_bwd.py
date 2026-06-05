@@ -1,3 +1,10 @@
+"""DSALT inference-kernel backward: gradients for the sparse attention forward.
+
+The autograd backward for ``dsalt_triton_attn``'s forward. Uses ``atomic_add`` to
+accumulate the key/value gradients, which structurally caps the backward key tile
+(see ``_BWD_MAX_BLOCK_N``) below the forward's.
+"""
+
 import torch
 import triton
 import triton.language as tl

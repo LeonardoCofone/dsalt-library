@@ -22,6 +22,14 @@ Thank you for your interest in contributing to DSALT! We welcome contributions f
    ```
    Without Triton the library still works and falls back to the SDPA path.
 
+   The available extras are `triton`, `dev`, `docs`, `build`, and `all`
+   (see `pyproject.toml`); `dev` already pulls in `pre-commit`.
+
+4. (Optional) Enable the pre-commit hooks so formatting/linting run on every commit:
+   ```bash
+   pre-commit install
+   ```
+
 ## Development Workflow
 
 1. Create a feature branch:

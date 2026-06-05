@@ -96,11 +96,14 @@ class DSALTLMHeadModel(nn.Module):
                             (fused Triton, wins on A100+), or ``"auto"`` (measure
                             per-GPU). NOTE: ``"chunked"`` with a large chunk is
                             fastest on T4 but materialises ``[chunk, vocab]`` fp32
-                            logits — a big memory peak. ``"auto"`` picks by speed
+                            logits, a big memory peak. ``"auto"`` picks by speed
                             only; prefer it on big-VRAM GPUs where ``liger`` (no
                             logits materialisation) wins, not on T4.
-        aux_loss_weight:    Weight of the auxiliary term (inert: frozen window,
-                            kept for signature compatibility).
+        aux_loss_weight:    Weight of the auxiliary term. Inert by design: the
+                            window/landmark predictors are trained directly in the
+                            main forward (soft window edge / soft landmark weight),
+                            so no extra loss is needed. Kept for signature
+                            compatibility; leave at 0.0.
     """
 
     def __init__(
@@ -180,7 +183,7 @@ class DSALTLMHeadModel(nn.Module):
     def _resolve_loss_fn(self, flat_x: torch.Tensor, flat_labels: torch.Tensor) -> tuple[str, int]:
         """Resolve ``loss_fn="auto"`` to a concrete (loss_fn, chunk_size) per GPU.
 
-        Measured once per ``(device, vocab)`` then cached — same one-shot pattern
+        Measured once per ``(device, vocab)`` then cached, same one-shot pattern
         as the kernel block-size autotune. For explicit ``"chunked"``/``"liger"``
         this is a no-op passthrough. Never hard-codes a device: ``"auto"`` picks
         whatever wins on the card actually running (chunked on T4, liger on A100+).
@@ -235,7 +238,7 @@ class DSALTLMHeadModel(nn.Module):
             rope_cs  = (attn0.rope_cos[pos_ids], attn0.rope_sin[pos_ids])
             # Single host copy of cu_seqlens for the whole step (all layers share it).
             # Done here, early, so the one unavoidable D2H sync happens while the GPU
-            # queue is still shallow — instead of once per layer mid-stream (which the
+            # queue is still shallow, instead of once per layer mid-stream (which the
             # profiler showed costing ~160ms total). Plain python ints downstream → no
             # per-layer .item()/.to('cpu').
             cu_list = cu_seqlens.detach().to("cpu").tolist()

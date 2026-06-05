@@ -8,6 +8,8 @@ from .dsalt_attention    import DSALTAttention
 
 
 class SwiGLUFFN(nn.Module):
+    """Gated SwiGLU feed-forward network: ``down(silu(gate(x)) * up(x))``."""
+
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.0):
         super().__init__()
         self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
@@ -20,6 +22,10 @@ class SwiGLUFFN(nn.Module):
 
 
 class DSALTTransformerBlock(nn.Module):
+    """One pre-norm Transformer block: RMSNorm → DSALTAttention → residual, then
+    RMSNorm → SwiGLUFFN → residual. Optionally uses activation checkpointing.
+    """
+
     def __init__(
         self,
         d_model:     int,
@@ -52,7 +58,7 @@ class DSALTTransformerBlock(nn.Module):
         gradient_checkpointing: bool                = False,
         rope_cs:                tuple | None         = None,
         cu_list:                list | None          = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if gradient_checkpointing and self.training:
             def custom_attn(h):
                 attn_out, layer_aux = self.attn(h, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, rope_cs=rope_cs, cu_list=cu_list)

@@ -1,3 +1,11 @@
+"""DSALT *inference* Triton kernel: sparse attention over window ∪ landmarks.
+
+The fast forward path used at eval time (packed sequences). It selects the local
+window and the precomputed landmark indices and runs a FlashAttention-style fused
+attention with online softmax. The differentiable backward lives in
+``dsalt_triton_bwd``; block sizes come from the one-shot ``autotune``.
+"""
+
 import math
 import torch
 import triton
@@ -326,7 +334,7 @@ class DSALTAttentionFunction(torch.autograd.Function):
         )
 
 # Opaque to torch.compile/Dynamo: the inference kernel is a custom autograd
-# Function with raw Triton launches — the compiler must graph-break here and never
+# Function with raw Triton launches, the compiler must graph-break here and never
 # trace inside. Guarded getattr so the lib still imports without `torch._dynamo`.
 def _dynamo_opaque(fn):
     disable = getattr(getattr(torch, "_dynamo", None), "disable", None)

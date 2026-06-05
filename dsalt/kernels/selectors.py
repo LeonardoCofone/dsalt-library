@@ -44,6 +44,12 @@ def _build_seq_block_map(
     device:     torch.device,
     cu_list:    list | None = None,
 ) -> tuple[torch.Tensor, int]:
+    """Map each ``BLOCK_M`` query block to its ``(sequence, block-in-sequence)`` pair.
+
+    Returns ``(seq_block_map [total_blocks, 2], total_blocks)``, cached per
+    ``(total_len, num_seqs, block_m)``. Consumed by both the forward and backward
+    kernels so they share the packed block layout.
+    """
     num_seqs  = cu_seqlens.shape[0] - 1
     # Key from host-side cu_list when available → no D2H sync on the hot path.
     total_len = int(cu_list[-1]) if cu_list is not None else int(cu_seqlens[-1])
@@ -81,6 +87,13 @@ def _compute_landmark_indices(
     total_len:  int,
     cu_list:    list | None = None,
 ) -> torch.Tensor:
+    """Hard top-k landmark indices per (head, sequence), excluding in-window tokens.
+
+    Scores tokens with the hybrid-energy formula (§4.3), masks out those already in
+    the local window, and returns the top-``k_lmk`` indices ``[H, num_seqs, k_lmk]``
+    (``-1`` padding where fewer than ``k_lmk`` candidates exist), plus the raw
+    ``z_x``/``z_v`` signals. Detached selection — addresses memory only.
+    """
     device   = x.device
     total    = x.shape[0]
     num_seqs, lens, starts, seq_ids, seq_off, max_len = _seq_meta(cu_seqlens, total, device, cu_list)
@@ -131,6 +144,10 @@ def _build_landmark_kv(
     n_heads:     int,
     head_dim:    int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather the landmark keys/values at ``lmk_indices`` into ``[H, num_seqs, k, D]``.
+
+    Invalid (``-1``) landmark slots are zero-filled, so the kernel can mask them out.
+    """
     starts   = cu_seqlens[:-1].to(K.device)
     safe_idx = lmk_indices.clamp(min=0)
     abs_idx  = starts[None, :, None] + safe_idx

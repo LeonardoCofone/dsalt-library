@@ -6,14 +6,12 @@ def compute_window_sizes(
     n_min:  int,
     n_max:  int,
 ) -> torch.Tensor:
-    """Per-token local window size.
+    """Constant per-token window size at the characteristic value ``(n_min+n_max)//2``.
 
-    In this version the window is **frozen** to the characteristic value
-    ``(n_min + n_max) // 2`` (§4.2): no learnable parameter, no dependence on a
-    per-token adaptivity degree. The model's demonstrated adaptivity is that of
-    the per-head ``alpha`` in landmark selection (§4.3).
-
-    Returns a constant tensor ``[T]`` aligned with ``x_prev``.
+    A simple, parameter-free utility that returns a constant window ``[T]`` aligned
+    with ``x_prev``. The model's *adaptive* window (§4.2) is computed elsewhere by
+    the learned ``win_gate`` predictor (see :class:`DSALTAttention`); this helper is
+    the non-adaptive baseline kept for convenience and external use.
     """
     T = x_prev.shape[0]
     w = (n_min + n_max) // 2
@@ -25,6 +23,11 @@ def build_local_window_mask(
     window_sizes: torch.Tensor,
     device:       torch.device,
 ) -> torch.Tensor:
+    """Boolean causal local-window mask ``[T, T]`` for a single sequence.
+
+    Row ``i`` attends to keys in ``[i - w(i) + 1, i]``. Built with a difference-array
+    + cumsum trick (no Python loop). ``True`` = attend.
+    """
     rows = torch.arange(seq_len, device=device)
     w    = window_sizes.clamp(min=1, max=seq_len).long()
     lo   = (rows - w + 1).clamp(min=0)
@@ -42,6 +45,12 @@ def build_local_window_mask_packed(
     total_len:    int,
     device:       torch.device,
 ) -> torch.Tensor:
+    """Boolean causal local-window mask ``[T, T]`` for packed sequences.
+
+    Like :func:`build_local_window_mask` but over the concatenated tokens defined
+    by ``cu_seqlens``: a key is attended only if it is inside the query's window
+    **and** belongs to the same sequence. Fully vectorized. ``True`` = attend.
+    """
     num_seqs = cu_seqlens.shape[0] - 1
     lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
     starts   = cu_seqlens[:-1].to(device)
@@ -56,23 +65,14 @@ def build_local_window_mask_packed(
     abs_lo = (starts[seq_ids] + lo_rel).clamp(min=0)
     abs_hi = (starts[seq_ids] + hi_rel).clamp(max=total_len - 1)
 
-    # difference array trick, zero Python loops, fully vectorized
-    mask_1d = torch.zeros(total_len + 1, dtype=torch.int32, device=device)
-    mask_1d.scatter_add_(0, abs_lo,       torch.ones(total_len, dtype=torch.int32, device=device))
-    mask_1d.scatter_add_(0, abs_hi + 1,  -torch.ones(total_len, dtype=torch.int32, device=device))
-
-    # build full [T, T] bool mask via row-broadcast
-    row_idx = torch.arange(total_len, device=device)
     col_idx = torch.arange(total_len, device=device)
-
-    # causal + window: col in [abs_lo[row], abs_hi[row]] AND same sequence
     lo2d = abs_lo.unsqueeze(1)   # [T, 1]
     hi2d = abs_hi.unsqueeze(1)   # [T, 1]
     c    = col_idx.unsqueeze(0)  # [1, T]
 
     same_seq = seq_ids.unsqueeze(1) == seq_ids.unsqueeze(0)  # [T, T]
     in_win   = (c >= lo2d) & (c <= hi2d)                     # [T, T]
-    return (same_seq & in_win)
+    return same_seq & in_win
 
 
 @torch.compile(dynamic=False)
@@ -82,6 +82,11 @@ def apply_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary positional embedding (RoPE) to ``q`` and ``k``.
+
+    Uses the half-split rotation convention with the precomputed ``cos``/``sin``
+    from :func:`build_rope_cache`. Returns the rotated ``(q, k)``.
+    """
     half  = q.shape[-1] // 2
     def _rot(x: torch.Tensor) -> torch.Tensor:
         return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
@@ -96,6 +101,11 @@ def build_rope_cache(
     base:     float       = 10000.0,
     scale:    float       = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute the RoPE ``(cos, sin)`` cache of shape ``[seq_len, head_dim]``.
+
+    ``scale`` is the RoPE/YaRN positional scaling (positions are divided by it),
+    ``base`` the rotary base frequency. Consumed by :func:`apply_rotary_emb`.
+    """
     theta     = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=dtype) / head_dim))
     positions = torch.arange(seq_len, device=device, dtype=dtype) / scale
     emb       = torch.cat([torch.outer(positions, theta)] * 2, dim=-1)

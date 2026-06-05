@@ -2,19 +2,19 @@
 
 The LM loss can be computed two ways:
 
-* ``chunked`` — pure PyTorch: materialises ``[chunk, vocab]`` logits in fp32 and
+* ``chunked``, pure PyTorch: materialises ``[chunk, vocab]`` logits in fp32 and
   runs a dense ``cross_entropy`` per chunk. Memory-frugal, no Triton, works
-  everywhere — but the fp32 logits materialisation + dense softmax cost real time
+  everywhere, but the fp32 logits materialisation + dense softmax cost real time
   on large vocabularies.
-* ``liger``  — fused Triton kernel: never materialises the full logits, fuses
+* ``liger`` , fused Triton kernel: never materialises the full logits, fuses
   ``lm_head @ x`` with the cross-entropy. Wins on newer GPUs (A100/H100/B200) with
   fast tensor cores and ample shared memory; *loses* on older cards (e.g. T4 sm_75)
   where the fp32 grad writes + ``@ weight.t()`` GEMM dominate.
 
 Which one wins is a property of the **GPU**, not something to hard-code. So, in the
 same spirit as the kernel block-size autotune (:mod:`dsalt.kernels.autotune`), when
-``loss_fn="auto"`` we *measure* both strategies — and, for ``chunked``, a sweep of
-``chunk_size`` candidates derived from the real token count — once per
+``loss_fn="auto"`` we *measure* both strategies, and, for ``chunked``, a sweep of
+``chunk_size`` candidates derived from the real token count, once per
 ``(device, vocab)`` and cache the winner for the whole run.
 
 Nothing here is device-specific: the candidates are generated from the runtime
@@ -60,7 +60,7 @@ def _chunk_candidates(n_tok: int, vocab: int) -> list[int]:
     Fractions of the real token count (1/16 … full), clamped to a sane floor and
     to ``n_tok``. NOT a fixed constant: a big-VRAM GPU keeps the large chunk
     (fewer kernel launches), a small one falls back to smaller chunks. The
-    measurement decides — this only enumerates plausible sizes.
+    measurement decides, this only enumerates plausible sizes.
 
     Returned in **ascending** order so the caller can sweep small→large and stop
     at the first OOM: a larger chunk allocates strictly more (its ``[chunk,
@@ -80,14 +80,14 @@ def _bench(loss_call, warmup: int = 2, iters: int = 5) -> float:
 
     Timed **forward-only** under ``torch.no_grad()`` on detached *views* of the
     live tensors (no clones, no extra grad buffers): this is the whole point of
-    the design choice — the autotune fires inside the first forward, while the
+    the design choice, the autotune fires inside the first forward, while the
     training graph is still alive and VRAM is already tight, so allocating clones
     of the 50k×512 embedding + their grads is exactly what blew up the T4. A
     forward-only measure on views adds ~zero memory.
 
     Forward-only is enough to *rank* the strategies: chunked's cost is dominated
     by the fp32 logits materialisation + dense softmax (a forward effect), and
-    Liger's whole advantage is *not* materialising those logits — visible in the
+    Liger's whole advantage is *not* materialising those logits, visible in the
     forward already. The backward tracks the forward for both, so the order is
     preserved on every GPU (chunked wins on T4, liger wins on A100+).
 
@@ -148,7 +148,7 @@ def autotune_loss(
     results: list[tuple[str, int | None, float]] = []
     main = _is_main_process(device)
 
-    # Detached VIEWS of the live tensors — NOT clones. The autotune runs inside
+    # Detached VIEWS of the live tensors, NOT clones. The autotune runs inside
     # the first forward, with the training graph alive and VRAM already tight;
     # cloning the 50k×512 embedding + grads is what OOM'd the T4. Forward-only
     # under no_grad on these views never writes a grad into the real parameter
@@ -176,7 +176,7 @@ def autotune_loss(
             ms_s = "OOM/fail" if ms == float("inf") else f"{ms:8.4f} ms"
             print(f"    [{i}/{n_cands}] chunked  chunk={cs:<8} {ms_s}")
         if ms == float("inf"):
-            # Skip the remaining (larger) chunked candidates — all would OOM.
+            # Skip the remaining (larger) chunked candidates, all would OOM.
             for cs_skip in chunk_cands[i:]:
                 results.append(("chunked", cs_skip, float("inf")))
             break

@@ -1,6 +1,6 @@
 $env:TWINE_USERNAME = $env:TWINE_DSALT_USERNAME
 $env:TWINE_PASSWORD = $env:TWINE_DSALT_PASSWORD
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop" 
 
 if (-not (Test-Path "pyproject.toml")) {
     Write-Host "ERROR: pyproject.toml not found!" -ForegroundColor Red

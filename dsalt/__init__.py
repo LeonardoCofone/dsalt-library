@@ -17,7 +17,7 @@ Example::
     cfg   = DSALTConfig(vocab_size=50257, d_model=512, n_layers=6, n_heads=8,
                         n_min=64, n_max=256, k_lmk=16, max_seq_len=1024)
     model = DSALTLMHeadModel.from_config(cfg)
-"""
+""" 
 
 from dsalt.kernels import (
     dsalt_triton_attention,

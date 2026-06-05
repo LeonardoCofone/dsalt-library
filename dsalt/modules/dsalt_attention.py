@@ -1,3 +1,11 @@
+"""DSALT sparse attention module: adaptive local window ∪ global landmarks (§4).
+
+Wires together the differentiable selectors (soft window edge trains ``win_gate``,
+soft landmark re-weight trains per-head ``alpha``) and dispatches to the Triton
+training/inference kernels on CUDA or a masked-SDPA fallback elsewhere. The selector
+math lives once in ``selectors`` / ``landmark_tokens_ker`` and is shared by every path.
+"""
+
 import math
 import warnings
 import torch
@@ -284,7 +292,7 @@ class DSALTAttention(nn.Module):
 
         ``scores`` ``[T, H]`` is the hybrid score s_j(α) (§4.3, eq. 30), continuous
         in ``α``. ``lmk_mask`` ``[H, T, T]`` is the *hard* boolean top-k selection
-        (detached — which tokens are landmarks does not depend on the gradient).
+        (detached, which tokens are landmarks does not depend on the gradient).
         For every selected landmark key ``j`` of head ``h`` we add to the logits
         ``log σ(s_j / τ)``, so the landmark's weight inside the softmax depends on
         ``α`` and the gradient reaches ``alpha_w`` through the weight (not through
@@ -355,7 +363,7 @@ class DSALTAttention(nn.Module):
         # [H,T,T] trains alpha via the σ(s/τ) re-weight of the (hard-selected)
         # landmarks. The union A(i)=W∪L is the elementwise max of the two log-biases
         # (a key is attended if it is in the window OR a landmark, taking whichever
-        # gives the larger — i.e. less negative — bias).
+        # gives the larger, i.e. less negative, bias).
         win_logbias, lmk_logbias = self._diff_logbias(x_1b, T, device)             # [T,T],[H,T,T]
         logbias = torch.maximum(win_logbias.unsqueeze(0), lmk_logbias)            # [H,T,T]
 
@@ -377,7 +385,7 @@ class DSALTAttention(nn.Module):
         Returns ``(win_logbias [T,T], lmk_logbias [H,T,T])``. The window bias trains
         ``win_gate``; the landmark bias trains ``alpha_w``. The landmark *selection*
         (top-k, excluding the local window) is computed under ``no_grad`` and
-        detached — only the per-landmark weight σ(s/τ) carries the α gradient.
+        detached, only the per-landmark weight σ(s/τ) carries the α gradient.
         """
         w_cont = self._window_continuous(x)                                       # [T] differentiable
         alpha  = self._alpha()                                                     # [H] differentiable
@@ -390,7 +398,7 @@ class DSALTAttention(nn.Module):
         # Hard landmark selection (which tokens), detached. The exclusion j∉W(i) is
         # PER-QUERY, not global (a key local to a near query can still be a landmark
         # for a far query), so we select the global top-k by score and apply the
-        # window exclusion per (i,j) when building the mask — exactly like the Triton
+        # window exclusion per (i,j) when building the mask, exactly like the Triton
         # kernel's `causal_lmk = lmk_pos < win_lo`.
         with torch.no_grad():
             w_disc = w_cont.floor().clamp(min=1)                                  # [T]
@@ -432,25 +440,17 @@ class DSALTAttention(nn.Module):
     def _train_selectors(self, x, cu_seqlens, total_len, device, cu_list=None):
         """Shared selector prelude for BOTH the Triton kernel and the dense fallback.
 
-        Returns ``(w_cont [total_len], lmk_pos [H,S,k], lmk_logw [H,S,k])`` — the
+        Returns ``(w_cont [total_len], lmk_pos [H,S,k], lmk_logw [H,S,k])``, the
         SAME tensors both paths must consume, so the dense verification reference
         and the kernel select identical landmarks (the previous mismatch came from
         the fallback using its own top-k instead of these).
 
-        Set ``DSALT_PROFILE_SELECTORS=1`` (eager only — under torch.compile this
-        method is traced into the fused graph and the timer is ignored) to print the
-        mean CUDA time this prelude costs. It is the "measure first" gate for the
-        selector-fusion optimisation: ``hybrid_scores_per_head`` runs the
-        ``x @ W_V`` GEMM over ALL ``total_len`` tokens twice per layer (once detached
-        for the hard indices, once differentiable for the landmark logits), and we
-        want the real number before refactoring.
+        Note: ``hybrid_scores_per_head`` (the ``x @ W_V`` GEMM over all tokens) runs
+        twice here, once detached for the hard indices, once differentiable for the
+        landmark logits. Profiled at ~5 ms/call eager (~32 ms/step over 6 layers),
+        but torch.compile fuses it into the surrounding graph, so a manual fusion has
+        low ROI in the real (compiled) training path. Left as-is by design.
         """
-        prof = self._selector_profile_enabled()
-        if prof:
-            ev0 = torch.cuda.Event(enable_timing=True)
-            ev1 = torch.cuda.Event(enable_timing=True)
-            ev0.record()
-
         w_cont = self._window_continuous(x)                                       # [total_len] diff
         alpha  = self._alpha()                                                     # [H] diff
         with torch.no_grad():
@@ -469,52 +469,16 @@ class DSALTAttention(nn.Module):
         s_sel    = scores[abs_pos, head_ix]                                        # [H,S,k] diff in α
         lmk_logw = torch.log(torch.sigmoid(s_sel / self.tau_lmk).clamp(min=1e-20))
         lmk_logw = torch.where(lmk_pos >= 0, lmk_logw, torch.full_like(lmk_logw, float("-inf")))
-
-        if prof:
-            ev1.record()
-            self._selector_profile_record(ev0, ev1)
-
         return w_cont, lmk_pos, lmk_logw
 
-    # --- selector profiling (opt-in, eager only) -----------------------------
-    _SEL_PROF_FLAG = None        # cached env check (class-level)
-    _sel_prof_events: list = []  # pending (start, end) CUDA events
-    _sel_prof_ms = 0.0
-    _sel_prof_n = 0
-
-    @classmethod
-    def _selector_profile_enabled(cls) -> bool:
-        if cls._SEL_PROF_FLAG is None:
-            import os
-            cls._SEL_PROF_FLAG = (
-                os.environ.get("DSALT_PROFILE_SELECTORS", "0") == "1"
-                and torch.cuda.is_available()
-            )
-        return cls._SEL_PROF_FLAG
-
-    @classmethod
-    def _selector_profile_record(cls, ev_start, ev_end) -> None:
-        # Defer elapsed_time (needs sync) by stashing the event pair; drain in
-        # batches so the timer itself never forces a sync on the hot path.
-        cls._sel_prof_events.append((ev_start, ev_end))
-        if len(cls._sel_prof_events) >= 50:
-            torch.cuda.synchronize()
-            for s, e in cls._sel_prof_events:
-                cls._sel_prof_ms += s.elapsed_time(e)
-                cls._sel_prof_n  += 1
-            cls._sel_prof_events.clear()
-            mean = cls._sel_prof_ms / max(cls._sel_prof_n, 1)
-            print(f"[selectors] mean {mean:.3f} ms/call over {cls._sel_prof_n} calls "
-                  f"(layers×steps); set DSALT_PROFILE_SELECTORS=0 to disable", flush=True)
-
     def _packed_train(self, q, k, v, x, cu, lens, total_len, device, cu_seqlens=None):
-        """Dense differentiable training attention — reference for the Triton kernel.
+        """Dense differentiable training attention, reference for the Triton kernel.
 
         Builds the SAME log-bias the Triton kernel computes (hard band ``d≤w̃`` +
         soft edge; landmarks at the kernel-selected ``lmk_pos`` weighted by
         ``lmk_logw``; union = elementwise max) and runs it through SDPA. Consuming
         the kernel's exact selectors (via :meth:`_train_selectors`) is what makes
-        this a faithful reference — uniform-length only (the verify/PG-19 case).
+        this a faithful reference, uniform-length only (the verify/PG-19 case).
         """
         H, D = self.n_heads, self.head_dim
         uniform = len(lens) > 0 and all(l == lens[0] for l in lens)
@@ -608,7 +572,7 @@ class DSALTAttention(nn.Module):
 
         # TRAINING: differentiable dense path, per sequence. This is the ONLY way the
         # soft window edge (§4.2) and the α-reweight of landmarks (§4.3) can train
-        # win_gate / alpha_w — the Triton kernel's hand-written backward does not
+        # win_gate / alpha_w, the Triton kernel's hand-written backward does not
         # carry those gradients. Slower than Triton but exact and gradcheck-verified.
         # INFERENCE: fall through to the fast Triton (or SDPA) selector path below.
         if self.training:
@@ -650,58 +614,54 @@ class DSALTAttention(nn.Module):
                 q, k, v, attn_mask, self.dropout, self.training,
             )
 
-        if True:
-            s0    = int(cu_seqlens[0])
-            e0    = int(cu_seqlens[1])
-            q0    = q[s0:e0].transpose(0, 1)
-            k0    = k[s0:e0].transpose(0, 1)
-            v0    = v[s0:e0].transpose(0, 1)
-            scale = 1.0 / math.sqrt(self.head_dim)
-            T0    = e0 - s0
+        s0    = int(cu_seqlens[0])
+        e0    = int(cu_seqlens[1])
+        q0    = q[s0:e0].transpose(0, 1)
+        k0    = k[s0:e0].transpose(0, 1)
+        scale = 1.0 / math.sqrt(self.head_dim)
+        T0    = e0 - s0
 
-            cu0    = torch.tensor([0, T0], dtype=torch.int32, device=device)
-            w0     = w_sizes[s0:e0]
-            alpha0 = alpha.detach()
+        cu0    = torch.tensor([0, T0], dtype=torch.int32, device=device)
+        w0     = w_sizes[s0:e0]
+        alpha0 = alpha.detach()
 
-            if _TRITON_OK:
-                lmk_idx, _, _ = _compute_landmark_indices(
-                    x[s0:e0].float().detach(),
-                    self.v_proj.weight.float().detach(),
-                    alpha0.float(),
-                    w0.float(),
-                    cu0,
-                    self.k_lmk,
-                    self.n_min,
-                    T0,
-                )
+        if _TRITON_OK:
+            lmk_idx, _, _ = _compute_landmark_indices(
+                x[s0:e0].float().detach(),
+                self.v_proj.weight.float().detach(),
+                alpha0.float(),
+                w0.float(),
+                cu0,
+                self.k_lmk,
+                self.n_min,
+                T0,
+            )
 
-                rows = torch.arange(T0, device=device)
-                cols = torch.arange(T0, device=device)
-                w0l  = w0.long()
-                in_win = (
-                    (cols.unsqueeze(0) >= (rows.unsqueeze(1) - w0l.unsqueeze(1) + 1)) &
-                    (cols.unsqueeze(0) <= rows.unsqueeze(1))
-                )
+            rows = torch.arange(T0, device=device)
+            cols = torch.arange(T0, device=device)
+            w0l  = w0.long()
+            in_win = (
+                (cols.unsqueeze(0) >= (rows.unsqueeze(1) - w0l.unsqueeze(1) + 1)) &
+                (cols.unsqueeze(0) <= rows.unsqueeze(1))
+            )
 
-                lmk_abs   = lmk_idx[:, 0, :]
-                in_lmk    = torch.zeros(self.n_heads, T0, T0, dtype=torch.bool, device=device)
-                for h in range(self.n_heads):
-                    valid_pos = lmk_abs[h]
-                    causal    = valid_pos.unsqueeze(0) <= rows.unsqueeze(1)
-                    in_lmk[h].scatter_(1, valid_pos.unsqueeze(0).expand(T0, -1), causal)
+            lmk_abs   = lmk_idx[:, 0, :]
+            in_lmk    = torch.zeros(self.n_heads, T0, T0, dtype=torch.bool, device=device)
+            for h in range(self.n_heads):
+                valid_pos = lmk_abs[h]
+                causal    = valid_pos.unsqueeze(0) <= rows.unsqueeze(1)
+                in_lmk[h].scatter_(1, valid_pos.unsqueeze(0).expand(T0, -1), causal)
 
-                full_mask = in_win.unsqueeze(0) | in_lmk
-            else:
-                # Fallback without Triton: dense mask shared across heads [T0, T0]
-                full_mask = _build_mask_packed(
-                    x[s0:e0], w0, self.v_proj.weight.detach(),
-                    alpha0, cu0, T0, self.k_lmk, self.head_dim, device,
-                ).unsqueeze(0).expand(self.n_heads, T0, T0)
-
-            sc        = torch.matmul(q0, k0.transpose(-2, -1)) * scale
-            additive  = sc.new_full((self.n_heads, T0, T0), float("-inf")).masked_fill_(full_mask, 0.0)
-            self._last_P = torch.softmax(sc + additive, dim=-1).detach()
+            full_mask = in_win.unsqueeze(0) | in_lmk
         else:
-            self._last_P = None
+            # Fallback without Triton: dense mask shared across heads [T0, T0]
+            full_mask = _build_mask_packed(
+                x[s0:e0], w0, self.v_proj.weight.detach(),
+                alpha0, cu0, T0, self.k_lmk, self.head_dim, device,
+            ).unsqueeze(0).expand(self.n_heads, T0, T0)
+
+        sc        = torch.matmul(q0, k0.transpose(-2, -1)) * scale
+        additive  = sc.new_full((self.n_heads, T0, T0), float("-inf")).masked_fill_(full_mask, 0.0)
+        self._last_P = torch.softmax(sc + additive, dim=-1).detach()
 
         return self.out_proj(out.view(total_len, self.d_model)), aux

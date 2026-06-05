@@ -9,7 +9,7 @@ dsalt/kernels/_verify_train_kernel.py
 profile_cuda.py
 profile_dense.py
 dense-baseline-model.ipynb
-
+ 
 # C extensions
 *.so
 

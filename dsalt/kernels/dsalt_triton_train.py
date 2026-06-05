@@ -41,7 +41,7 @@ from .autotune import get_tuned_config, _heuristic_config
 # ``BLOCK_N_BWD`` (e.g. an inference-tuned config reused as fallback). The real
 # value is chosen PER DEVICE by the autotune (`_candidate_configs(with_bwd_tile=True)`
 # sweeps 32/64/128, smem-filtered). Why a conservative fallback: MEASURED on T4,
-# bumping the dk/dv kernel from 32 to 64 DOUBLED its time (68→146ms) — at HEAD_DIM=16
+# bumping the dk/dv kernel from 32 to 64 DOUBLED its time (68→146ms), at HEAD_DIM=16
 # the larger key tile blows shared memory and kills occupancy. On A100/H100 the
 # autotune is free to pick 64/128; nothing here is hard-coded to one GPU.
 _BWD_MAX_BLOCK_N = 32
@@ -386,7 +386,7 @@ def _train_bwd_kernel(
         dbias_dw = tl.where(in_core, 0.0, (1.0 - sig) / tau_win)
         dw_contrib = tl.where(final, ds_raw * dbias_dw, 0.0)
         dw_i += tl.sum(dw_contrib, axis=1)
-        # dk/dv of the band are NOT written here — they are computed key-parallel in
+        # dk/dv of the band are NOT written here, they are computed key-parallel in
         # _train_bwd_dkdv_kernel (no atomics). This kernel only does dq, dw, and the
         # landmark dk/dv (rare atomics, outside the loop).
         n_start += BLOCK_N
@@ -419,7 +419,7 @@ def _train_bwd_dkdv_kernel(
     BLOCK_N:  tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """Key-parallel dk/dv for the WINDOW band — no atomics.
+    """Key-parallel dk/dv for the WINDOW band, no atomics.
 
     Each program owns one key block ``[kn, kn+BLOCK_N)`` of one head and loops over
     the query blocks that can attend to it (a query i attends key j iff
@@ -526,7 +526,7 @@ def _train_candidates(head_dim: int, device: torch.device) -> list[dict]:
     ½/1/2/4×, warps 2/4/8, smem-filtered) but with ``with_bwd_tile=True`` so the
     backward key tile ``BLOCK_N_BWD`` is ALSO tuned per device (32/64/128, filtered
     by the heavier backward smem budget). T4 will keep 32; A100/H100 can pick a
-    larger tile — measured, never hard-coded.
+    larger tile, measured, never hard-coded.
     """
     from .autotune import _candidate_configs
     return _candidate_configs(head_dim, device, with_bwd_tile=True)
@@ -572,7 +572,7 @@ def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
             ms = _bench_step(run)
             results.append((cfg, ms, None))
         except Exception as e:
-            # keep a short slice of the real message — class name alone hides
+            # keep a short slice of the real message, class name alone hides
             # whether it is smem-overflow, an illegal dot, or a launch error.
             msg = f"{type(e).__name__}: {str(e).strip().splitlines()[-1][:40]}" if str(e).strip() else type(e).__name__
             results.append((cfg, None, msg))
@@ -799,7 +799,7 @@ class DSALTTrainFunction(torch.autograd.Function):
 # + raw Triton launches) and would otherwise graph-break or fail. Wrapping the
 # entry point with `torch._dynamo.disable` forces a clean graph-break exactly here,
 # so the compiler still fuses everything AROUND it (RoPE, selectors, norm, residual,
-# FFN, loss) — which is where the eager overhead lives — while the kernel runs
+# FFN, loss), which is where the eager overhead lives, while the kernel runs
 # unchanged. Guarded getattr so the lib still imports on torch builds without
 # `_dynamo` (the decorator then degrades to identity).
 def _dynamo_opaque(fn):
