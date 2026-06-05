@@ -516,26 +516,6 @@ class DSALTTrainer:
             )
             loss = out["loss"]
 
-        # --- DDP+compile grad-graph diagnostic (first 2 steps only) ---------
-        # Pinpoints WHERE the graph dies: if loss has no grad_fn here, the
-        # compiled-under-DDP forward already severed it (not the backward call).
-        # Probe a raw model output too (the model is DDP/compile-wrapped, so we
-        # peek at the dict the forward returned). Prints on every rank.
-        if self.global_step < 2:
-            lg = getattr(loss, "grad_fn", None)
-            logits = out.get("logits", None) if isinstance(out, dict) else None
-            print(
-                f"[graph-probe rank={self.rank} step={self.global_step}] "
-                f"loss.requires_grad={loss.requires_grad} "
-                f"loss.grad_fn={type(lg).__name__ if lg is not None else None} "
-                f"logits.requires_grad="
-                f"{getattr(logits, 'requires_grad', 'NA')} "
-                f"logits.grad_fn="
-                f"{type(logits.grad_fn).__name__ if (logits is not None and logits.grad_fn is not None) else None} "
-                f"model_type={type(self.model).__name__}",
-                flush=True,
-            )
-
         return loss
 
     @torch.no_grad()

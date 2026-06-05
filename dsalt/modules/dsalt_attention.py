@@ -436,7 +436,21 @@ class DSALTAttention(nn.Module):
         SAME tensors both paths must consume, so the dense verification reference
         and the kernel select identical landmarks (the previous mismatch came from
         the fallback using its own top-k instead of these).
+
+        Set ``DSALT_PROFILE_SELECTORS=1`` (eager only — under torch.compile this
+        method is traced into the fused graph and the timer is ignored) to print the
+        mean CUDA time this prelude costs. It is the "measure first" gate for the
+        selector-fusion optimisation: ``hybrid_scores_per_head`` runs the
+        ``x @ W_V`` GEMM over ALL ``total_len`` tokens twice per layer (once detached
+        for the hard indices, once differentiable for the landmark logits), and we
+        want the real number before refactoring.
         """
+        prof = self._selector_profile_enabled()
+        if prof:
+            ev0 = torch.cuda.Event(enable_timing=True)
+            ev1 = torch.cuda.Event(enable_timing=True)
+            ev0.record()
+
         w_cont = self._window_continuous(x)                                       # [total_len] diff
         alpha  = self._alpha()                                                     # [H] diff
         with torch.no_grad():
@@ -455,7 +469,43 @@ class DSALTAttention(nn.Module):
         s_sel    = scores[abs_pos, head_ix]                                        # [H,S,k] diff in α
         lmk_logw = torch.log(torch.sigmoid(s_sel / self.tau_lmk).clamp(min=1e-20))
         lmk_logw = torch.where(lmk_pos >= 0, lmk_logw, torch.full_like(lmk_logw, float("-inf")))
+
+        if prof:
+            ev1.record()
+            self._selector_profile_record(ev0, ev1)
+
         return w_cont, lmk_pos, lmk_logw
+
+    # --- selector profiling (opt-in, eager only) -----------------------------
+    _SEL_PROF_FLAG = None        # cached env check (class-level)
+    _sel_prof_events: list = []  # pending (start, end) CUDA events
+    _sel_prof_ms = 0.0
+    _sel_prof_n = 0
+
+    @classmethod
+    def _selector_profile_enabled(cls) -> bool:
+        if cls._SEL_PROF_FLAG is None:
+            import os
+            cls._SEL_PROF_FLAG = (
+                os.environ.get("DSALT_PROFILE_SELECTORS", "0") == "1"
+                and torch.cuda.is_available()
+            )
+        return cls._SEL_PROF_FLAG
+
+    @classmethod
+    def _selector_profile_record(cls, ev_start, ev_end) -> None:
+        # Defer elapsed_time (needs sync) by stashing the event pair; drain in
+        # batches so the timer itself never forces a sync on the hot path.
+        cls._sel_prof_events.append((ev_start, ev_end))
+        if len(cls._sel_prof_events) >= 50:
+            torch.cuda.synchronize()
+            for s, e in cls._sel_prof_events:
+                cls._sel_prof_ms += s.elapsed_time(e)
+                cls._sel_prof_n  += 1
+            cls._sel_prof_events.clear()
+            mean = cls._sel_prof_ms / max(cls._sel_prof_n, 1)
+            print(f"[selectors] mean {mean:.3f} ms/call over {cls._sel_prof_n} calls "
+                  f"(layers×steps); set DSALT_PROFILE_SELECTORS=0 to disable", flush=True)
 
     def _packed_train(self, q, k, v, x, cu, lens, total_len, device, cu_seqlens=None):
         """Dense differentiable training attention — reference for the Triton kernel.
