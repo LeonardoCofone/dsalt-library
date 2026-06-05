@@ -114,6 +114,7 @@ def _bench(loss_call, warmup: int = 2, iters: int = 5) -> float:
         return float("inf")
 
 
+@torch._dynamo.disable
 def autotune_loss(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -125,6 +126,13 @@ def autotune_loss(
     default_chunk: int,
 ) -> dict:
     """Measure loss strategies once per ``(device, vocab)`` and cache the winner.
+
+    Marked ``@torch._dynamo.disable``: this runs inside the first compiled forward
+    but is a one-shot eager routine (CUDA ``Event`` timing, ``print`` progress,
+    ``empty_cache``). Letting Dynamo trace it both defeats the purpose (re-timing
+    every recompile) and crashes — the ``print`` calls trigger a graph break whose
+    own formatting raises ``'tuple' object has no attribute 'splitlines'``. Keep it
+    opaque so it always executes eagerly, once, returning a plain dict.
 
     Args mirror what :class:`DSALTLMHeadModel` already has on hand: ``x`` flat
     ``[n_tok, d_model]`` hidden states, the lm_head ``weight``, flat ``labels``,
