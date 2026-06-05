@@ -209,6 +209,22 @@ class DSALTLMHeadModel(nn.Module):
             return _liger_cross_entropy(flat_x, self.lm_head.weight, flat_labels)
         return _chunked_cross_entropy(flat_x, self.lm_head.weight, flat_labels, chunk)
 
+    @staticmethod
+    def _to_autocast_dtype(x: torch.Tensor) -> torch.Tensor:
+        """Cast ``x`` to the active autocast compute dtype (no-op if not autocasting).
+
+        Handles both the ``device_type`` API (PyTorch ≥ 2.4) and the older no-arg
+        form (PyTorch 2.0–2.3) so the package stays importable on torch>=2.0.
+        """
+        dev = x.device.type
+        try:
+            enabled = torch.is_autocast_enabled(dev)
+            dtype   = torch.get_autocast_dtype(dev)
+        except TypeError:  # PyTorch < 2.4: CUDA-only no-arg API
+            enabled = dev == "cuda" and torch.is_autocast_enabled()
+            dtype   = torch.get_autocast_gpu_dtype() if enabled else x.dtype
+        return x.to(dtype) if enabled and x.dtype != dtype else x
+
     def forward(
         self,
         input_ids:              torch.Tensor,
@@ -221,7 +237,14 @@ class DSALTLMHeadModel(nn.Module):
         if max_seqlen is None:
             max_seqlen = input_ids.shape[-1]
 
-        x        = self.embed_dropout(self.embed_tokens(input_ids))
+        x = self.embed_dropout(self.embed_tokens(input_ids))
+        # Embedding lookups are not autocast-cast, so ``x`` stays fp32 even under a
+        # bf16/fp16 autocast region. Bring it to the autocast compute dtype so the
+        # whole residual stream is homogeneous: otherwise an fp32 activation meets a
+        # bf16 weight in the first projection / FFN and, under torch.compile (which
+        # emits dtype-strict ``addmm``), raises "self and mat2 must have the same
+        # dtype". GPU-portable: a no-op when no autocast is active (stays fp32).
+        x = self._to_autocast_dtype(x)
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
 
         rope_cs = None

@@ -597,7 +597,7 @@ class DSALTAttention(nn.Module):
             lmk_indices, _, _ = _compute_landmark_indices(
                 x.detach(), self.v_proj.weight.detach(),
                 alpha.detach().float(), w_sizes,
-                cu_seqlens, self.k_lmk, self.n_min, total_len,
+                cu_seqlens, self.k_lmk, self.n_min, total_len, cu_list,
             )
             # Pure A(i)=W∪L (eq. 32): the score only selects, zero logit bias.
             lmk_bias = torch.zeros_like(lmk_indices, dtype=torch.float32)
@@ -635,6 +635,7 @@ class DSALTAttention(nn.Module):
                 self.k_lmk,
                 self.n_min,
                 T0,
+                [0, T0],   # host-side cu_list → no D2H sync / graph break
             )
 
             rows = torch.arange(T0, device=device)
