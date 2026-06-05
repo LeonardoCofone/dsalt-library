@@ -372,19 +372,25 @@ class DSALTTrainer:
             #print(f"--- [trainer] DDP wrapping DONE")
 
         # Compile AFTER wrapping in DDP — the PyTorch-recommended order for
-        # DDP + torch.compile. Compiling the bare module first and then wrapping in
-        # DDP broke the autograd graph here (loss lost its grad_fn: "element 0 ...
-        # does not require grad") because of the interaction between DDP's allreduce
-        # hooks, the compiled graph, and the opaque custom autograd Function
-        # (DSALTTrainFunction). With DDP outside, Dynamo's `DDPOptimizer` splits the
-        # graph at the allreduce buckets and the custom Function stays a clean
-        # graph-break. The DSALT Triton kernels are `torch._dynamo.disable`'d
+        # DDP + torch.compile. The DSALT Triton kernels are `torch._dynamo.disable`'d
         # (opaque), so compile still fuses all the eager code around them (RoPE,
-        # selectors, RMSNorm, residuals, FFN, loss) — where the launch overhead
-        # lives. fullgraph=False allows those graph-breaks; a hard compile failure
-        # falls back to eager (compile is a perf knob, never a correctness gate).
+        # selectors, RMSNorm, residuals, FFN, loss) — where the launch overhead lives.
+        # fullgraph=False allows those graph-breaks; a hard compile failure falls back
+        # to eager (compile is a perf knob, never a correctness gate).
+        #
+        # DDPOptimizer OFF under DDP: Dynamo's `DDPOptimizer` splits the compiled
+        # graph at DDP allreduce buckets, but it does NOT cope with our opaque custom
+        # autograd Function (DSALTTrainFunction) sitting mid-graph — the backward link
+        # between the post-kernel subgraph (loss) and the pre-kernel params is severed,
+        # so `loss.backward()` raises "element 0 ... does not require grad". Disabling
+        # DDPOptimizer keeps a single fused graph with clean graph-breaks at the kernel
+        # and lets DDP's eager allreduce hooks fire normally. We lose the bucket/compute
+        # overlap DDPOptimizer would give, but that overlap was never the bottleneck
+        # here (the kernel is), and correctness wins. Single-GPU compile is unaffected.
         if compile_model and hasattr(torch, "compile"):
             try:
+                if world_size > 1 and hasattr(torch, "_dynamo"):
+                    torch._dynamo.config.optimize_ddp = False
                 model = torch.compile(model, fullgraph=False)
             except Exception as e:  # pragma: no cover - environment dependent
                 print(f"[trainer] torch.compile failed ({type(e).__name__}); running eager.")
@@ -509,6 +515,26 @@ class DSALTTrainer:
                 gradient_checkpointing=self.gradient_checkpointing,
             )
             loss = out["loss"]
+
+        # --- DDP+compile grad-graph diagnostic (first 2 steps only) ---------
+        # Pinpoints WHERE the graph dies: if loss has no grad_fn here, the
+        # compiled-under-DDP forward already severed it (not the backward call).
+        # Probe a raw model output too (the model is DDP/compile-wrapped, so we
+        # peek at the dict the forward returned). Prints on every rank.
+        if self.global_step < 2:
+            lg = getattr(loss, "grad_fn", None)
+            logits = out.get("logits", None) if isinstance(out, dict) else None
+            print(
+                f"[graph-probe rank={self.rank} step={self.global_step}] "
+                f"loss.requires_grad={loss.requires_grad} "
+                f"loss.grad_fn={type(lg).__name__ if lg is not None else None} "
+                f"logits.requires_grad="
+                f"{getattr(logits, 'requires_grad', 'NA')} "
+                f"logits.grad_fn="
+                f"{type(logits.grad_fn).__name__ if (logits is not None and logits.grad_fn is not None) else None} "
+                f"model_type={type(self.model).__name__}",
+                flush=True,
+            )
 
         return loss
 
