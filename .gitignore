@@ -144,6 +144,9 @@ dmypy.json
 .Trashes
 ehthumbs.db
 Thumbs.db
+diagnose_loader.py
+diagnose_metrics.py
+
 
 # Project specific
 checkpoints/
@@ -158,6 +161,7 @@ last_version_6.pdf
 CLAUDE.md
 make_dataset_longform_REFERENCE.py
 data_utils_longform_REFERENCE.py
+diagnose_step.py
 
 # Claude AI
 .claude/
