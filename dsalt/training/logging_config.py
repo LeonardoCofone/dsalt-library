@@ -232,7 +232,7 @@ class _DSALTFilter(logging.Filter):
 def get_logger(name: str, log_dir: str | None = None, level: int = logging.INFO) -> logging.Logger:
     """Build (once) the DSALT logger: colored stdout + optional ``train.log`` file.
 
-    Idempotent — returns the existing logger if it already has handlers.
+    Idempotent, returns the existing logger if it already has handlers.
     """
     logger = logging.getLogger(name)
     if logger.handlers:

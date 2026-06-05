@@ -92,7 +92,7 @@ def _compute_landmark_indices(
     Scores tokens with the hybrid-energy formula (§4.3), masks out those already in
     the local window, and returns the top-``k_lmk`` indices ``[H, num_seqs, k_lmk]``
     (``-1`` padding where fewer than ``k_lmk`` candidates exist), plus the raw
-    ``z_x``/``z_v`` signals. Detached selection — addresses memory only.
+    ``z_x``/``z_v`` signals. Detached selection, addresses memory only.
     """
     device   = x.device
     total    = x.shape[0]

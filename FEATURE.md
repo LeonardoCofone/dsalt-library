@@ -1,8 +1,8 @@
-# DSALT — Features & Hyperparameters Guide
+# DSALT, Features & Hyperparameters Guide
 
 A complete reference for **every** public component, its real constructor
 signature, every default, every option, and the recommended usage. Everything
-here is verified against the source — no placeholders, no planned-but-missing
+here is verified against the source, no placeholders, no planned-but-missing
 APIs. Reading this file takes you from zero knowledge of the library to full
 working command of it.
 
@@ -12,12 +12,12 @@ working command of it.
 
 1. [What DSALT computes](#1-what-dsalt-computes)
 2. [Installation & extras](#2-installation--extras)
-3. [`DSALTLMHeadModel` — the causal language model](#3-dsaltlmheadmodel--the-causal-language-model)
-4. [`DSALTConfig` — serializable configuration](#4-dsaltconfig--serializable-configuration)
-5. [`DSALTAttention` — the sparse attention module](#5-dsaltattention--the-sparse-attention-module)
+3. [`DSALTLMHeadModel`, the causal language model](#3-dsaltlmheadmodel--the-causal-language-model)
+4. [`DSALTConfig`, serializable configuration](#4-dsaltconfig--serializable-configuration)
+5. [`DSALTAttention`, the sparse attention module](#5-dsaltattention--the-sparse-attention-module)
 6. [`DSALTTransformerBlock` & `SwiGLUFFN`](#6-dsalttransformerblock--swigluffn)
 7. [The loss functions](#7-the-loss-functions)
-8. [`DSALTTrainer` — the training loop](#8-dsalttrainer--the-training-loop)
+8. [`DSALTTrainer`, the training loop](#8-dsalttrainer--the-training-loop)
 9. [Data format: packed sequences](#9-data-format-packed-sequences)
 10. [Mixed precision & device portability](#10-mixed-precision--device-portability)
 11. [Distributed training (DDP) & torch.compile](#11-distributed-training-ddp--torchcompile)
@@ -38,7 +38,7 @@ attention with the union of two sparse sets per query `i`:
 A(i) = W(i) ∪ L(i)            (paper eq. 32)
 ```
 
-- **`W(i)` — adaptive local causal window (§4.2).** A learned linear projection
+- **`W(i)`, adaptive local causal window (§4.2).** A learned linear projection
   `win_gate: R^d → R` predicts, per token, a continuous window size
 
   ```
@@ -46,13 +46,13 @@ A(i) = W(i) ∪ L(i)            (paper eq. 32)
   ```
 
   from the block input (the previous layer's hidden state, so there is no
-  circular dependency). The window core is a **hard** mask — a query block only
+  circular dependency). The window core is a **hard** mask, a query block only
   loads the key tiles inside its radius, which is what keeps the cost
-  sub-quadratic — but the boundary carries a **soft, differentiable** edge of
+  sub-quadratic, but the boundary carries a **soft, differentiable** edge of
   width `win_edge` so that `win_gate` is trained. At inference `w̃` is floored to
   an integer window (paper eq. 29).
 
-- **`L(i)` — global landmark tokens (§4.3).** A per-head **hybrid-energy** score
+- **`L(i)`, global landmark tokens (§4.3).** A per-head **hybrid-energy** score
 
   ```
   s_j = α · z(‖x_j · W_V‖₂) + (1 − α) · z(‖x_j‖₂),   α = σ(α̃)  (per head)
@@ -60,10 +60,10 @@ A(i) = W(i) ∪ L(i)            (paper eq. 32)
 
   (where `z(·)` is standardisation over the candidate tokens) ranks tokens; the
   top-`k_lmk` per head become landmarks. The **selection is hard** (top-k,
-  detached — it only addresses memory), while a **soft re-weight** `log σ(s_j/τ)`
+  detached, it only addresses memory), while a **soft re-weight** `log σ(s_j/τ)`
   added to the admitted landmarks' logits makes the per-head balance `α` trainable.
 
-Both predictors — `win_gate` (§4.2) and the per-head `α` (§4.3) — are **trained**.
+Both predictors, `win_gate` (§4.2) and the per-head `α` (§4.3), are **trained**.
 The union `W ∪ L` is realised as the elementwise `max` of the two additive
 log-biases; the raw `q·k` score itself is never biased by the selector. There is
 **no separate auxiliary loss**: the predictors receive their gradient directly
@@ -79,7 +79,7 @@ correctness reference. The package always stays importable (CPU, Windows include
 ## 2. Installation & extras
 
 ```bash
-pip install dsalt                 # core — depends only on torch>=2.0.0
+pip install dsalt                 # core, depends only on torch>=2.0.0
 pip install "dsalt[triton]"       # + Triton GPU kernels (triton>=2.0.0)
 pip install "dsalt[dev]"          # + pytest, pytest-cov, black, isort, flake8, mypy, pre-commit
 pip install "dsalt[docs]"         # + sphinx, sphinx-rtd-theme, myst-parser
@@ -89,13 +89,13 @@ pip install "dsalt[all]"          # triton + dev + docs + build
 
 - **Python** ≥ 3.10, **PyTorch** ≥ 2.0.
 - Triton is optional and only matters on Linux/CUDA. Without it, `loss_fn="liger"`
-  is unavailable and the attention uses the SDPA fallback — everything else works.
+  is unavailable and the attention uses the SDPA fallback, everything else works.
 
 ---
 
-## 3. `DSALTLMHeadModel` — the causal language model
+## 3. `DSALTLMHeadModel`, the causal language model
 
-`dsalt.model.DSALTLMHeadModel` — token embedding → a stack of
+`dsalt.model.DSALTLMHeadModel`, token embedding → a stack of
 `DSALTTransformerBlock` → final RMSNorm → (optionally tied) LM head.
 
 The optimized training path consumes **packed** sequences (concatenated tokens +
@@ -127,7 +127,7 @@ loss_fn:            str        = "chunked" # "chunked" | "liger" | "auto"  (see 
 aux_loss_weight:    float      = 0.0       # Weight of the auxiliary term (inert: predictors train in the main forward)
 ```
 
-- `d_ff=None` resolves to `((⌈8/3·d_model⌉ + 127) // 128) · 128` — the standard
+- `d_ff=None` resolves to `((⌈8/3·d_model⌉ + 127) // 128) · 128`, the standard
   SwiGLU ~2.67× width rounded to a multiple of 128.
 - `loss_fn="liger"` requires the Triton fused cross-entropy kernel; if Triton is
   not available the constructor raises a clear `RuntimeError` pointing you to
@@ -170,7 +170,7 @@ model.num_parameters(trainable_only=True)    # parameter count
 
 ---
 
-## 4. `DSALTConfig` — serializable configuration
+## 4. `DSALTConfig`, serializable configuration
 
 `dsalt.model.DSALTConfig` is a dataclass holding **every** model argument, so an
 experiment's configuration can be saved and reloaded reproducibly.
@@ -204,9 +204,9 @@ A clear `ValueError` is raised otherwise.
 
 ---
 
-## 5. `DSALTAttention` — the sparse attention module
+## 5. `DSALTAttention`, the sparse attention module
 
-`dsalt.modules.DSALTAttention` — multi-head attention over `W(i) ∪ L(i)` with
+`dsalt.modules.DSALTAttention`, multi-head attention over `W(i) ∪ L(i)` with
 RoPE/YaRN positions.
 
 ### Constructor
@@ -225,12 +225,12 @@ layer_idx:   int   = 0
 
 ### Learnable parameters
 
-- **`win_gate`** — `nn.Linear(d_model, 1)`: the §4.2 window-size predictor.
+- **`win_gate`**, `nn.Linear(d_model, 1)`: the §4.2 window-size predictor.
   Trained through the *soft window edge* (`_soft_window_logbias`): inside the
   window the bias is exactly `0` (hard core), and only the last `win_edge` keys
   before the boundary carry `log σ((w̃ − d)/τ_win)`, so `∂/∂w̃` is non-zero only on
   the boundary band.
-- **`alpha_w`** — a per-head vector, initialised so that `σ(alpha_w) ≈ 0.6`. It
+- **`alpha_w`**, a per-head vector, initialised so that `σ(alpha_w) ≈ 0.6`. It
   balances value-energy vs. context-energy in the landmark score and is trained
   through the *soft landmark re-weight* (`_soft_landmark_logbias`): the top-k
   selection is detached, but each admitted landmark's logit is biased by
@@ -260,7 +260,7 @@ diagnostics.
 
 ## 6. `DSALTTransformerBlock` & `SwiGLUFFN`
 
-- **`dsalt.modules.DSALTTransformerBlock`** — one pre-norm block:
+- **`dsalt.modules.DSALTTransformerBlock`**, one pre-norm block:
 
   ```
   x = x + DSALTAttention(RMSNorm(x))
@@ -272,7 +272,7 @@ diagnostics.
   architectural hyperparameters are inherited from `DSALTLMHeadModel`. Its
   `forward` returns `(x, aux)` where `aux` is the inert zero auxiliary term.
 
-- **`dsalt.modules.SwiGLUFFN`** — gated SwiGLU feed-forward,
+- **`dsalt.modules.SwiGLUFFN`**, gated SwiGLU feed-forward,
   `SwiGLUFFN(d_model, d_ff, dropout=0.0)`: `down(silu(gate(x)) * up(x))`.
 
 ---
@@ -290,7 +290,7 @@ cross-entropy with `-100` ignored; they differ only in memory/speed trade-offs.
 
 Notes:
 - `"chunked"` with a large chunk is fast on T4 but materialises `[chunk, vocab]`
-  fp32 logits — a larger memory peak. Lower `lm_head_chunk_size` to trade speed
+  fp32 logits, a larger memory peak. Lower `lm_head_chunk_size` to trade speed
   for memory.
 - The chunked path passes fp16 logits straight to `F.cross_entropy` (which already
   upcasts to fp32 internally for the log-softmax), so there is no redundant fp32
@@ -298,9 +298,9 @@ Notes:
 
 ---
 
-## 8. `DSALTTrainer` — the training loop
+## 8. `DSALTTrainer`, the training loop
 
-`dsalt.training.DSALTTrainer` — single- and multi-GPU (DDP) training with AMP
+`dsalt.training.DSALTTrainer`, single- and multi-GPU (DDP) training with AMP
 autodetect, cosine LR schedule, checkpointing, and rich diagnostics. It expects
 **packed** batches shaped `(input_ids, labels, cu_seqlens, max_seqlen)` (see §9).
 
@@ -360,13 +360,13 @@ sequences concatenated along the token axis, with an offset table.
 
 A batch is `(input_ids, labels, cu_seqlens, max_seqlen)`:
 
-- `input_ids` — `[total_len]` (or `[B, T]` for the inference path).
-- `labels` — same shape as `input_ids`; positions set to `-100` are ignored by
+- `input_ids`, `[total_len]` (or `[B, T]` for the inference path).
+- `labels`, same shape as `input_ids`; positions set to `-100` are ignored by
   the loss (use this for padding / prompt masking).
-- `cu_seqlens` — `int32` tensor `[num_seqs + 1]`, the cumulative sequence offsets
+- `cu_seqlens`, `int32` tensor `[num_seqs + 1]`, the cumulative sequence offsets
   (`cu_seqlens[0] = 0`, `cu_seqlens[-1] = total_len`), exactly the FlashAttention
   convention. Sequence `b` occupies `input_ids[cu_seqlens[b] : cu_seqlens[b+1]]`.
-- `max_seqlen` — the longest sequence length in the batch (an `int`).
+- `max_seqlen`, the longest sequence length in the batch (an `int`).
 
 Your `DataLoader` must yield this 4-tuple.
 
@@ -375,7 +375,7 @@ Your `DataLoader` must yield this 4-tuple.
 ## 10. Mixed precision & device portability
 
 With `mixed_precision="auto"` the trainer picks the autocast dtype from the GPU's
-**compute capability** — not from `torch.cuda.is_bf16_supported()`, which returns
+**compute capability**, not from `torch.cuda.is_bf16_supported()`, which returns
 `True` even on `sm_75`/T4 where bf16 is software-emulated and does not compile:
 
 - `sm_80+` (A100 / H100 / L4 / …) → **bf16** (no GradScaler needed)
@@ -422,28 +422,28 @@ Besides loss, perplexity, LR, it/s and tok/s, the trainer computes a suite of
 per-layer **representation-health** metrics in `eval` mode from the cached
 attention matrices (`_last_P`):
 
-- `σ²` — second singular value of the attention matrix (rank-collapse signal)
-- `eff_rank` — effective rank of the representations
-- `res_norm` — residual-stream norm ratio
-- `attn_entropy` — attention entropy `H`
-- `noise_norm` — noise propagation under a token perturbation
-- `token_dist` — token distinguishability
-- `head_spec_std` — head-specialisation spread
-- `attn_sink` — attention mass on token 0 (sink)
+- `σ²`, second singular value of the attention matrix (rank-collapse signal)
+- `eff_rank`, effective rank of the representations
+- `res_norm`, residual-stream norm ratio
+- `attn_entropy`, attention entropy `H`
+- `noise_norm`, noise propagation under a token perturbation
+- `token_dist`, token distinguishability
+- `head_spec_std`, head-specialisation spread
+- `attn_sink`, attention mass on token 0 (sink)
 - `alpha_{min,mean,max}` and per-head `alpha`
 - `win_{min,mean,max}` and per-layer window sizes
-- `scan_block_max`, `scan_ratio` — the per-block max window `max(w̃)` and realised
+- `scan_block_max`, `scan_ratio`, the per-block max window `max(w̃)` and realised
   scan ratio (this is what makes the early throughput dip = head specialisation
   visible; it saturates as heads specialise)
-- `oow_mass_per_layer` — out-of-window attention mass
+- `oow_mass_per_layer`, out-of-window attention mass
 
 ### Checkpointing
 
 The trainer saves to `save_dir`:
 
-- `checkpoint_best.pt` — on a new best validation perplexity
-- `checkpoint_step_<n>.pt` — every `save_every` steps
-- `checkpoint_final.pt` — at the end
+- `checkpoint_best.pt`, on a new best validation perplexity
+- `checkpoint_step_<n>.pt`, every `save_every` steps
+- `checkpoint_final.pt`, at the end
 
 Each checkpoint stores the **unwrapped** model state (DDP/compile peeled off),
 optimizer state, scheduler state, best validation perplexity, and the full metric
@@ -483,7 +483,7 @@ falls back to portable heuristics. Constraint on `sm_75`: every `tl.dot` axis mu
 be ≥ 16, so landmark blocks are padded to 16 when needed.
 
 When Triton is absent, `dsalt_triton_attention` (and the other Triton symbols) are
-`None`, and the model uses the SDPA fallback automatically — the SDPA path mirrors
+`None`, and the model uses the SDPA fallback automatically, the SDPA path mirrors
 the exact same math (shared selectors), so it doubles as the kernel's correctness
 reference.
 
@@ -559,5 +559,5 @@ trainer.train()
 
 ## License
 
-Apache 2.0 — see
+Apache 2.0, see
 [LICENSE](https://github.com/LeonardoCofone/dsalt-library/blob/main/LICENSE).

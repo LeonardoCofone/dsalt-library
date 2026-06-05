@@ -72,7 +72,7 @@ def compute_metrics(
         sv_norm = sv / (sv.sum() + 1e-9)
         eff_rank = torch.exp(-(sv_norm * (sv_norm + 1e-9).log()).sum()).item()
     else:
-        print("[trainer] compute_metrics: _last_P unavailable (training mode / packed) — skipping rank/entropy stats")
+        print("[trainer] compute_metrics: _last_P unavailable (training mode / packed), skipping rank/entropy stats")
 
     for li, layer in enumerate(m.layers):
         attn = layer.attn

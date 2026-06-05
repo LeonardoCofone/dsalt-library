@@ -11,33 +11,41 @@ custom **Triton** kernels; everywhere else it falls back to a masked **SDPA**
 path, so the package stays importable and runnable on any platform (including
 CPU and Windows).
 
-> **Install**: `pip install dsalt`
-> **Source**: <https://github.com/LeonardoCofone/dsalt-library>
+> **Install**: `pip install dsalt`  
+> **Source**: <https://github.com/LeonardoCofone/dsalt-library>  
 > **Paper**: <https://zenodo.org/records/19312826>
 
 ## ✨ Key Features
 
-- **Sparse attention** — adaptive local causal window `∪` top-`k` landmark tokens per head (`A(i) = W(i) ∪ L(i)`).
-- **Fully differentiable selectors** — the *hard* window/landmark selection stays non-differentiable, but the gradient still reaches both predictors through soft weights: a **soft window edge** trains the per-token window size, and a **soft landmark re-weight** trains the per-head balance `α`.
-- **GPU-portable** — Triton kernels on CUDA, transparent SDPA fallback otherwise; AMP dtype is auto-selected from the GPU's compute capability (bf16 on `sm_80+`, fp16 on T4-class cards, none on CPU).
-- **One-shot autotune** — Triton block sizes are benchmarked once per `(head_dim, GPU)` at the first launch, then reused for the whole run; portable heuristics if benchmarking is impossible.
-- **Packed-sequence training** — concatenated sequences + `cu_seqlens`, fused FlashAttention-2-style forward/backward with online softmax and a key-parallel, atomic-free `dk/dv` backward.
-- **Flexible loss** — memory-frugal chunked cross-entropy (default), optional Liger fused linear cross-entropy, or `"auto"` to pick the fastest per GPU.
-- **DDP + torch.compile** — single- and multi-GPU via `DistributedDataParallel`, co-existing with `torch.compile`; gradient accumulation, cosine schedule with warm-up, checkpointing, and rich representation-health diagnostics.
+- **Sparse attention**, adaptive local causal window `∪` top-`k` landmark tokens per head (`A(i) = W(i) ∪ L(i)`).
+- **Fully differentiable selectors**, the *hard* window/landmark selection stays non-differentiable, but the gradient still reaches both predictors through soft weights: a **soft window edge** trains the per-token window size, and a **soft landmark re-weight** trains the per-head balance `α`.
+- **GPU-portable**, Triton kernels on CUDA, transparent SDPA fallback otherwise; AMP dtype is auto-selected from the GPU's compute capability (bf16 on `sm_80+`, fp16 on T4-class cards, none on CPU).
+- **One-shot autotune**, Triton block sizes are benchmarked once per `(head_dim, GPU)` at the first launch, then reused for the whole run; portable heuristics if benchmarking is impossible.
+- **Packed-sequence training**, concatenated sequences + `cu_seqlens`, fused FlashAttention-2-style forward/backward with online softmax and a key-parallel, atomic-free `dk/dv` backward.
+- **Flexible loss**, memory-frugal chunked cross-entropy (default), optional Liger fused linear cross-entropy, or `"auto"` to pick the fastest per GPU.
+- **DDP + torch.compile**, single- and multi-GPU via `DistributedDataParallel`, co-existing with `torch.compile`; gradient accumulation, cosine schedule with warm-up, checkpointing, and rich representation-health diagnostics.
 
 ---
 
 ## 📋 Table of Contents
-- [✨ Key Features](#-key-features)
-- [🛠️ Installation](#️-installation)
-- [🚀 Quick Start](#-quick-start)
-- [🏗️ Architecture Overview](#️-architecture-overview)
-- [🎯 Training](#-training)
-- [📚 API Reference](#-api-reference)
-- [📖 Documentation](#-documentation)
-- [📄 License](#-license)
-- [🤝 Contributing](#-contributing)
-- [📝 Citation](#-citation)
+- [DSALT: Dynamic Sparse Attention with Landmark Tokens](#dsalt-dynamic-sparse-attention-with-landmark-tokens)
+  - [✨ Key Features](#-key-features)
+  - [📋 Table of Contents](#-table-of-contents)
+  - [🛠️ Installation](#️-installation)
+    - [Requirements](#requirements)
+    - [From PyPI](#from-pypi)
+    - [From source](#from-source)
+  - [🚀 Quick Start](#-quick-start)
+    - [Inference](#inference)
+    - [Computing the loss](#computing-the-loss)
+    - [Building from a config](#building-from-a-config)
+  - [🏗️ Architecture Overview](#️-architecture-overview)
+  - [🎯 Training](#-training)
+  - [📚 API Reference](#-api-reference)
+  - [📖 Documentation](#-documentation)
+  - [📄 License](#-license)
+  - [🤝 Contributing](#-contributing)
+  - [📝 Citation](#-citation)
 
 ---
 
@@ -230,23 +238,23 @@ signature and semantics of **every** component live in
 
 ## 📖 Documentation
 
-- [FEATURE.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/FEATURE.md) — complete feature & hyperparameter reference (every public API, every option).
-- [DESIGN_NOTES.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/DESIGN_NOTES.md) — engineering design rationale and profiling evidence.
-- [STRUCTURE.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/STRUCTURE.md) — repository layout and intra-package usage map.
-- [CONTRIBUTING.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/CONTRIBUTING.md) — how to contribute.
+- [FEATURE.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/FEATURE.md), complete feature & hyperparameter reference (every public API, every option).
+- [DESIGN_NOTES.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/DESIGN_NOTES.md), engineering design rationale and profiling evidence.
+- [STRUCTURE.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/STRUCTURE.md), repository layout and intra-package usage map.
+- [CONTRIBUTING.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/CONTRIBUTING.md), how to contribute.
 
 ---
 
 ## 📄 License
 
-Apache 2.0 — see
+Apache 2.0, see
 [LICENSE](https://github.com/LeonardoCofone/dsalt-library/blob/main/LICENSE).
 
 ---
 
 ## 🤝 Contributing
 
-Contributions are welcome — see
+Contributions are welcome, see
 [CONTRIBUTING.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/CONTRIBUTING.md).
 Especially valuable: Triton kernel optimisation, new architectures (encoder /
 encoder-decoder), additional training strategies, documentation, and bug fixes.
