@@ -38,6 +38,17 @@ except Exception:
     _TRITON_TRAIN_OK = False
 
 
+def _dynamo_opaque(fn):
+    """Make ``fn`` opaque to torch.compile/Dynamo (graph-break, run eager).
+
+    Same helper as in ``dsalt_triton_train``. Autograd is unaffected (gradients
+    flow normally), only the *tracing* is skipped. Degrades to identity on torch
+    builds without ``_dynamo``.
+    """
+    disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
+    return disable(fn) if disable is not None else fn
+
+
 @torch.no_grad()
 def _hybrid_scores(
     x:     torch.Tensor,
@@ -437,8 +448,20 @@ class DSALTAttention(nn.Module):
             n_max=self.n_max, cu_list=cu_list,
         )
 
+    @_dynamo_opaque
     def _train_selectors(self, x, cu_seqlens, total_len, device, cu_list=None):
         """Shared selector prelude for BOTH the Triton kernel and the dense fallback.
+
+        Marked ``@_dynamo_opaque``: this prelude branches on data-dependent PYTHON
+        values derived from ``cu_list`` (per-step ``total_len`` / ``num_seqs`` /
+        ``max_len`` via ``int()``/``max()``/``range()`` in ``selectors``). Under
+        torch.compile those become guards on concrete python ints that change every
+        step (varlen packing), forcing a full re-trace per step — which dominated
+        wall-clock (~82s/step) while the in-step timer still read ~17s of compute.
+        Running it eager (it is pure-torch, ~5ms/call) keeps the graph stable; the
+        ``w_cont`` / ``lmk_logw`` gradients to ``win_gate`` / ``alpha`` are
+        unaffected (Dynamo opacity skips tracing, not autograd), exactly like the
+        already-opaque ``dsalt_triton_train_attention`` it feeds.
 
         Returns ``(w_cont [total_len], lmk_pos [H,S,k], lmk_logw [H,S,k])``, the
         SAME tensors both paths must consume, so the dense verification reference

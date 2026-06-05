@@ -238,6 +238,30 @@ class DSALTLMHeadModel(nn.Module):
             dtype   = torch.get_autocast_gpu_dtype() if enabled else x.dtype
         return x.to(dtype) if enabled and x.dtype != dtype else x
 
+    @staticmethod
+    @torch._dynamo.disable
+    def _packed_rope_meta(cu_seqlens: torch.Tensor, total_len: int, attn0):
+        """Per-step packed metadata: RoPE cos/sin gather + host copy of cu_seqlens.
+
+        Marked ``@torch._dynamo.disable``: this builds tensors from data-dependent
+        positions (``pos_ids`` from per-sequence ``cu_seqlens``) and does the one
+        D2H ``.tolist()`` for ``cu_list``. Under torch.compile the ``.tolist()`` is
+        a graph break AND yields a python list of per-step-varying ints; tracing it
+        would re-specialize the graph every step (varlen packing). Running it eager
+        keeps the compiled forward shape-stable. The single D2H sync is intentional
+        and happens once per step here (not once per layer), while the GPU queue is
+        still shallow. ``rope_cs`` carries no grad (RoPE tables are buffers).
+        """
+        device   = cu_seqlens.device
+        num_seqs = cu_seqlens.shape[0] - 1
+        lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
+        starts   = cu_seqlens[:-1].to(device)
+        seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
+        pos_ids  = torch.arange(total_len, device=device) - starts[seq_ids]
+        rope_cs  = (attn0.rope_cos[pos_ids], attn0.rope_sin[pos_ids])
+        cu_list  = cu_seqlens.detach().to("cpu").tolist()
+        return rope_cs, cu_list
+
     def forward(
         self,
         input_ids:              torch.Tensor,
@@ -263,21 +287,9 @@ class DSALTLMHeadModel(nn.Module):
         rope_cs = None
         cu_list = None
         if cu_seqlens is not None:
-            device   = input_ids.device
-            attn0    = self.layers[0].attn
-            num_seqs = cu_seqlens.shape[0] - 1
-            lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
-            starts   = cu_seqlens[:-1].to(device)
-            seq_ids  = torch.repeat_interleave(torch.arange(num_seqs, device=device), lens)
-            total_len = input_ids.shape[0]
-            pos_ids  = torch.arange(total_len, device=device) - starts[seq_ids]
-            rope_cs  = (attn0.rope_cos[pos_ids], attn0.rope_sin[pos_ids])
-            # Single host copy of cu_seqlens for the whole step (all layers share it).
-            # Done here, early, so the one unavoidable D2H sync happens while the GPU
-            # queue is still shallow, instead of once per layer mid-stream (which the
-            # profiler showed costing ~160ms total). Plain python ints downstream → no
-            # per-layer .item()/.to('cpu').
-            cu_list = cu_seqlens.detach().to("cpu").tolist()
+            rope_cs, cu_list = self._packed_rope_meta(
+                cu_seqlens, input_ids.shape[0], self.layers[0].attn,
+            )
 
         for layer in self.layers:
             x, layer_aux = layer(

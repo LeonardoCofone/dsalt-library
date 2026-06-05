@@ -156,6 +156,8 @@ COSE_CAMBIATE_DALLA_TEORIA.md
 last_version_6.pdf
 .CLAUDE.md
 CLAUDE.md
+make_dataset_longform_REFERENCE.py
+data_utils_longform_REFERENCE.py
 
 # Claude AI
 .claude/

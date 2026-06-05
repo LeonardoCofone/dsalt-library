@@ -379,7 +379,13 @@ class DSALTTrainer:
             try:
                 if world_size > 1 and hasattr(torch, "_dynamo"):
                     torch._dynamo.config.optimize_ddp = False
-                model = torch.compile(model, fullgraph=False)
+                # dynamic=True: the packed varlen format gives a different total
+                # token count (and cu_seqlens length) on almost every step. With
+                # the default dynamic=None, Dynamo specializes on the first shape
+                # then RE-COMPILES whenever it changes — i.e. nearly every step,
+                # which dominated wall-clock (~82s/step vs ~17s of real compute).
+                # Forcing symbolic shapes compiles once and reuses the graph.
+                model = torch.compile(model, fullgraph=False, dynamic=True)
             except Exception as e:  # pragma: no cover - environment dependent
                 print(f"[trainer] torch.compile failed ({type(e).__name__}); running eager.")
 
@@ -587,6 +593,20 @@ class DSALTTrainer:
         lr_now    = self.scheduler.get_last_lr()[0]
         train_ppl = math.exp(min(accum_loss, 20.0))
 
+        # Dynamo recompile counter: a healthy compiled run recompiles only in the
+        # first 1-2 steps then plateaus. A monotonically rising count means the
+        # graph is being re-traced every step (data-dependent python values or
+        # changing shapes), which silently dominates wall-clock while the in-step
+        # timer (it_s) keeps reporting only the compute time. Delta since last log.
+        recompiles = 0
+        try:
+            from torch._dynamo.utils import counters as _dyn_counters
+            recompiles = sum(_dyn_counters["frames"].values()) if "frames" in _dyn_counters else 0
+        except Exception:
+            recompiles = 0
+        recompiles_delta = recompiles - getattr(self, "_last_recompiles", 0)
+        self._last_recompiles = recompiles
+
         metrics = compute_metrics(
             _unwrap_model(self.model),
             self._last_ids,
@@ -611,7 +631,8 @@ class DSALTTrainer:
             f"head_std={_fs(metrics['head_spec_std'])} | "
             f"win={metrics['win_min']:.0f}/{metrics['win_mean']:.1f}/{metrics['win_max']:.0f} | "
             f"scan={metrics['scan_block_max']:.1f} x{metrics['scan_ratio']:.2f} | "
-            f"alpha={metrics['alpha_min']:.3f}/{metrics['alpha_mean']:.3f}/{metrics['alpha_max']:.3f}"
+            f"alpha={metrics['alpha_min']:.3f}/{metrics['alpha_mean']:.3f}/{metrics['alpha_max']:.3f} | "
+            f"recompiles=+{recompiles_delta}"
         )
 
         self.logger.info(msg, extra={"it_s": it_s, "tok_s": tok_s, "mem_gb": mem_gb, "peak_gb": peak_gb, "total_gb": stats.get("total_gb", 0.0)})
