@@ -214,8 +214,17 @@ class DSALTLMHeadModel(nn.Module):
         return _chunked_cross_entropy(flat_x, self.lm_head.weight, flat_labels, chunk)
 
     @staticmethod
+    @torch._dynamo.disable
     def _to_autocast_dtype(x: torch.Tensor) -> torch.Tensor:
         """Cast ``x`` to the active autocast compute dtype (no-op if not autocasting).
+
+        Marked ``@torch._dynamo.disable``: the autocast state is queried via
+        ``torch.is_autocast_enabled``, which Dynamo evaluates at *trace* time, not
+        at runtime — under ``torch.compile`` the traced state can differ from the
+        real one, so Inductor freezes the embedding to fp32 and an fp32 activation
+        then hits a bf16 weight in the first fused residual ``addmm`` ("self and
+        mat2 must have the same dtype"). Keeping this opaque forces the cast to be
+        decided eagerly, per call, from the live autocast state.
 
         Handles both the ``device_type`` API (PyTorch ≥ 2.4) and the older no-arg
         form (PyTorch 2.0–2.3) so the package stays importable on torch>=2.0.
