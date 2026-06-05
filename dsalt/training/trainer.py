@@ -293,6 +293,7 @@ class DSALTTrainer:
         grad_accum: int = 1,
         log_every: int = 100,
         val_every: int = 500,
+        max_val_batches: int | None = None,
         save_every: int = 1000,
         save_dir: str = "./checkpoints_dsalt",
         mixed_precision: str = "auto",
@@ -314,6 +315,7 @@ class DSALTTrainer:
         self.grad_accum             = grad_accum
         self.log_every              = log_every
         self.val_every              = val_every
+        self.max_val_batches        = max_val_batches
         self.save_every             = save_every
         self.save_dir               = Path(save_dir)
         self.gradient_checkpointing = gradient_checkpointing
@@ -504,7 +506,13 @@ class DSALTTrainer:
         self.model.eval()
         total_loss, total_tokens = 0.0, 0
 
-        for batch in self.val_loader:
+        # Cap the number of validation batches: the full val set can be thousands
+        # of batches, and validating every ``val_every`` steps over all of them can
+        # cost more wall-time than the training itself. A few dozen batches give a
+        # stable enough perplexity estimate. ``None`` keeps the full sweep.
+        for vi, batch in enumerate(self.val_loader):
+            if self.max_val_batches is not None and vi >= self.max_val_batches:
+                break
             ids, labels, cu_seqlens, max_seqlen = self._extract_batch(batch)
             valid_tokens  = (labels != -100).sum().item()
 
