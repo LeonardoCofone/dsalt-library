@@ -7,6 +7,8 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
+from datetime import datetime #SOLO per debug a riga 761
+
 from .gpu_auto import (
     get_device,
     get_gpu_memory_stats,
@@ -633,17 +635,10 @@ class DSALTTrainer:
         def _fs(v) -> str:
             return f"{v:.6f}" if math.isfinite(v) else "nan"
 
-        # --- cheap line, EVERY log_every: only free quantities already in hand
-        # (loss/ppl/lr + it_s/tok_s/mem). No model re-run, no SVD, no forward.
-        msg = (
-            f"step={self.global_step} | "
-            f"loss={accum_loss:.4f} | "
-            f"ppl={train_ppl:.4f} | "
-            f"lr={lr_now:.2e}"
-        )
-        self.logger.info(msg, extra={"it_s": it_s, "tok_s": tok_s, "mem_gb": mem_gb, "peak_gb": peak_gb, "total_gb": stats.get("total_gb", 0.0)})
+        extra = {"it_s": it_s, "tok_s": tok_s, "mem_gb": mem_gb,
+                 "peak_gb": peak_gb, "total_gb": stats.get("total_gb", 0.0)}
 
-        # always record the cheap history
+        # always record the cheap history (one entry per log_every)
         self.history["gpu_peak_gb"] = self.history.get("gpu_peak_gb", [])
         self.history["gpu_peak_gb"].append(peak_gb)
         self.history["train_loss"].append(accum_loss)
@@ -652,13 +647,23 @@ class DSALTTrainer:
         self.history["tok_s"].append(tok_s)
         self.history["gpu_mem_gb"].append(mem_gb)
 
-        # --- heavy diagnostics, only every metrics_every: the model re-run + SVDs
-        # (rank/entropy/sink/noise) AND the window/alpha/scan probe. This is the
-        # expensive part (full extra forward + per-layer GPU SVDs), kept rare so
-        # the steady ``log_every`` line stays free. Skipped entirely otherwise.
-        if self.global_step % self.metrics_every != 0:
+        heavy = (self.global_step % self.metrics_every == 0)
+
+        # --- cheap line, EVERY log_every: a single compact row, no model re-run,
+        # no SVD, no forward. ``kind=cheap`` tells the formatter to render one line
+        # (step | loss | ppl | lr | it/s | tok/s | mem) instead of the full box.
+        if not heavy:
+            self.logger.info(
+                f"kind=cheap | step={self.global_step} | "
+                f"loss={accum_loss:.4f} | ppl={train_ppl:.4f} | lr={lr_now:.2e}",
+                extra=extra,
+            )
             return
 
+        # --- heavy diagnostics, every metrics_every: a model re-run + per-layer
+        # GPU SVDs (rank/entropy/sink/noise) + the window/alpha/scan probe. Carries
+        # loss/ppl/lr too so the full box never shows nan. ``kind=metrics`` selects
+        # the box layout in the formatter.
         metrics = compute_metrics(
             _unwrap_model(self.model),
             self._last_ids,
@@ -667,17 +672,20 @@ class DSALTTrainer:
             heavy=True,
         )
         self.logger.info(
-            f"step={self.global_step} [metrics] | "
+            f"kind=metrics | step={self.global_step} | "
+            f"loss={accum_loss:.4f} | ppl={train_ppl:.4f} | lr={lr_now:.2e} | "
             f"σ²={_fs(metrics['sigma2'])} | "
             f"rank={_fs(metrics['eff_rank'])} | "
-            f"res={metrics['res_norm']:.4f} | "
+            f"res={_fs(metrics['res_norm'])} | "
             f"H={_fs(metrics['attn_entropy'])} | "
             f"noise={_fs(metrics['noise_norm'])} | "
             f"sink={_fs(metrics['attn_sink'])} | "
             f"head_std={_fs(metrics['head_spec_std'])} | "
+            f"token_dist={_fs(metrics['token_dist'])} | "
             f"win={metrics['win_min']:.0f}/{metrics['win_mean']:.1f}/{metrics['win_max']:.0f} | "
             f"scan={metrics['scan_block_max']:.1f} x{metrics['scan_ratio']:.2f} | "
-            f"alpha={metrics['alpha_min']:.3f}/{metrics['alpha_mean']:.3f}/{metrics['alpha_max']:.3f}"
+            f"alpha={metrics['alpha_min']:.3f}/{metrics['alpha_mean']:.3f}/{metrics['alpha_max']:.3f}",
+            extra=extra,
         )
         for k in ["sigma2", "eff_rank", "res_norm", "attn_entropy", "noise_norm",
                   "token_dist", "head_spec_std", "attn_sink",
@@ -750,8 +758,8 @@ class DSALTTrainer:
 
             gn_val = grad_norm.item() if grad_norm is not None else 0.0
             if self.rank == 0:
-                print(f"step {self.global_step} | grad_norm={gn_val:.4f} | accum_loss={accum_loss:.4f}")
-
+                current_time = datetime.now().strftime("%H:%M:%S")
+                print(f"[{current_time}] step {self.global_step} | grad_norm={gn_val:.4f} | accum_loss={accum_loss:.4f}")
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1
