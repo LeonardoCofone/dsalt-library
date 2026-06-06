@@ -757,9 +757,10 @@ class DSALTTrainer:
                 self.optimizer.step()
 
             gn_val = grad_norm.item() if grad_norm is not None else 0.0
-            if self.rank == 0:
-                current_time = datetime.now().strftime("%H:%M:%S")
-                print(f"[{current_time}] step {self.global_step} | grad_norm={gn_val:.4f} | accum_loss={accum_loss:.4f}")
+            #PER DEBUG:
+            #if self.rank == 0:
+                #current_time = datetime.now().strftime("%H:%M:%S")
+                #print(f"[{current_time}] step {self.global_step} | grad_norm={gn_val:.4f} | accum_loss={accum_loss:.4f}")
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1

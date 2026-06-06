@@ -10,6 +10,9 @@ profile_cuda.py
 profile_dense.py
 dense-baseline-model.ipynb
 profile_copies.py
+es_dsalt/
+es_dense/
+test/
  
 # C extensions
 *.so
