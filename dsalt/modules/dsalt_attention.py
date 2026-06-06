@@ -589,6 +589,16 @@ class DSALTAttention(nn.Module):
             sin = self.rope_sin[pos_ids]
         else:
             cos, sin = rope_cs
+        # The RoPE cache is stored in fp32, but q/k come out of their projections
+        # in the autocast compute dtype (bf16 on Ampere+, fp16 on T4). Multiplying
+        # by an fp32 cos/sin promotes q/k back to fp32, so the training kernel then
+        # re-casts them down (a real [total_len,H,D] copy per tensor) AND, because
+        # the post-RoPE dtype is fp32, its ``in_dtype`` guard falls through to fp16
+        # even on a bf16 run. Cast cos/sin to q's dtype here so RoPE stays in the
+        # compute dtype: q/k reach the kernel already in bf16 (kernel runs in the
+        # right precision, and its .to(in_dtype) becomes a no-op). dtype-agnostic.
+        cos = cos.to(q.dtype)
+        sin = sin.to(q.dtype)
         q, k = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
 
         aux = self._aux_zero(x.device, x.dtype)

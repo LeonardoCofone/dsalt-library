@@ -25,6 +25,8 @@ MAGENTA  = "\033[95m"
 CYAN     = "\033[96m"
 WHITE    = "\033[97m"
 BG_GREEN = "\033[48;5;22m"
+LAVENDER  = "\033[38;5;141m"
+OCHRE     = "\033[38;5;179m"
 
 _W_LABEL = 10
 _W_VAL   = 14
@@ -150,9 +152,16 @@ class _StepFormatter(logging.Formatter):
         mem_s   = (f"{mem_c}peak {peak_gb:.1f} GB{RESET}" if peak_gb > 0
                    else f"{DIM}?.? GB{RESET}")
 
-        return (f"  {ts}  {BOLD}step {CYAN}{step}{RESET}  "
-                f"loss {loss_s}  {DIM}ppl{RESET} {ppl_s}  {DIM}lr{RESET} {lr_s}  "
-                f"{speed_s}  {tok_s_s}  {mem_s}")
+        return (
+            f"\n  {ts}  │  "
+            f"{BOLD}step {CYAN}{step:<5}{RESET}  │  "
+            f"loss {BOLD}{loss_s:<7}{RESET}  │  "
+            f"ppl {ppl_s:<10}  │  "
+            f"lr {lr_s:<8}  │  "
+            f"{speed_s:<10}  │  "
+            f"{tok_s_s:<13}  │  "
+            f"{mem_s}"
+        )
 
     def _banner(self, msg: str) -> str:
         bar = f"{BOLD}{CYAN}{'━' * _W_BAR}{RESET}"
@@ -172,7 +181,7 @@ class _StepFormatter(logging.Formatter):
             if not part:
                 continue
             k, _, v = part.partition("=")
-            lines.append(f"  {YELLOW}{k.strip():>22}{RESET}  {DIM}={RESET}  {WHITE}{v.strip()}{RESET}")
+            lines.append(f"  {YELLOW}{k.strip():>22}{RESET}  {DIM}={RESET}  {LAVENDER}{v.strip()}{RESET}")
         lines.append(bar)
         lines.append("")
         return "\n".join(lines)
@@ -182,7 +191,7 @@ class _StepFormatter(logging.Formatter):
         c       = GREEN if is_best else YELLOW
         badge   = f"  {BOLD}{GREEN}  ★ NEW BEST  {RESET}" if is_best else ""
         bar     = f"{c}{'─' * 60}{RESET}"
-        return f"\n{bar}\n  {BOLD}{c}VAL{RESET}  {WHITE}{msg}{RESET}{badge}\n{bar}\n"
+        return f"\n{bar}\n  {BOLD}{c}VAL{RESET}  {LAVENDER}{msg}{RESET}{badge}\n{bar}\n"
 
     def _step(self, record: logging.LogRecord, msg: str) -> str:
         p      = _parse(msg)
@@ -206,12 +215,12 @@ class _StepFormatter(logging.Formatter):
 
         sigma2 = _fmt_val(p.get("σ²",      p.get("sigma2", "nan")), color=YELLOW)
         rank   = _fmt_val(p.get("rank",     "nan"),                  color=CYAN)
-        res    = _fmt_val(p.get("res",      "nan"),                  color=WHITE)
+        res    = _fmt_val(p.get("res",      "nan"),                  color=OCHRE)
         H      = _fmt_val(p.get("H",        "nan"),                  color=GREEN)
         noise  = _fmt_val(p.get("noise",    "nan"),                  color=RED)
         sink   = _fmt_val(p.get("sink",     "nan"),                  color=YELLOW)
         hstd   = _fmt_val(p.get("head_std", p.get("hstd", "nan")),   color=MAGENTA)
-        tdist  = _fmt_val(p.get("token_dist", "nan"),                color=WHITE)
+        tdist  = _fmt_val(p.get("token_dist", "nan"),                color=LAVENDER)
         lr_s   = f"{MAGENTA}{p.get('lr', '?')}{RESET}"
         # §4.2 window (min/mean/max) and §4.3 alpha (min/mean/max): shown raw
         # as already-formatted "a/b/c" triplets, not numerically reformatted.
