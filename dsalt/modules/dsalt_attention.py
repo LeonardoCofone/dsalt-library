@@ -647,6 +647,15 @@ class DSALTAttention(nn.Module):
                 q, k, v, attn_mask, self.dropout, self.training,
             )
 
+        # The rest of this method reconstructs the DENSE [H,T,T] attention matrix of
+        # the first sequence purely to populate ``_last_P`` for analysis metrics
+        # (rank / Dobrushin in paper_eval). It is O(T^2) and cancels the sparse
+        # memory advantage, so it is gated: callers that only need the output (e.g.
+        # the context-scaling experiment) set ``_collect_last_P = False`` to skip it.
+        if not getattr(self, "_collect_last_P", True):
+            self._last_P = None
+            return self.out_proj(out.view(total_len, self.d_model)), aux
+
         s0    = int(cu_seqlens[0])
         e0    = int(cu_seqlens[1])
         q0    = q[s0:e0].transpose(0, 1)
