@@ -750,8 +750,20 @@ class DSALTAttention(nn.Module):
             in_lmk    = torch.zeros(self.n_heads, T0, T0, dtype=torch.bool, device=device)
             for h in range(self.n_heads):
                 valid_pos = lmk_abs[h]
-                causal    = valid_pos.unsqueeze(0) <= rows.unsqueeze(1)
-                in_lmk[h].scatter_(1, valid_pos.unsqueeze(0).expand(T0, -1), causal)
+                # ``_compute_landmark_indices`` pads unfilled slots with -1 (fewer than
+                # k_lmk valid landmarks — common under the near-dense window seed, where
+                # almost every token is already in-window so few landmark candidates
+                # remain). A -1 is an illegal scatter index (device-side assert). We mark
+                # the landmark columns directly with index_fill_ on the valid positions
+                # only, which also avoids scatter's duplicate-index races; the per-query
+                # causal cut (a landmark key must be ≤ the query) is reapplied after.
+                vp = valid_pos[valid_pos >= 0]                                     # [k_valid]
+                if vp.numel() == 0:
+                    continue
+                col_is_lmk = torch.zeros(T0, dtype=torch.bool, device=device)
+                col_is_lmk[vp] = True                                              # [T0] over keys
+                # a landmark key j is attended by query i iff it is causal (j ≤ i)
+                in_lmk[h] = col_is_lmk.unsqueeze(0) & (cols.unsqueeze(0) <= rows.unsqueeze(1))
 
             full_mask = in_win.unsqueeze(0) | in_lmk
         else:
