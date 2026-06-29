@@ -124,6 +124,9 @@ class DSALTLMHeadModel(nn.Module):
         lm_head_chunk_size: int        = 2048,
         loss_fn:            str        = "chunked",
         aux_loss_weight:    float      = 0.0,
+        n_kv_heads:         int | None = None,
+        qkv_bias:           bool       = False,
+        rope_base:          float      = 10000.0,
     ):
         super().__init__()
         assert loss_fn in _LOSS_FN, f"loss_fn must be one of {list(_LOSS_FN)}"
@@ -153,6 +156,7 @@ class DSALTLMHeadModel(nn.Module):
                 d_model=d_model, n_heads=n_heads, n_min=n_min, n_max=n_max,
                 k_lmk=k_lmk, max_seq_len=max_seq_len, d_ff=d_ff,
                 dropout=dropout, yarn_scale=yarn_scale, layer_idx=i,
+                n_kv_heads=n_kv_heads, qkv_bias=qkv_bias, rope_base=rope_base,
             )
             for i in range(n_layers)
         ])

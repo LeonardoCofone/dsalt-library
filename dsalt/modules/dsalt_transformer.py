@@ -38,6 +38,9 @@ class DSALTTransformerBlock(nn.Module):
         dropout:     float = 0.0,
         yarn_scale:  float = 1.0,
         layer_idx:   int   = 0,
+        n_kv_heads:  int | None = None,
+        qkv_bias:    bool   = False,
+        rope_base:   float  = 10000.0,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -47,6 +50,7 @@ class DSALTTransformerBlock(nn.Module):
             d_model=d_model, n_heads=n_heads, n_min=n_min, n_max=n_max,
             k_lmk=k_lmk, max_seq_len=max_seq_len, dropout=dropout,
             yarn_scale=yarn_scale, layer_idx=layer_idx,
+            n_kv_heads=n_kv_heads, qkv_bias=qkv_bias, rope_base=rope_base,
         )
         self.ffn = SwiGLUFFN(d_model=d_model, d_ff=d_ff, dropout=dropout)
 

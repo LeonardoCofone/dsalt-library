@@ -70,9 +70,13 @@ def _build_mask_batched(
     k_lmk:   int,
     T:        int,
     device:   torch.device,
+    dh:       int | None = None,
 ) -> torch.Tensor:
     n_heads = alpha.shape[0]
-    dh      = v_weight.shape[0] // n_heads
+    # Pass the true per-head dim explicitly under GQA (where v_weight has only
+    # n_kv_heads head-rows, so v_weight.shape[0] // n_heads would be wrong).
+    if dh is None:
+        dh = v_weight.shape[0] // n_heads
 
     window_mask   = build_local_window_mask(T, w_sizes, device)
     scores        = _hybrid_scores(x, v_weight, alpha, dh)
@@ -183,6 +187,9 @@ class DSALTAttention(nn.Module):
         dropout:     float = 0.0,
         yarn_scale:  float = 1.0,
         layer_idx:   int   = 0,
+        n_kv_heads:  int | None = None,
+        qkv_bias:    bool   = False,
+        rope_base:   float  = 10000.0,
     ):
         super().__init__()
         assert d_model % n_heads == 0
@@ -190,18 +197,32 @@ class DSALTAttention(nn.Module):
         self.d_model     = d_model
         self.n_heads     = n_heads
         self.head_dim    = d_model // n_heads
+        # Grouped-Query Attention: ``n_kv_heads`` key/value heads shared across the
+        # ``n_heads`` query heads (each kv head serves ``n_rep`` query heads). None
+        # => full MHA. The kv heads are expanded to ``n_heads`` at runtime (repeat_kv)
+        # right after the projections, so every downstream consumer — the Triton
+        # kernels, the selectors, the SDPA fallback — still sees a uniform ``n_heads``
+        # layout and needs no GQA awareness. We carry the unexpanded kv-head count
+        # only to size k_proj/v_proj and to load a GQA backbone (e.g. Qwen2.5) 1:1.
+        self.n_kv_heads  = n_kv_heads if n_kv_heads is not None else n_heads
+        assert n_heads % self.n_kv_heads == 0, "n_heads must be a multiple of n_kv_heads"
+        self.n_rep       = n_heads // self.n_kv_heads
+        self.kv_dim      = self.n_kv_heads * self.head_dim
         self.n_min       = n_min
         self.n_max       = n_max
         self.k_lmk       = k_lmk
         self.max_seq_len = max_seq_len
         self.dropout     = dropout
         self.yarn_scale  = yarn_scale
+        self.rope_base   = rope_base
         self.layer_idx   = layer_idx
 
-        self.q_proj   = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj   = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj   = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        # q is full-width; k/v are kv_dim-wide (== d_model only when MHA). out_proj
+        # consumes the full n_heads*head_dim. Qwen2.5 ships q/k/v WITH bias.
+        self.q_proj   = nn.Linear(d_model, d_model,      bias=qkv_bias)
+        self.k_proj   = nn.Linear(d_model, self.kv_dim,  bias=qkv_bias)
+        self.v_proj   = nn.Linear(d_model, self.kv_dim,  bias=qkv_bias)
+        self.out_proj = nn.Linear(d_model, d_model,      bias=False)
 
         # §4.2 adaptive local window: learned linear projection f: R^d -> R that
         # predicts, per token, w(i) = n_min + σ(f(x_i))·(n_max-n_min) from the
@@ -230,12 +251,36 @@ class DSALTAttention(nn.Module):
 
         self._last_P: torch.Tensor | None = None
 
-        cos, sin = build_rope_cache(max_seq_len, self.head_dim, torch.device("cpu"), scale=yarn_scale)
+        cos, sin = build_rope_cache(max_seq_len, self.head_dim, torch.device("cpu"), base=rope_base, scale=yarn_scale)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
     def _alpha(self) -> torch.Tensor:
         return torch.sigmoid(self.alpha_w)
+
+    def _repeat_kv(self, t: torch.Tensor) -> torch.Tensor:
+        """Expand grouped key/value heads to the full ``n_heads`` (GQA → MHA view).
+
+        ``t`` is a key or value tensor laid out with ``n_kv_heads`` in its
+        second-to-last axis: either ``[..., n_kv_heads, head_dim]`` (the
+        ``[T, H, D]`` packed layout) or ``[B, n_kv_heads, T, head_dim]`` (the
+        batched layout). Each kv head is repeated ``n_rep`` times so the result has
+        ``n_heads`` heads, matching ``q``. No-op when MHA (``n_rep == 1``).
+
+        We materialise the expansion (``repeat_interleave``) rather than broadcast so
+        that every downstream consumer — the Triton kernels, the dense selectors, the
+        SDPA fallback — keeps seeing a plain ``n_heads`` layout with no GQA awareness.
+        The extra memory is the deliberate cost of leaving the kernels untouched; on
+        the large-VRAM GPU we fine-tune on it is comfortably affordable.
+        """
+        if self.n_rep == 1:
+            return t
+        if t.dim() == 3:                        # [T, n_kv_heads, D] (packed)
+            T, _, D = t.shape
+            return t.unsqueeze(2).expand(T, self.n_kv_heads, self.n_rep, D).reshape(T, self.n_heads, D)
+        # [B, n_kv_heads, T, D] (batched)
+        B, _, T, D = t.shape
+        return t.unsqueeze(2).expand(B, self.n_kv_heads, self.n_rep, T, D).reshape(B, self.n_heads, T, D)
 
     def _window_continuous(self, x: torch.Tensor) -> torch.Tensor:
         """Continuous window size w̃(i) (§4.2), differentiable in ``win_gate``.
@@ -359,12 +404,16 @@ class DSALTAttention(nn.Module):
         return self._batched(x, B, T, x.device)
 
     def _batched(self, x: torch.Tensor, B: int, T: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        q = self.q_proj(x).view(B, T, self.n_heads,    self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = self._rope(T, device)
+        # RoPE acts on the native (unexpanded) kv heads, then we replicate kv → full
+        # n_heads so the dots below see a uniform MHA layout (no-op when not GQA).
         q, k     = apply_rotary_emb(q, k, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0))
+        k        = self._repeat_kv(k)
+        v        = self._repeat_kv(v)
 
         x_1b = x[0] if B > 1 else x.squeeze(0)
         scale = 1.0 / math.sqrt(self.head_dim)
@@ -481,6 +530,7 @@ class DSALTAttention(nn.Module):
             lmk_pos, _, _ = _compute_landmark_indices(
                 x.detach(), self.v_proj.weight.detach(), alpha.detach().float(),
                 w_disc, cu_seqlens, self.k_lmk, self.n_min, total_len, cu_list,
+                head_dim=self.head_dim,
             )                                                                     # [H,num_seqs,k]
         scores, _, _ = hybrid_scores_per_head(                                     # [total_len,H] diff in α
             x, self.v_proj.weight, alpha, self.n_heads, self.head_dim,
@@ -575,9 +625,9 @@ class DSALTAttention(nn.Module):
         return torch.maximum(win_lb.unsqueeze(1), lmk_lb)                          # [N,H,L,L]
 
     def _packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, total_len: int, device: torch.device, rope_cs: tuple | None = None, cu_list: list | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        q = self.q_proj(x).view(total_len, self.n_heads, self.head_dim)
-        k = self.k_proj(x).view(total_len, self.n_heads, self.head_dim)
-        v = self.v_proj(x).view(total_len, self.n_heads, self.head_dim)
+        q = self.q_proj(x).view(total_len, self.n_heads,    self.head_dim)
+        k = self.k_proj(x).view(total_len, self.n_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(total_len, self.n_kv_heads, self.head_dim)
 
         if rope_cs is None:
             num_seqs = cu_seqlens.shape[0] - 1
@@ -600,6 +650,12 @@ class DSALTAttention(nn.Module):
         cos = cos.to(q.dtype)
         sin = sin.to(q.dtype)
         q, k = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
+        # GQA: replicate the kv heads to the full n_heads after RoPE, so the kernels /
+        # SDPA fallback below consume a uniform [total_len, n_heads, D] layout. The
+        # landmark *selection* still uses v_proj.weight (kv_dim-wide) directly, which
+        # is correct: a landmark key is selected once per kv group, not per query head.
+        k = self._repeat_kv(k)
+        v = self._repeat_kv(v)
 
         aux = self._aux_zero(x.device, x.dtype)
 
@@ -631,6 +687,7 @@ class DSALTAttention(nn.Module):
                 x.detach(), self.v_proj.weight.detach(),
                 alpha.detach().float(), w_sizes,
                 cu_seqlens, self.k_lmk, self.n_min, total_len, cu_list,
+                head_dim=self.head_dim,
             )
             # Pure A(i)=W∪L (eq. 32): the score only selects, zero logit bias.
             lmk_bias = torch.zeros_like(lmk_indices, dtype=torch.float32)
@@ -678,6 +735,7 @@ class DSALTAttention(nn.Module):
                 self.n_min,
                 T0,
                 [0, T0],   # host-side cu_list → no D2H sync / graph break
+                head_dim=self.head_dim,
             )
 
             rows = torch.arange(T0, device=device)

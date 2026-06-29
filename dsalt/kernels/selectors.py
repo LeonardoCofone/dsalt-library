@@ -86,6 +86,7 @@ def _compute_landmark_indices(
     n_min:      int,
     total_len:  int,
     cu_list:    list | None = None,
+    head_dim:   int | None = None,
 ) -> torch.Tensor:
     """Hard top-k landmark indices per (head, sequence), excluding in-window tokens.
 
@@ -93,13 +94,16 @@ def _compute_landmark_indices(
     the local window, and returns the top-``k_lmk`` indices ``[H, num_seqs, k_lmk]``
     (``-1`` padding where fewer than ``k_lmk`` candidates exist), plus the raw
     ``z_x``/``z_v`` signals. Detached selection, addresses memory only.
+
+    ``head_dim`` must be given under grouped-query attention, where ``W_V`` has only
+    ``n_kv_heads < n_heads`` head-rows and ``W_V.shape[0] // n_heads`` would be wrong.
     """
     device   = x.device
     total    = x.shape[0]
     num_seqs, lens, starts, seq_ids, seq_off, max_len = _seq_meta(cu_seqlens, total, device, cu_list)
 
     n_heads = alpha.shape[0]
-    dh      = W_V.shape[0] // n_heads
+    dh      = head_dim if head_dim is not None else W_V.shape[0] // n_heads
 
     scores, z_x, z_v = _score_block(x, W_V, alpha, n_heads, dh)
 

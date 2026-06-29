@@ -31,9 +31,11 @@ def hybrid_scores_per_head(
 
     Args:
         x:       Hidden states ``[T, d]``.
-        W_V:     Value projection matrix ``[d, d]`` (``v_proj.weight``).
+        W_V:     Value projection matrix ``[n_kv_heads*dh, d]`` (``v_proj.weight``).
+                 Under full MHA this is ``[d, d]``; under grouped-query attention it
+                 has only ``n_kv_heads < n_heads`` head-rows.
         alpha:   Per-head balancing, ``[n_heads]``, in ``(0, 1)``.
-        n_heads: Number of heads.
+        n_heads: Number of (query) heads — the width of the returned score.
         dh:      Per-head dimension (``d // n_heads``).
 
     Returns:
@@ -45,16 +47,27 @@ def hybrid_scores_per_head(
     ``z_x`` and ``z_v`` are returned separately because the backward over ``alpha``
     (the landmark gate in the Triton kernel) needs them to reconstruct the
     differentiable score without recomputing the norms.
+
+    Grouped-query attention: ``W_V`` projects to only ``n_kv_heads`` value heads, so
+    the output-sensitivity ``‖x·W_V^(g)‖₂`` is computed for the ``n_kv_heads`` groups
+    and then repeated to the ``n_heads`` query heads (the query heads in one kv group
+    share K/V, hence share the same value-norm signal). ``alpha`` stays per query
+    head, so the final score is still ``[T, n_heads]`` and differentiable per head.
     """
     T = x.shape[0]
 
     x_norm = x.norm(dim=-1).float()
     z_x    = (x_norm - x_norm.mean()) / x_norm.std().clamp(min=1e-6)
 
-    xwv   = (x @ W_V.T).view(T, n_heads, dh).norm(dim=-1).float()
+    # Number of value head-rows actually in W_V (== n_heads for MHA, < for GQA).
+    n_kv = W_V.shape[0] // dh
+    xwv   = (x @ W_V.T).view(T, n_kv, dh).norm(dim=-1).float()                  # [T, n_kv]
     mu_v  = xwv.mean(0, keepdim=True)
     std_v = xwv.std(0, keepdim=True).clamp(min=1e-6)
-    z_v   = (xwv - mu_v) / std_v
+    z_v   = (xwv - mu_v) / std_v                                                # [T, n_kv]
+    if n_kv != n_heads:                                                         # GQA: share per kv group
+        n_rep = n_heads // n_kv
+        z_v   = z_v.repeat_interleave(n_rep, dim=1)                             # [T, n_heads]
 
     scores = alpha * z_v + (1.0 - alpha) * z_x.unsqueeze(1)
     return scores, z_x, z_v

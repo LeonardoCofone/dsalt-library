@@ -40,6 +40,19 @@ class DSALTConfig:
     dropout:            float      = 0.0
     yarn_scale:         float      = 1.0
     tie_weights:        bool       = True
+    # Grouped-Query Attention: number of key/value heads. ``None`` (default) means
+    # full multi-head attention (n_kv_heads == n_heads). When loading a GQA backbone
+    # (e.g. Qwen2.5, 16 query heads / 2 kv heads) set this to the backbone value;
+    # k_proj/v_proj are then sized to ``n_kv_heads * head_dim`` and the kv heads are
+    # repeated to ``n_heads`` at runtime before the dots (so the kernels see full MHA).
+    n_kv_heads:         int | None = None
+    # q/k/v projection bias. False for our from-scratch models; Qwen2.5 ships q/k/v
+    # WITH bias (and out_proj without), so set True to load that backbone faithfully.
+    qkv_bias:           bool       = False
+    # RoPE base frequency (``rope_theta``). 10000 for our models; Qwen2.5 uses 1e6.
+    # Wrong base => the pretrained positions are misread and the backbone outputs
+    # garbage, so this MUST match the checkpoint when fine-tuning from one.
+    rope_base:          float      = 10000.0
     padding_idx:        int | None = None
     lm_head_chunk_size: int        = 2048
     loss_fn:            str        = "chunked"
@@ -54,6 +67,12 @@ class DSALTConfig:
             raise ValueError(f"required 0 <= n_min <= n_max, got n_min={self.n_min} n_max={self.n_max}")
         if self.k_lmk < 0:
             raise ValueError(f"k_lmk must be >= 0, got {self.k_lmk}")
+        if self.n_kv_heads is not None:
+            if self.n_kv_heads <= 0 or self.n_heads % self.n_kv_heads != 0:
+                raise ValueError(
+                    f"n_heads ({self.n_heads}) must be a positive multiple of "
+                    f"n_kv_heads ({self.n_kv_heads}) for grouped-query attention"
+                )
         if self.loss_fn not in ("auto", "chunked", "liger"):
             raise ValueError(f"loss_fn must be 'auto', 'chunked' or 'liger', got {self.loss_fn!r}")
 

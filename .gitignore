@@ -13,6 +13,8 @@ profile_copies.py
 es_dsalt/
 es_dense/
 test/
+images/
+figures/
  
 # C extensions
 *.so
