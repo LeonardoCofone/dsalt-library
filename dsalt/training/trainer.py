@@ -164,7 +164,16 @@ def compute_metrics(
     noise_per_layer = []
     seq0_len = (cu_seqlens[1] - cu_seqlens[0]).item()
 
-    run_noise = heavy and seq0_len > 128 and math.isfinite(res_norm) and res_norm < 200.0
+    # The noise probe is gated to skip *degenerate* hidden states (NaN/inf or a residual
+    # that has blown up), where injecting a perturbation would measure garbage. The cap
+    # must scale with depth: ``res_norm`` is the depth-accumulated residual / input ratio,
+    # so a 36-layer multi-billion model legitimately reaches a few hundred (≈320 on
+    # Qwen2.5-3B) where a 14-18 layer prototype sat well below. A fixed 200 cap silently
+    # skipped the probe at 3B (=> noise=nan). Tie it to depth so the gate still catches a
+    # true blow-up but admits the large grafted models. GPU/scale-portable.
+    res_cap  = 60.0 * (len(m.layers) ** 0.5)        # ~360 at 36L (admits Qwen-3B's ~320),
+                                                     # ~255 at 18L, ~225 at 14L (still gates blow-ups)
+    run_noise = heavy and seq0_len > 128 and math.isfinite(res_norm) and res_norm < res_cap
 
     if run_noise:
         inject_pos = int(seq0_len // 4)
