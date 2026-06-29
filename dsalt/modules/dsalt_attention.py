@@ -258,6 +258,20 @@ class DSALTAttention(nn.Module):
     def _alpha(self) -> torch.Tensor:
         return torch.sigmoid(self.alpha_w)
 
+    def _apply_out_proj(self, out: torch.Tensor) -> torch.Tensor:
+        """Output projection, dtype-safe under and outside autocast.
+
+        Some attention paths (the dense ``_last_P`` reconstruction, the SDPA fallback,
+        fp32 RoPE promotion) leave ``out`` in fp32 while ``out_proj.weight`` is the
+        compute dtype (bf16 on Ampere). Inside the training autocast region addmm is
+        lenient, but the metrics probe runs the forward WITHOUT autocast, so the fp32
+        activation meets a bf16 weight and addmm raises "mat1 and mat2 must have the
+        same dtype". Cast ``out`` to the weight dtype here: a no-op when they already
+        match, GPU-portable (T4 fp16 / A100 bf16 / CPU fp32). Mirrors the embedding
+        cast in dsalt_lm._to_autocast_dtype.
+        """
+        return self.out_proj(out.to(self.out_proj.weight.dtype))
+
     def _repeat_kv(self, t: torch.Tensor) -> torch.Tensor:
         """Expand grouped key/value heads to the full ``n_heads`` (GQA → MHA view).
 
@@ -437,7 +451,7 @@ class DSALTAttention(nn.Module):
         aux = self._aux_zero(x.device, x.dtype)
         self._last_P = P.detach() if not self.training else None
 
-        return self.out_proj(out.transpose(1, 2).contiguous().view(B, T, self.d_model)), aux
+        return self._apply_out_proj(out.transpose(1, 2).contiguous().view(B, T, self.d_model)), aux
 
     def _diff_logbias(self, x: torch.Tensor, T: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Build the two differentiable log-biases (window, landmarks) for [T] tokens.
@@ -671,12 +685,12 @@ class DSALTAttention(nn.Module):
             # window edge) and alpha (soft landmark weight) directly in the kernel.
             if _TRITON_TRAIN_OK and device.type == "cuda":
                 out = self._packed_train_triton(q, k, v, x, cu_seqlens, total_len, device, cu_list)
-                return self.out_proj(out.view(total_len, self.d_model)), aux
+                return self._apply_out_proj(out.view(total_len, self.d_model)), aux
             # Fallback (CPU / no Triton): dense SDPA path, same math, gradcheck-tested.
             cu   = cu_list if cu_list is not None else cu_seqlens.detach().to("cpu").tolist()
             lens = [cu[b + 1] - cu[b] for b in range(len(cu) - 1)]
             out  = self._packed_train(q, k, v, x, cu, lens, total_len, device, cu_seqlens)
-            return self.out_proj(out.reshape(total_len, self.d_model)), aux
+            return self._apply_out_proj(out.reshape(total_len, self.d_model)), aux
 
         # ---- inference (selectors, no gradient) ----
         w_sizes = self._window_sizes(x, floor=True)
@@ -711,7 +725,7 @@ class DSALTAttention(nn.Module):
         # the context-scaling experiment) set ``_collect_last_P = False`` to skip it.
         if not getattr(self, "_collect_last_P", True):
             self._last_P = None
-            return self.out_proj(out.view(total_len, self.d_model)), aux
+            return self._apply_out_proj(out.view(total_len, self.d_model)), aux
 
         s0    = int(cu_seqlens[0])
         e0    = int(cu_seqlens[1])
@@ -777,4 +791,4 @@ class DSALTAttention(nn.Module):
         additive  = sc.new_full((self.n_heads, T0, T0), float("-inf")).masked_fill_(full_mask, 0.0)
         self._last_P = torch.softmax(sc + additive, dim=-1).detach()
 
-        return self.out_proj(out.view(total_len, self.d_model)), aux
+        return self._apply_out_proj(out.view(total_len, self.d_model)), aux
