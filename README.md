@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Downloads](https://static.pepy.tech/personalized-badge/dsalt?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/dsalt)
 [![Python](https://img.shields.io/pypi/pyversions/dsalt)](https://pypi.org/project/dsalt/)
-[![DOI](https://zenodo.org/badge/DOI/19312826.svg)](https://doi.org/19312826)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19312826.svg)](https://doi.org/10.5281/zenodo.19312826)
 
 **DSALT** is a PyTorch library implementing *Dynamic Sparse Attention with
 Landmark Tokens*, a memory-efficient attention mechanism for transformers. Each
