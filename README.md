@@ -18,7 +18,7 @@ CPU and Windows).
 > **Source**: <https://github.com/LeonardoCofone/dsalt-library>  
 > **Paper**: <https://zenodo.org/records/19312826>
 
-## ✨ Key Features
+## Key Features
 
 - **Sparse attention**, adaptive local causal window `∪` top-`k` landmark tokens per head (`A(i) = W(i) ∪ L(i)`).
 - **Fully differentiable selectors**, the *hard* window/landmark selection stays non-differentiable, but the gradient still reaches both predictors through soft weights: a **soft window edge** trains the per-token window size, and a **soft landmark re-weight** trains the per-head balance `α`.
@@ -30,29 +30,29 @@ CPU and Windows).
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 - [DSALT: Dynamic Sparse Attention with Landmark Tokens](#dsalt-dynamic-sparse-attention-with-landmark-tokens)
-  - [✨ Key Features](#-key-features)
-  - [📋 Table of Contents](#-table-of-contents)
-  - [🛠️ Installation](#️-installation)
+  - [Key Features](#key-features)
+  - [Table of Contents](#table-of-contents)
+  - [Installation](#installation)
     - [Requirements](#requirements)
     - [From PyPI](#from-pypi)
     - [From source](#from-source)
-  - [🚀 Quick Start](#-quick-start)
+  - [Quick Start](#quick-start)
     - [Inference](#inference)
     - [Computing the loss](#computing-the-loss)
     - [Building from a config](#building-from-a-config)
-  - [🏗️ Architecture Overview](#️-architecture-overview)
-  - [🎯 Training](#-training)
-  - [📚 API Reference](#-api-reference)
-  - [📖 Documentation](#-documentation)
-  - [📄 License](#-license)
-  - [🤝 Contributing](#-contributing)
-  - [📝 Citation](#-citation)
+  - [Architecture Overview](#architecture-overview)
+  - [Training](#training)
+  - [API Reference](#api-reference)
+  - [Documentation](#documentation)
+  - [License](#license)
+  - [Contributing](#contributing)
+  - [Citation](#citation)
 
 ---
 
-## 🛠️ Installation
+## Installation
 
 ### Requirements
 - Python **3.10+** (the codebase uses `X | None` / `tuple[...]` syntax)
@@ -77,7 +77,7 @@ pip install -e .
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Inference
 
@@ -130,7 +130,7 @@ cfg.save("config.json")               # reload with DSALTConfig.load("config.jso
 
 ---
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 Each query's attention set is the union of two sparse sets:
 
@@ -165,7 +165,7 @@ graph integrity, the key-parallel backward, and profiling evidence) see
 
 ---
 
-## 🎯 Training
+## Training
 
 `DSALTTrainer` drives single- and multi-GPU (DDP) training. It expects **packed**
 batches `(input_ids, labels, cu_seqlens, max_seqlen)`, where `cu_seqlens` is an
@@ -213,7 +213,7 @@ Every constructor argument, default, and the full metric list are documented in
 
 ---
 
-## 📚 API Reference
+## API Reference
 
 ```python
 # Top-level exports
@@ -239,7 +239,7 @@ signature and semantics of **every** component live in
 
 ---
 
-## 📖 Documentation
+## Documentation
 
 - [FEATURE.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/FEATURE.md), complete feature & hyperparameter reference (every public API, every option).
 - [DESIGN_NOTES.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/DESIGN_NOTES.md), engineering design rationale and profiling evidence.
@@ -248,14 +248,14 @@ signature and semantics of **every** component live in
 
 ---
 
-## 📄 License
+## License
 
 Apache 2.0, see
 [LICENSE](https://github.com/LeonardoCofone/dsalt-library/blob/main/LICENSE).
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome, see
 [CONTRIBUTING.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/CONTRIBUTING.md).
@@ -267,7 +267,7 @@ encoder-decoder), additional training strategies, documentation, and bug fixes.
 
 ---
 
-## 📝 Citation
+## Citation
 
 If you use DSALT in your research, please cite the paper:
 
