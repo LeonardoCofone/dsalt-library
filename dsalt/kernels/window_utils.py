@@ -6,12 +6,10 @@ def compute_window_sizes(
     n_min:  int,
     n_max:  int,
 ) -> torch.Tensor:
-    """Constant per-token window size at the characteristic value ``(n_min+n_max)//2``.
+    """Constant window size ``(n_min+n_max)//2`` for every token, aligned with ``x_prev``.
 
-    A simple, parameter-free utility that returns a constant window ``[T]`` aligned
-    with ``x_prev``. The model's *adaptive* window (§4.2) is computed elsewhere by
-    the learned ``win_gate`` predictor (see :class:`DSALTAttention`); this helper is
-    the non-adaptive baseline kept for convenience and external use.
+    The adaptive window of the model is predicted by ``win_gate`` in
+    :class:`DSALTAttention`; this helper is a non-adaptive utility.
     """
     T = x_prev.shape[0]
     w = (n_min + n_max) // 2
@@ -23,10 +21,10 @@ def build_local_window_mask(
     window_sizes: torch.Tensor,
     device:       torch.device,
 ) -> torch.Tensor:
-    """Boolean causal local-window mask ``[T, T]`` for a single sequence.
+    """Boolean causal local-window mask ``[T, T]`` for one sequence.
 
-    Row ``i`` attends to keys in ``[i - w(i) + 1, i]``. Built with a difference-array
-    + cumsum trick (no Python loop). ``True`` = attend.
+    Row ``i`` attends to keys in ``[i - w(i) + 1, i]``, built with a difference array
+    and a cumsum. ``True`` means attend.
     """
     rows = torch.arange(seq_len, device=device)
     w    = window_sizes.clamp(min=1, max=seq_len).long()
@@ -45,11 +43,8 @@ def build_local_window_mask_packed(
     total_len:    int,
     device:       torch.device,
 ) -> torch.Tensor:
-    """Boolean causal local-window mask ``[T, T]`` for packed sequences.
-
-    Like :func:`build_local_window_mask` but over the concatenated tokens defined
-    by ``cu_seqlens``: a key is attended only if it is inside the query's window
-    **and** belongs to the same sequence. Fully vectorized. ``True`` = attend.
+    """Boolean causal local-window mask ``[T, T]`` for packed sequences: a key is
+    attended only if it is inside the query's window and in the same sequence.
     """
     num_seqs = cu_seqlens.shape[0] - 1
     lens     = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)

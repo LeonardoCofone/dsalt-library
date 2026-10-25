@@ -1,9 +1,6 @@
-"""Pure-PyTorch selector helpers shared by the Triton kernels and the dense path.
-
-These functions contain NO Triton code (window sizing, landmark top-k, packed
-metadata, landmark KV gather). Keeping them in a triton-free module lets the CPU
-fallback / kernel-verification path import them without requiring a GPU+Triton
-install (the triton kernels re-export them for backward compatibility).
+"""PyTorch selector helpers shared by the Triton kernels and the dense path: window
+sizing, landmark top-k, packed metadata and landmark KV gather. No Triton code, so
+the CPU fallback can import them.
 """
 
 import torch
@@ -16,8 +13,7 @@ _SEQ_META_CACHE: dict = {}
 
 
 def _seq_meta(cu_seqlens: torch.Tensor, total: int, device: torch.device, cu_list: list | None = None):
-    # Build the cache key from the host-side cu_list when available (no D2H sync);
-    # fall back to a scalar read only when called standalone (tests).
+    # Cache key from the host-side cu_list when available (no device-to-host sync).
     if cu_list is not None:
         key = (int(cu_list[-1]), len(cu_list) - 1)
     else:
@@ -51,7 +47,7 @@ def _build_seq_block_map(
     kernels so they share the packed block layout.
     """
     num_seqs  = cu_seqlens.shape[0] - 1
-    # Key from host-side cu_list when available → no D2H sync on the hot path.
+    # Cache key from the host-side cu_list when available.
     total_len = int(cu_list[-1]) if cu_list is not None else int(cu_seqlens[-1])
     key = (total_len, num_seqs, block_m)
     if key in _SEQ_BLOCK_MAP_CACHE:
@@ -72,7 +68,7 @@ def _build_seq_block_map(
 
 
 def _score_block(x: torch.Tensor, W_V: torch.Tensor, alpha: torch.Tensor, n_heads: int, dh: int):
-    # Single source of the formula: see kernels.landmark_tokens_ker
+    # The score formula is defined once, in kernels.landmark_tokens_ker.
     return hybrid_scores_per_head(x, W_V, alpha, n_heads, dh)
 
 
@@ -90,13 +86,12 @@ def _compute_landmark_indices(
 ) -> torch.Tensor:
     """Hard top-k landmark indices per (head, sequence), excluding in-window tokens.
 
-    Scores tokens with the hybrid-energy formula (§4.3), masks out those already in
-    the local window, and returns the top-``k_lmk`` indices ``[H, num_seqs, k_lmk]``
-    (``-1`` padding where fewer than ``k_lmk`` candidates exist), plus the raw
-    ``z_x``/``z_v`` signals. Detached selection, addresses memory only.
+    Scores every token with the hybrid score, standardized over the whole sequence,
+    and returns the top-``k_lmk`` indices ``[H, num_seqs, k_lmk]`` (``-1`` where fewer
+    candidates exist) and the signals ``z_x`` / ``z_v``. The selection is detached.
 
-    ``head_dim`` must be given under grouped-query attention, where ``W_V`` has only
-    ``n_kv_heads < n_heads`` head-rows and ``W_V.shape[0] // n_heads`` would be wrong.
+    ``head_dim`` must be given under GQA, where ``W_V`` has only ``n_kv_heads`` head
+    rows.
     """
     device   = x.device
     total    = x.shape[0]
@@ -111,7 +106,7 @@ def _compute_landmark_indices(
     covered_h  = covered.unsqueeze(1).expand(-1, n_heads)
     scores_fil = scores.masked_fill(covered_h, float("-inf"))
 
-    # Uniform-length detection from host-side cu_list (no sync) when available.
+    # Uniform-length detection from the host-side cu_list when available.
     if cu_list is not None:
         seq_lens = [cu_list[b + 1] - cu_list[b] for b in range(len(cu_list) - 1)]
         uniform  = len(seq_lens) > 0 and all(s == seq_lens[0] for s in seq_lens)

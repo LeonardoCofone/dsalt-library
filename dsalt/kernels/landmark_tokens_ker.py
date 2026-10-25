@@ -1,19 +1,15 @@
-"""Hybrid Energy Landmark scoring, single source of the DSALT formula (§4.3).
+"""Hybrid-energy landmark score, the single implementation of the DSALT formula.
 
-This module defines *the only* implementation of the hybrid-energy score used for
-landmark selection. Both the attention path (``dsalt_attention``) and the Triton
-kernel (``dsalt_triton_attn``) call :func:`hybrid_scores_per_head`, so that the
-paper's formula lives in a single place and cannot diverge between execution
-paths.
+The attention module and the Triton kernels both call
+:func:`hybrid_scores_per_head`, so the formula cannot diverge between paths.
 
-Formula (for token ``j``, layer ``l``, head ``h``)::
+For token ``j``, layer ``l``, head ``h``::
 
     s = alpha * z(||x_j W_V||_2) + (1 - alpha) * z(||x_j||_2)
 
-where ``z(·)`` is standardisation (empirical mean/std over the candidate tokens),
-``alpha = sigmoid(alpha_raw)`` is the per-head/per-layer balancing parameter, and
-``||x_j W_V||_2`` is computed **per head** (output-sensitivity), while ``||x_j||_2``
-is the representational persistence (shared across heads).
+where ``z(·)`` standardizes over the candidate tokens, ``alpha = sigmoid(alpha_raw)``
+is learned per head and layer, ``||x_j W_V||_2`` is computed per head and
+``||x_j||_2`` is shared across heads.
 """
 
 import torch
@@ -27,39 +23,31 @@ def hybrid_scores_per_head(
     n_heads: int,
     dh:      int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute the per-head hybrid score and the raw normalised signals.
+    """Per-head hybrid score and the standardized signals.
 
     Args:
         x:       Hidden states ``[T, d]``.
-        W_V:     Value projection matrix ``[n_kv_heads*dh, d]`` (``v_proj.weight``).
-                 Under full MHA this is ``[d, d]``; under grouped-query attention it
-                 has only ``n_kv_heads < n_heads`` head-rows.
-        alpha:   Per-head balancing, ``[n_heads]``, in ``(0, 1)``.
-        n_heads: Number of (query) heads — the width of the returned score.
-        dh:      Per-head dimension (``d // n_heads``).
+        W_V:     Value projection ``[n_kv_heads*dh, d]`` (``v_proj.weight``); ``[d, d]``
+                 under MHA.
+        alpha:   Per-head balance ``[n_heads]`` in ``(0, 1)``.
+        n_heads: Number of query heads, the width of the returned score.
+        dh:      Per-head dimension.
 
     Returns:
-        Tuple ``(scores, z_x, z_v)`` where:
-          * ``scores`` ``[T, n_heads]`` is the hybrid score ``s``;
-          * ``z_x`` ``[T]`` is the standardised representational persistence;
-          * ``z_v`` ``[T, n_heads]`` is the per-head standardised output-sensitivity.
+        ``(scores, z_x, z_v)``: ``scores`` ``[T, n_heads]``, the standardized hidden-state
+        norm ``z_x`` ``[T]`` and the standardized per-head value norm ``z_v``
+        ``[T, n_heads]``, returned so the alpha gradient can be formed without
+        recomputing the norms.
 
-    ``z_x`` and ``z_v`` are returned separately because the backward over ``alpha``
-    (the landmark gate in the Triton kernel) needs them to reconstruct the
-    differentiable score without recomputing the norms.
-
-    Grouped-query attention: ``W_V`` projects to only ``n_kv_heads`` value heads, so
-    the output-sensitivity ``‖x·W_V^(g)‖₂`` is computed for the ``n_kv_heads`` groups
-    and then repeated to the ``n_heads`` query heads (the query heads in one kv group
-    share K/V, hence share the same value-norm signal). ``alpha`` stays per query
-    head, so the final score is still ``[T, n_heads]`` and differentiable per head.
+    Under GQA the value norm is computed for the ``n_kv_heads`` groups and repeated to
+    the query heads of each group; ``alpha`` stays per query head.
     """
     T = x.shape[0]
 
     x_norm = x.norm(dim=-1).float()
     z_x    = (x_norm - x_norm.mean()) / x_norm.std().clamp(min=1e-6)
 
-    # Number of value head-rows actually in W_V (== n_heads for MHA, < for GQA).
+    # value head rows in W_V (n_heads for MHA, fewer under GQA)
     n_kv = W_V.shape[0] // dh
     xwv   = (x @ W_V.T).view(T, n_kv, dh).norm(dim=-1).float()                  # [T, n_kv]
     mu_v  = xwv.mean(0, keepdim=True)
@@ -78,16 +66,11 @@ def compute_hybrid_scores(
     W_V:   torch.Tensor,
     alpha: torch.Tensor,
 ) -> torch.Tensor:
-    """Hybrid score, backward-compatible wrapper of the public API.
+    """Hybrid score with the historical signature ``(x, W_V, alpha)``.
 
-    Keeps the historical signature ``(x, W_V, alpha)``. ``alpha`` can be:
-
-    * **scalar** → legacy *query-agnostic* behaviour: the value norm is computed
-      over the whole vector (single head), returns ``[T]``;
-    * **vector** ``[n_heads]`` → delegates to :func:`hybrid_scores_per_head`,
-      returning the per-head scores ``[T, n_heads]``.
-
-    For the DSALT runtime path use :func:`hybrid_scores_per_head` directly.
+    A scalar ``alpha`` computes the value norm over the whole vector and returns
+    ``[T]``; a vector ``[n_heads]`` delegates to :func:`hybrid_scores_per_head` and
+    returns ``[T, n_heads]``.
     """
     if alpha.ndim == 0:
         x_norm      = x.norm(dim=-1)
@@ -127,7 +110,7 @@ def soft_landmark_weights(
     exclude_mask: torch.Tensor | None = None,
     temperature:  float = 1.0,
 ) -> torch.Tensor:
-    """Soft weights (temperature-scaled softmax) over candidates, auxiliary utility."""
+    """Temperature-scaled softmax weights over the candidates."""
     if exclude_mask is not None:
         scores = scores.masked_fill(exclude_mask, float("-inf"))
     weights = torch.softmax(scores / temperature, dim=-1)
@@ -135,11 +118,8 @@ def soft_landmark_weights(
 
 
 class HybridEnergyLandmarkSelector(nn.Module):
-    """Landmark selector with a learnable per-layer/per-head ``alpha``.
-
-    An ``nn.Module`` wrapper around the shared formula. Keeps
-    ``alpha`` ``[n_layers, n_heads]`` initialised to ``sigmoid^{-1}(0.6)``,
-    consistent with :class:`~dsalt.modules.dsalt_attention.DSALTAttention`.
+    """Landmark selector with a learnable ``alpha`` ``[n_layers, n_heads]``, initialized
+    at ``sigmoid^{-1}(0.6)`` as in :class:`~dsalt.modules.dsalt_attention.DSALTAttention`.
     """
 
     def __init__(self, n_layers: int, n_heads: int):

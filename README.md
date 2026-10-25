@@ -16,17 +16,18 @@ CPU and Windows).
 
 > **Install**: `pip install dsalt`  
 > **Source**: <https://github.com/LeonardoCofone/dsalt-library>  
-> **Paper**: <https://zenodo.org/records/19312826>
+> **Paper**: *DSALT: Sparse Attention with Adaptive Windows and Content-Selected Landmarks* (arXiv link added on release)  
+> **Paper code and results**: <https://github.com/LeonardoCofone/dsalt>
 
 ## Key Features
 
 - **Sparse attention**, adaptive local causal window `∪` top-`k` landmark tokens per head (`A(i) = W(i) ∪ L(i)`).
-- **Fully differentiable selectors**, the *hard* window/landmark selection stays non-differentiable, but the gradient still reaches both predictors through soft weights: a **soft window edge** trains the per-token window size, and a **soft landmark re-weight** trains the per-head balance `α`.
+- **Trainable selectors**, the window and landmark selection itself is hard, but the gradient reaches both predictors through soft weights: a **soft window edge** trains the per-token window size, and a **soft landmark re-weight** trains the per-head balance `α`.
 - **GPU-portable**, Triton kernels on CUDA, transparent SDPA fallback otherwise; AMP dtype is auto-selected from the GPU's compute capability (bf16 on `sm_80+`, fp16 on T4-class cards, none on CPU).
 - **One-shot autotune**, Triton block sizes are benchmarked once per `(head_dim, GPU)` at the first launch, then reused for the whole run; portable heuristics if benchmarking is impossible.
 - **Packed-sequence training**, concatenated sequences + `cu_seqlens`, fused FlashAttention-2-style forward/backward with online softmax and a key-parallel, atomic-free `dk/dv` backward.
 - **Flexible loss**, memory-frugal chunked cross-entropy (default), optional Liger fused linear cross-entropy, or `"auto"` to pick the fastest per GPU.
-- **DDP + torch.compile**, single- and multi-GPU via `DistributedDataParallel`, co-existing with `torch.compile`; gradient accumulation, cosine schedule with warm-up, checkpointing, and rich representation-health diagnostics.
+- **DDP + torch.compile**, single- and multi-GPU via `DistributedDataParallel`, co-existing with `torch.compile`; gradient accumulation, cosine schedule with warm-up, checkpointing, and per-layer diagnostics.
 
 ---
 
@@ -136,21 +137,27 @@ Each query's attention set is the union of two sparse sets:
 
 ```
 ┌─ Local window W(i) (adaptive) ─┬─ Global landmarks L(i) ─┐
-│  Recent causal tokens up to    │  Top-k informative      │
-│  a per-token learned size      │  tokens per head        │
+│  Recent causal tokens up to    │  Top-k tokens per head  │
+│  a per-token learned size      │  by hybrid score        │
 └────────────────────────────────┴─────────────────────────┘
                  ↓                            ↓
               Sparse attention output  over  A(i) = W(i) ∪ L(i)
 ```
 
-- **Adaptive window (§4.2).** A small learned projection `win_gate` predicts a
+- **Adaptive window.** A small learned projection `win_gate` predicts a
   per-token continuous window `w̃(i) = n_min + σ(f(x_i))·(n_max − n_min)` from the
   block input. The window core is a hard mask (so the cost stays sub-quadratic),
   but a thin differentiable band at the boundary lets gradients train `win_gate`.
-- **Landmark tokens (§4.3).** A per-head hybrid-energy score
+- **Landmark tokens.** A per-head hybrid-energy score
   `s = α·z(‖x·W_V‖₂) + (1−α)·z(‖x‖₂)` ranks tokens; the top-`k` are admitted as
   landmarks. The selection is hard (detached), while a soft re-weight on the
   admitted tokens' logits trains the per-head balance `α = σ(α̃)`.
+- **Causality.** Landmarks are selected once per sequence and head, with the
+  standardization and the top-k over the whole sequence. A query attends only to
+  landmarks before its window, but which earlier tokens become landmarks depends on
+  later tokens, so the selection is not causal in the strict sense. Autoregressive
+  generation needs a selection computed on the prefix; the paper repository evaluates
+  a block-causal variant.
 - **Blocks.** Pre-norm `DSALTTransformerBlock` = RMSNorm → `DSALTAttention`
   (with RoPE/YaRN positions) → residual, then RMSNorm → `SwiGLUFFN` → residual.
 - **Model.** `DSALTLMHeadModel` = token embeddings → block stack → RMSNorm →
@@ -222,7 +229,7 @@ from dsalt import (
     DSALTAttention, DSALTTransformerBlock, SwiGLUFFN,
     DSALTTrainer,
     dsalt_triton_attention,            # None when Triton is unavailable
-    hybrid_scores_per_head,            # single source of the landmark score (§4.3)
+    hybrid_scores_per_head,            # the landmark score
     compute_hybrid_scores, select_landmarks, soft_landmark_weights,
     HybridEnergyLandmarkSelector,
     sparse_attention_forward, sparse_attention_forward_packed,
@@ -233,17 +240,17 @@ from dsalt import (
 ```
 
 `q, k, v` for the low-level kernel are `[total_len, n_heads, head_dim]`;
-`cu_seqlens` is the `int32` sequence-offset tensor. The complete, source-verified
-signature and semantics of **every** component live in
+`cu_seqlens` is the `int32` sequence-offset tensor. Signatures and defaults of the
+public components are in
 [FEATURE.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/FEATURE.md).
 
 ---
 
 ## Documentation
 
-- [FEATURE.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/FEATURE.md), complete feature & hyperparameter reference (every public API, every option).
-- [DESIGN_NOTES.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/DESIGN_NOTES.md), engineering design rationale and profiling evidence.
-- [STRUCTURE.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/STRUCTURE.md), repository layout and intra-package usage map.
+- [FEATURE.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/FEATURE.md), feature and hyperparameter reference.
+- [DESIGN_NOTES.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/DESIGN_NOTES.md), implementation notes and profiling.
+- [STRUCTURE.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/STRUCTURE.md), repository layout and import map.
 - [CONTRIBUTING.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/CONTRIBUTING.md), how to contribute.
 
 ---
@@ -269,9 +276,16 @@ encoder-decoder), additional training strategies, documentation, and bug fixes.
 
 ## Citation
 
-If you use DSALT in your research, please cite the paper:
+If you use DSALT in your research, please cite the paper and the library:
 
 ```bibtex
+@misc{cofone2026dsalt,
+  author = {Cofone, Leonardo},
+  title  = {{DSALT}: Sparse Attention with Adaptive Windows and Content-Selected Landmarks},
+  year   = {2026},
+  note   = {arXiv preprint}
+}
+
 @software{dsalt,
   author  = {Cofone, Leonardo},
   title   = {DSALT: Dynamic Sparse Attention with Landmark Tokens},

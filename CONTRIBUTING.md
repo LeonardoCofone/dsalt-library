@@ -1,6 +1,6 @@
 # Contributing to DSALT
 
-Thank you for your interest in contributing to DSALT! We welcome contributions from the community.
+Contributions are welcome. This file describes the setup and the conventions.
 
 ## Development Setup
 

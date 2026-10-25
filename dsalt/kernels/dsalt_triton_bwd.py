@@ -1,8 +1,7 @@
-"""DSALT inference-kernel backward: gradients for the sparse attention forward.
+"""Backward of the DSALT inference kernel.
 
-The autograd backward for ``dsalt_triton_attn``'s forward. Uses ``atomic_add`` to
-accumulate the key/value gradients, which structurally caps the backward key tile
-(see ``_BWD_MAX_BLOCK_N``) below the forward's.
+Accumulates the key/value gradients with ``atomic_add``, which caps the backward key
+tile (``_BWD_MAX_BLOCK_N``) below the forward's.
 """
 
 import torch
@@ -10,8 +9,8 @@ import triton
 import triton.language as tl
 
 
-# Structural cap on BLOCK_N in the backward (see note at the launch): the bwd
-# kernel uses atomic_add and cannot handle N tiles as wide as the forward.
+# Cap on BLOCK_N in the backward, which accumulates with atomic_add and cannot use tiles
+# as wide as the forward.
 _BWD_MAX_BLOCK_N = 32
 
 
@@ -270,10 +269,9 @@ def dsalt_triton_backward(
         num_warps=4,
     )
 
-    # num_warps/num_stages: explicit values take priority (passed by the autotune
-    # benchmark to faithfully measure a candidate), then the config already tuned
-    # for this GPU, finally the per-head_dim heuristic. BLOCK_M/BLOCK_N come from
-    # the forward (they must match: seq_block_map is shared).
+    # num_warps/num_stages: explicit values first (autotune benchmark), then the config
+    # tuned for this GPU, then the per-head_dim heuristic. BLOCK_M/BLOCK_N must match
+    # the forward, since seq_block_map is shared.
     if num_warps is None or num_stages is None:
         from .autotune import get_tuned_config
         tuned = get_tuned_config(head_dim, device)
@@ -291,10 +289,8 @@ def dsalt_triton_backward(
     lmk_bias_f = lmk_bias.to(torch.float32).contiguous()
     w_int     = w_sizes.clamp(min=1).to(torch.int32).contiguous()
 
-    # The backward is heavier in registers/smem than the forward (accumulation
-    # via atomic_add): we cap BLOCK_N at _BWD_MAX_BLOCK_N regardless of what the
-    # forward/autotune chose. A structural kernel limit, not a tunable
-    # hyperparameter.
+    # The backward needs more registers and shared memory than the forward, so BLOCK_N
+    # is capped at _BWD_MAX_BLOCK_N.
     BLOCK_N = min(BLOCK_N, _BWD_MAX_BLOCK_N)
 
     _dsalt_bwd_kernel[(total_blk, n_heads)](

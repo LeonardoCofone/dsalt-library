@@ -7,8 +7,7 @@ from ..kernels.RMSENorm          import RMSENorm
 from ..modules.dsalt_transformer import DSALTTransformerBlock
 from .config                     import DSALTConfig
 
-# Liger (fused cross-entropy) requires Triton: optional, imported at runtime
-# only when loss_fn="liger" is actually requested.
+# Liger needs Triton; imported only when loss_fn="liger" is requested.
 try:
     from ..kernels.cross_entropy import LigerFusedLinearCrossEntropyFunction
     _LIGER_OK = True
@@ -30,11 +29,8 @@ def _chunked_cross_entropy(
     for start in range(0, total, chunk_size):
         end = min(start + chunk_size, total)
         y_c = labels[start:end]
-        # No explicit ``.float()``: F.cross_entropy already upcasts the logits to
-        # fp32 internally for the log_softmax, so a manual fp32 copy of the
-        # ``[chunk, vocab]`` logits was pure overhead (profiled at ~24.6ms / step on
-        # T4, the dominant aten::copy_). Passing the fp16 logits straight in keeps
-        # the same numerics (fp32 softmax) without materialising the fp32 tensor.
+        # F.cross_entropy computes the log_softmax in fp32 internally, so the logits are
+        # passed in their own dtype without an fp32 copy.
         logits = F.linear(x[start:end], weight)
         loss = F.cross_entropy(logits, y_c, ignore_index=-100, reduction="sum")
         loss_acc  += loss
@@ -56,8 +52,8 @@ def _liger_cross_entropy(
     return loss
 
 
-# Valid loss_fn values. "auto" is resolved per-(device, vocab) at first forward
-# via loss_autotune (chunked on T4, liger on A100+), then cached.
+# Valid loss_fn values. "auto" is resolved per (device, vocab) at the first forward by
+# loss_autotune and cached.
 _LOSS_FN = {
     "auto":    None,
     "liger":   _liger_cross_entropy,
@@ -66,44 +62,35 @@ _LOSS_FN = {
 
 
 class DSALTLMHeadModel(nn.Module):
-    """Causal Language Model based on DSALT (Dynamic Sparse Attention with Landmark Tokens).
+    """Causal language model based on DSALT.
 
-    A stack of :class:`~dsalt.modules.dsalt_transformer.DSALTTransformerBlock` with
-    token embeddings, a final RMSNorm, and an LM head (optionally tied to the embedding).
+    A stack of :class:`~dsalt.modules.dsalt_transformer.DSALTTransformerBlock` with token
+    embeddings, a final RMSNorm and an LM head (optionally tied to the embedding).
 
-    The input is expected in **packed** format (concatenated sequences + ``cu_seqlens``),
-    the path optimised for training; the forward also accepts ``[B, T]`` tensors for
-    inference.
-
-    Preferably instantiate via :meth:`from_config` with a
-    :class:`~dsalt.model.config.DSALTConfig`.
+    The input is in packed format (concatenated sequences and ``cu_seqlens``); the
+    forward also accepts ``[B, T]`` tensors for inference. Build it preferably with
+    :meth:`from_config` and a :class:`~dsalt.model.config.DSALTConfig`.
 
     Args:
         vocab_size:         Vocabulary size.
-        d_model:            Model dimension (must be divisible by ``n_heads``).
-        n_layers:           Number of Transformer blocks.
+        d_model:            Model dimension, divisible by ``n_heads``.
+        n_layers:           Number of blocks.
         n_heads:            Number of attention heads.
-        n_min, n_max:       Bounds of the adaptive local window (§4.2).
-        k_lmk:              Number of landmark tokens per query (§4.3).
-        max_seq_len:        Max length for the RoPE cache.
-        d_ff:               FFN dimension; if ``None`` uses ~8/3·d_model rounded.
+        n_min, n_max:       Bounds of the adaptive local window.
+        k_lmk:              Number of landmark tokens.
+        max_seq_len:        Length of the RoPE cache.
+        d_ff:               FFN dimension; ``None`` gives about 8/3·d_model, rounded.
         dropout:            Dropout probability.
         yarn_scale:         RoPE/YaRN positional scaling factor.
-        tie_weights:        Tie the LM head weights to the embedding.
-        padding_idx:        Padding index for the embedding.
-        lm_head_chunk_size: Chunk for the "chunked" cross-entropy (memory).
-        loss_fn:            ``"chunked"`` (default, memory-frugal), ``"liger"``
-                            (fused Triton, wins on A100+), or ``"auto"`` (measure
-                            per-GPU). NOTE: ``"chunked"`` with a large chunk is
-                            fastest on T4 but materialises ``[chunk, vocab]`` fp32
-                            logits, a big memory peak. ``"auto"`` picks by speed
-                            only; prefer it on big-VRAM GPUs where ``liger`` (no
-                            logits materialisation) wins, not on T4.
-        aux_loss_weight:    Weight of the auxiliary term. Inert by design: the
-                            window/landmark predictors are trained directly in the
-                            main forward (soft window edge / soft landmark weight),
-                            so no extra loss is needed. Kept for signature
-                            compatibility; leave at 0.0.
+        tie_weights:        Tie the LM head to the embedding.
+        padding_idx:        Padding index of the embedding.
+        lm_head_chunk_size: Chunk size of the "chunked" cross-entropy.
+        loss_fn:            ``"chunked"`` (default), ``"liger"`` (fused Triton kernel)
+                            or ``"auto"`` (measured per GPU, by speed only; a large
+                            chunk materializes ``[chunk, vocab]`` fp32 logits).
+        aux_loss_weight:    Unused, kept for signature compatibility: the window and
+                            landmark predictors are trained in the main forward.
+                            Leave at 0.0.
     """
 
     def __init__(
@@ -185,12 +172,8 @@ class DSALTLMHeadModel(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def _resolve_loss_fn(self, flat_x: torch.Tensor, flat_labels: torch.Tensor) -> tuple[str, int]:
-        """Resolve ``loss_fn="auto"`` to a concrete (loss_fn, chunk_size) per GPU.
-
-        Measured once per ``(device, vocab)`` then cached, same one-shot pattern
-        as the kernel block-size autotune. For explicit ``"chunked"``/``"liger"``
-        this is a no-op passthrough. Never hard-codes a device: ``"auto"`` picks
-        whatever wins on the card actually running (chunked on T4, liger on A100+).
+        """Resolve ``loss_fn="auto"`` to a concrete (loss_fn, chunk_size), measured once per
+        ``(device, vocab)`` and cached. Explicit ``"chunked"`` and ``"liger"`` pass through.
         """
         if self.loss_fn != "auto":
             return self.loss_fn, self.lm_head_chunk_size
@@ -207,10 +190,7 @@ class DSALTLMHeadModel(nn.Module):
 
     def _compute_loss(self, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         flat_x      = x.view(-1, self.d_model)
-        # F.cross_entropy targets must be int64: its internal ``torch.gather`` rejects
-        # int32 indices ("Expected dtype int64 for index, but got torch.int32"). Eager
-        # was lenient on some paths; under torch.compile Inductor traces the gather and
-        # enforces it. Cast here so both the chunked and liger paths get int64 targets.
+        # F.cross_entropy needs int64 targets, which torch.compile enforces.
         flat_labels = labels.view(-1).long()
         loss_fn, chunk = self._resolve_loss_fn(flat_x, flat_labels)
         if loss_fn == "liger":
@@ -220,24 +200,17 @@ class DSALTLMHeadModel(nn.Module):
     @staticmethod
     @torch._dynamo.disable
     def _to_autocast_dtype(x: torch.Tensor) -> torch.Tensor:
-        """Cast ``x`` to the active autocast compute dtype (no-op if not autocasting).
+        """Cast ``x`` to the active autocast compute dtype (no-op without autocast).
 
-        Marked ``@torch._dynamo.disable``: the autocast state is queried via
-        ``torch.is_autocast_enabled``, which Dynamo evaluates at *trace* time, not
-        at runtime — under ``torch.compile`` the traced state can differ from the
-        real one, so Inductor freezes the embedding to fp32 and an fp32 activation
-        then hits a bf16 weight in the first fused residual ``addmm`` ("self and
-        mat2 must have the same dtype"). Keeping this opaque forces the cast to be
-        decided eagerly, per call, from the live autocast state.
-
-        Handles both the ``device_type`` API (PyTorch ≥ 2.4) and the older no-arg
-        form (PyTorch 2.0–2.3) so the package stays importable on torch>=2.0.
+        Opaque to torch.compile: ``torch.is_autocast_enabled`` would be evaluated at trace
+        time, and the traced state can differ from the runtime one. Supports the
+        ``device_type`` API (PyTorch ≥ 2.4) and the older no-argument form.
         """
         dev = x.device.type
         try:
             enabled = torch.is_autocast_enabled(dev)
             dtype   = torch.get_autocast_dtype(dev)
-        except TypeError:  # PyTorch < 2.4: CUDA-only no-arg API
+        except TypeError:  # PyTorch < 2.4: CUDA-only no-argument API
             enabled = dev == "cuda" and torch.is_autocast_enabled()
             dtype   = torch.get_autocast_gpu_dtype() if enabled else x.dtype
         return x.to(dtype) if enabled and x.dtype != dtype else x
@@ -245,16 +218,11 @@ class DSALTLMHeadModel(nn.Module):
     @staticmethod
     @torch._dynamo.disable
     def _packed_rope_meta(cu_seqlens: torch.Tensor, total_len: int, attn0):
-        """Per-step packed metadata: RoPE cos/sin gather + host copy of cu_seqlens.
+        """Per-step packed metadata: RoPE cos/sin gather and a host copy of cu_seqlens.
 
-        Marked ``@torch._dynamo.disable``: this builds tensors from data-dependent
-        positions (``pos_ids`` from per-sequence ``cu_seqlens``) and does the one
-        D2H ``.tolist()`` for ``cu_list``. Under torch.compile the ``.tolist()`` is
-        a graph break AND yields a python list of per-step-varying ints; tracing it
-        would re-specialize the graph every step (varlen packing). Running it eager
-        keeps the compiled forward shape-stable. The single D2H sync is intentional
-        and happens once per step here (not once per layer), while the GPU queue is
-        still shallow. ``rope_cs`` carries no grad (RoPE tables are buffers).
+        Opaque to torch.compile: the positions depend on the data and the ``.tolist()`` for
+        ``cu_list`` yields ints that change every step, which would force a re-trace. The
+        one device-to-host sync happens once per step here, not once per layer.
         """
         device   = cu_seqlens.device
         num_seqs = cu_seqlens.shape[0] - 1
@@ -279,12 +247,8 @@ class DSALTLMHeadModel(nn.Module):
             max_seqlen = input_ids.shape[-1]
 
         x = self.embed_dropout(self.embed_tokens(input_ids))
-        # Embedding lookups are not autocast-cast, so ``x`` stays fp32 even under a
-        # bf16/fp16 autocast region. Bring it to the autocast compute dtype so the
-        # whole residual stream is homogeneous: otherwise an fp32 activation meets a
-        # bf16 weight in the first projection / FFN and, under torch.compile (which
-        # emits dtype-strict ``addmm``), raises "self and mat2 must have the same
-        # dtype". GPU-portable: a no-op when no autocast is active (stays fp32).
+        # Embedding outputs are not cast by autocast; cast x to the compute dtype so the
+        # residual stream has one dtype.
         x = self._to_autocast_dtype(x)
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
 

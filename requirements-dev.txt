@@ -1,4 +1,4 @@
-# Development dependencies.
+# Development dependencies for DSALT.
 #
 # Single source of truth = pyproject.toml [project.optional-dependencies].
 # This file just installs the package in editable mode with every dev-relevant

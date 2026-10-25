@@ -1,27 +1,20 @@
-"""DSALT *training* Triton kernel: sparse attention with DIFFERENTIABLE selectors.
+"""DSALT training Triton kernel: sparse attention with differentiable selectors.
 
-The inference kernel (``dsalt_triton_attn``) computes the pure ``A(i)=W(i)∪L(i)``
-with hard selectors. For training we additionally need the gradient to reach the
-two predictors of §4.2/§4.3 (``win_gate`` and ``alpha``) WITHOUT materialising the
-dense ``[N,H,L,L]`` attention that the SDPA path needs (the real bottleneck: ~6×
-wasted work, since each query only attends to ``w(i)+k ≪ L`` tokens).
+The inference kernel (``dsalt_triton_attn``) computes ``A(i) = W(i) ∪ L(i)`` with
+hard selectors. Training also needs gradients for the two predictors (``win_gate``
+and ``alpha``) without materializing the dense ``[N,H,L,L]`` attention.
 
-Two differentiable hooks, both kept inside the sparse kernel:
+Two differentiable terms inside the sparse kernel:
 
-* **soft window edge (trains win_gate).** Inside the band the logit gets an extra
-  ``log σ((w̃(i) − d)/τ_win)`` with ``d = i − j``; in the hard core
-  (``d ≤ w̃ − B``) the bias is exactly 0. The continuous ``w̃`` thus modulates the
-  softmax on the boundary, and the kernel returns ``d_w̃`` (gradient w.r.t. the
-  per-query continuous window). ``∂ logσ(z)/∂w̃ = (1−σ(z))·(1/τ)``.
+* soft window edge (trains win_gate): inside the band the logit gets
+  ``log σ((w̃(i) − d)/τ_win)`` with ``d = i − j``, exactly 0 in the core
+  (``d ≤ w̃ − B``). The kernel returns ``d_w̃``, using
+  ``∂ logσ(z)/∂w̃ = (1−σ(z))·(1/τ)``.
+* soft landmark weight (trains alpha): each landmark logit gets
+  ``log σ(s_j(α)/τ_lmk)``, passed in as ``Lmk_logw`` and computed in PyTorch. The
+  kernel returns ``d_logw``, which autograd carries back to α.
 
-* **soft landmark weight (trains alpha).** Each landmark logit gets
-  ``+ log σ(s_j(α)/τ_lmk)`` passed in as ``Lmk_logw`` (computed in PyTorch, so
-  differentiable in α). The kernel returns ``d_logw`` (= the classic ``d_bias``);
-  PyTorch autograd then carries it back to α through ``log σ(s/τ)``.
-
-So the kernel emits ``dq, dk, dv, d_w̃, d_logw``; α and win_gate gradients are
-obtained by attaching ``d_w̃``/``d_logw`` to the (differentiable) python tensors
-that produced ``w̃`` and ``Lmk_logw``.
+The kernel returns ``dq, dk, dv, d_w̃, d_logw``.
 """
 
 import math
@@ -37,29 +30,22 @@ from .dsalt_triton_attn import (
 from .landmark_tokens_ker import hybrid_scores_per_head
 from .autotune import get_tuned_config, _heuristic_config
 
-# FALLBACK backward key tile, used only when the resolved config has no tuned
-# ``BLOCK_N_BWD`` (e.g. an inference-tuned config reused as fallback). The real
-# value is chosen PER DEVICE by the autotune (`_candidate_configs(with_bwd_tile=True)`
-# sweeps 32/64/128, smem-filtered). Why a conservative fallback: MEASURED on T4,
-# bumping the dk/dv kernel from 32 to 64 DOUBLED its time (68→146ms), at HEAD_DIM=16
-# the larger key tile blows shared memory and kills occupancy. On A100/H100 the
-# autotune is free to pick 64/128; nothing here is hard-coded to one GPU.
+# Fallback backward key tile, used only when the resolved config has no tuned
+# ``BLOCK_N_BWD``. The autotune picks it per device (32/64/128, filtered by shared
+# memory); 32 is the safe value at small head_dim.
 _BWD_MAX_BLOCK_N = 32
 
-# Triton's MMA on sm_75 (T4) requires every tl.dot dimension ≥ 16 (M,N,K).
-# The landmark tile contracts/produces along the K_LMK axis, so when the model
-# uses k_lmk < 16 the two landmark dots (q·lk_k → N=K_LMK, p_lmk·lk_v → K=K_LMK)
-# violate the constraint. We pad the landmark axis up to this minimum with
-# invalid landmarks (pos=-1, logw=0) that the kernel masks out (valid_lmk=False),
-# so the math is unchanged and only the tile shape grows.
+# On sm_75 every tl.dot dimension must be at least 16. With k_lmk < 16 the two landmark
+# dots violate this, so the landmark axis is padded with invalid landmarks (pos=-1,
+# logw=0) that the kernel masks out.
 _MIN_DOT = 16
 
 
 def _pad_landmarks(lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk):
-    """Pad the landmark axis to ≥ _MIN_DOT so tl.dot is legal on T4.
+    """Pad the landmark axis to at least _MIN_DOT so tl.dot is legal on sm_75.
 
-    Returns the padded (lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk_pad). Padded
-    slots get pos=-1 (→ masked out) and logw=0 / kv=0 (never contribute).
+    Returns (lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk_pad). Padded slots get pos=-1
+    (masked out) and logw=0, kv=0.
     """
     if k_lmk >= _MIN_DOT:
         return lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk
@@ -171,9 +157,8 @@ def _train_fwd_kernel(
 
         m_new  = tl.maximum(m_i, tl.max(qk, axis=1))
         p      = tl.where(final, tl.exp(qk - m_new[:, None]), 0.0)
-        # Guard the running-max rescale: when m_i is still -inf (nothing accumulated
-        # yet for this row), m_i - m_new is -inf-(-inf)=nan. Force l_corr=0 there
-        # (l_i/acc are 0 anyway), which is the correct online-softmax behaviour.
+        # When m_i is still -inf (nothing accumulated yet for this row), m_i - m_new is
+        # nan; l_corr = 0 is the correct online-softmax value there.
         l_corr = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i - m_new))
         l_i    = l_i * l_corr + tl.sum(p, axis=1)
         acc    = acc * l_corr[:, None] + tl.dot(p.to(k_blk.dtype), tl.trans(v_blk))
@@ -386,9 +371,8 @@ def _train_bwd_kernel(
         dbias_dw = tl.where(in_core, 0.0, (1.0 - sig) / tau_win)
         dw_contrib = tl.where(final, ds_raw * dbias_dw, 0.0)
         dw_i += tl.sum(dw_contrib, axis=1)
-        # dk/dv of the band are NOT written here, they are computed key-parallel in
-        # _train_bwd_dkdv_kernel (no atomics). This kernel only does dq, dw, and the
-        # landmark dk/dv (rare atomics, outside the loop).
+        # The band dk/dv are computed key-parallel in _train_bwd_dkdv_kernel without
+        # atomics; this kernel computes dq, dw and the landmark dk/dv.
         n_start += BLOCK_N
 
     tl.store(DQ + (seq_start + m_start + offs_m[:, None]) * stride_dqt
@@ -419,16 +403,14 @@ def _train_bwd_dkdv_kernel(
     BLOCK_N:  tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """Key-parallel dk/dv for the WINDOW band, no atomics.
+    """Key-parallel dk/dv for the window band, without atomics.
 
-    Each program owns one key block ``[kn, kn+BLOCK_N)`` of one head and loops over
-    the query blocks that can attend to it (a query i attends key j iff
-    ``j ≤ i ≤ j + w̃(i)``, so i ≤ j + N_MAX). dk/dv are accumulated in registers and
-    stored ONCE, no atomic_add (the previous query-parallel scheme wrote the same
-    key from many query blocks → ~5 atomics per block, the backward bottleneck).
+    Each program owns one key block ``[kn, kn+BLOCK_N)`` of one head and loops over the
+    query blocks that can attend to it (query i attends key j iff ``j ≤ i ≤ j + w̃(i)``,
+    so i ≤ j + N_MAX). dk/dv are accumulated in registers and stored once.
 
-    Must run BEFORE the landmark dk/dv atomics in _train_bwd_kernel: this kernel
-    `store`s the band contribution, then the landmark pass `atomic_add`s on top.
+    Must run before the landmark dk/dv atomics in _train_bwd_kernel, which add on top
+    of the band contribution stored here.
     """
     pid_kn = tl.program_id(0)
     pid_h  = tl.program_id(1)
@@ -454,9 +436,8 @@ def _train_bwd_dkdv_kernel(
     dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
-    # Queries i that can see this key block: i ≥ j (causal) and i ≤ j + w̃(i) ≤
-    # j + N_MAX. So scan only [n_start, n_start + BLOCK_N + N_MAX) in BLOCK_M steps
-    # (the band is short → few iterations, no O(L²) scan).
+    # Queries that can see this key block satisfy j ≤ i ≤ j + w̃(i) ≤ j + N_MAX, so only
+    # [n_start, n_start + BLOCK_N + N_MAX) is scanned.
     m_lo  = n_start
     m_hi  = tl.minimum(n_start + BLOCK_N + N_MAX, seq_len)
     m_start = m_lo - (m_lo % BLOCK_M)
@@ -503,9 +484,9 @@ def _train_bwd_dkdv_kernel(
 # --------------------------------------------------------------------------- #
 #  python wrappers
 # --------------------------------------------------------------------------- #
-# Training-kernel tuned configs, keyed by (head_dim, sm_major, sm_minor). Kept
-# separate from the inference autotune: the training fwd+bwd has a different
-# register/smem profile (extra d_w accumulation), so its optimum can differ.
+# Tuned training-kernel configs, keyed by (head_dim, sm_major, sm_minor), separate from
+# the inference autotune because the training fwd+bwd has a different register and
+# shared-memory profile.
 _TRAIN_TUNED: dict = {}
 
 
@@ -520,13 +501,9 @@ def _resolve_cfg(head_dim: int, device: torch.device) -> dict:
 
 
 def _train_candidates(head_dim: int, device: torch.device) -> list[dict]:
-    """Candidate configs for the training kernel.
-
-    Same base sweep as the inference autotune (`_candidate_configs`: BLOCK_M
-    ½/1/2/4×, warps 2/4/8, smem-filtered) but with ``with_bwd_tile=True`` so the
-    backward key tile ``BLOCK_N_BWD`` is ALSO tuned per device (32/64/128, filtered
-    by the heavier backward smem budget). T4 will keep 32; A100/H100 can pick a
-    larger tile, measured, never hard-coded.
+    """Candidate configs for the training kernel: the inference sweep
+    (`_candidate_configs`) with ``with_bwd_tile=True``, so the backward key tile
+    ``BLOCK_N_BWD`` is also tuned per device (32/64/128, filtered by shared memory).
     """
     from .autotune import _candidate_configs
     return _candidate_configs(head_dim, device, with_bwd_tile=True)
@@ -551,9 +528,8 @@ def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
     lp  = lmk_pos.detach()
     lw  = lmk_logw.detach()
 
-    # Fresh leaves each call so .backward() has something to flow into and never
-    # accumulates a stale graph. q/k/v also need grad or the output graph is empty
-    # → "element 0 does not require grad".
+    # Fresh leaves on each call, with requires_grad on q/k/v, so .backward() has a graph
+    # to run.
     def run():
         with torch.enable_grad():
             qg = q_c.clone().requires_grad_(True)
@@ -572,8 +548,7 @@ def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
             ms = _bench_step(run)
             results.append((cfg, ms, None))
         except Exception as e:
-            # keep a short slice of the real message, class name alone hides
-            # whether it is smem-overflow, an illegal dot, or a launch error.
+            # keep a short slice of the error message
             msg = f"{type(e).__name__}: {str(e).strip().splitlines()[-1][:40]}" if str(e).strip() else type(e).__name__
             results.append((cfg, None, msg))
         finally:
@@ -583,12 +558,8 @@ def _maybe_autotune_train(head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont,
     best_cfg = min(valid, key=lambda x: x[1])[0] if valid else _heuristic_config(head_dim, device)
     best_ms  = min((t for _, t, _ in results if t is not None), default=None)
 
-    # PHASE 2: with the forward axes fixed, search the backward key tile
-    # (BLOCK_N_BWD) per device. Cheap (≤3 benches) and only meaningful when the
-    # winning config actually has the field (training path). On T4 only 32 fits;
-    # bigger GPUs may pick 64/128. This is what keeps the bwd tile DYNAMIC instead
-    # of a hard-coded cap. We re-measure 32 here too so the comparison is apples-to-
-    # apples (same machine state) and never regresses below the phase-1 result.
+    # Phase 2: with the forward axes fixed, search the backward key tile BLOCK_N_BWD per
+    # device; 32 is measured again in the same state for a fair comparison.
     if valid and "BLOCK_N_BWD" in best_cfg:
         from .autotune import _bwd_tile_candidates
         for cand in _bwd_tile_candidates(best_cfg, head_dim, device):
@@ -621,9 +592,7 @@ class DSALTTrainFunction(torch.autograd.Function):
         HEAD_DIM_C = triton.next_power_of_2(head_dim)
         k_lmk      = lmk_pos.shape[-1]
 
-        # Autotune the TRAINING kernel once per (head_dim, GPU) on the first batch,
-        # so training uses a config measured on its own fwd+bwd (not the inference
-        # kernel's). Runs at step 0, before the steady state.
+        # Autotune the training kernel once per (head_dim, GPU) on the first batch.
         _maybe_autotune_train(
             head_dim, device, q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
             float(tau_win), float(win_edge), int(n_max), cu_list,
@@ -637,9 +606,7 @@ class DSALTTrainFunction(torch.autograd.Function):
         cfg     = _resolve_cfg(head_dim, device)
         BLOCK_M = cfg["BLOCK_M"]
         BLOCK_N = cfg["BLOCK_N"]
-        # Backward key tile: tuned per device (autotune sweeps BLOCK_N_BWD over
-        # 32/64/128, smem-filtered). Falls back to the legacy cap for configs that
-        # predate the field (e.g. an inference-tuned config reused as fallback).
+        # Backward key tile from the autotune, or the fallback for configs without it.
         BLOCK_N_BWD = cfg.get("BLOCK_N_BWD", min(BLOCK_N, _BWD_MAX_BLOCK_N))
 
         out = torch.zeros_like(q_c)
@@ -654,7 +621,7 @@ class DSALTTrainFunction(torch.autograd.Function):
         lmk_pos_i = lmk_pos.to(torch.int32).contiguous()
         lmk_logw_c = lmk_logw.detach().to(torch.float32).contiguous()
 
-        # Pad the landmark axis to ≥16 so the landmark tl.dot is legal on T4.
+        # Pad the landmark axis to at least 16 (see _MIN_DOT).
         lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk_pad = _pad_landmarks(
             lmk_K, lmk_V, lmk_pos_i, lmk_logw_c, k_lmk
         )
@@ -714,7 +681,7 @@ class DSALTTrainFunction(torch.autograd.Function):
         delta = torch.empty(total_len, n_heads, device=device, dtype=torch.float32)
 
         BLOCK_M = ctx.BLOCK_M
-        # Backward key tile chosen by the autotune (per device), not a fixed cap.
+        # Backward key tile chosen by the autotune.
         BLOCK_N = ctx.BLOCK_N_BWD
         cu_int  = ctx.cu_seqlens.to(torch.int32).contiguous()
 
@@ -732,10 +699,9 @@ class DSALTTrainFunction(torch.autograd.Function):
             total_len=total_len, HEAD_DIM=ctx.HEAD_DIM_C, BLOCK_M=BLOCK_M, num_warps=4,
         )
 
-        # dk/dv of the band: key-parallel, NO atomics. Must run BEFORE the main
-        # kernel (which atomic_adds the landmark dk/dv on top of this band store).
-        # BLOCK_N here is the autotuned backward key tile (BLOCK_N_BWD): 32 on T4,
-        # potentially 64/128 on bigger GPUs. The block_map must match this BLOCK_N.
+        # Band dk/dv, key-parallel and without atomics. Must run before the main
+        # backward kernel, which atomic_adds the landmark dk/dv on top. The block_map
+        # must match BLOCK_N_BWD.
         kn_block_map, total_kn = _build_seq_block_map(ctx.cu_seqlens, BLOCK_N, device, ctx.cu_list)
         _train_bwd_dkdv_kernel[(total_kn, n_heads)](
             q_c, k_c, v_c, do_f, dk, dv,
@@ -778,30 +744,24 @@ class DSALTTrainFunction(torch.autograd.Function):
             num_warps=num_warps, num_stages=num_stages,
         )
 
-        # d_w is summed over heads inside the kernel → per-token gradient of w̃.
+        # d_w is summed over heads inside the kernel: one gradient per token.
         d_w_tok = d_w.sum(dim=1)                                              # [total_len]
-        # Trim the padded landmark slots back to the real k_lmk for autograd.
+        # Trim the padded landmark slots back to k_lmk.
         d_logw = d_logw[:, :, :ctx.k_lmk]
         od = ctx.out_dtype
         return (
             dq.to(od), dk.to(od), dv.to(od),
             None,                 # lmk_pos (no grad)
-            d_logw.to(od),        # → α via autograd on log σ(s/τ)
-            d_w_tok.to(od),       # → win_gate via autograd on w̃
+            d_logw.to(od),        # to alpha via log σ(s/τ)
+            d_w_tok.to(od),       # to win_gate via w̃
             None, None, None,     # cu_seqlens, tau_win, win_edge
             None,                 # n_max (constexpr, no grad)
             None,                 # cu_list (host helper, no grad)
         )
 
 
-# torch.compile / Dynamo must treat the hand-written Triton autograd Function as
-# an OPAQUE op: it cannot trace through `DSALTTrainFunction.apply` (custom backward
-# + raw Triton launches) and would otherwise graph-break or fail. Wrapping the
-# entry point with `torch._dynamo.disable` forces a clean graph-break exactly here,
-# so the compiler still fuses everything AROUND it (RoPE, selectors, norm, residual,
-# FFN, loss), which is where the eager overhead lives, while the kernel runs
-# unchanged. Guarded getattr so the lib still imports on torch builds without
-# `_dynamo` (the decorator then degrades to identity).
+# The custom autograd Function and its Triton launches are opaque to torch.compile,
+# which fuses the code around them. Identity on torch builds without `_dynamo`.
 def _dynamo_opaque(fn):
     disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
     return disable(fn) if disable is not None else fn
@@ -812,14 +772,10 @@ def dsalt_triton_train_attention(q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens,
                                  tau_win=1.0, win_edge=4.0, n_max=256, cu_list=None):
     """Differentiable sparse DSALT attention for training.
 
-    ``lmk_logw`` (the per-landmark log σ(s/τ) weight, differentiable in α) and
-    ``w_cont`` (the continuous per-token window, differentiable in win_gate) carry
-    the gradients of §4.3 / §4.2; the function returns the attention output and
-    routes ``d_logw``/``d_w̃`` back to them through autograd. ``n_max`` bounds the
-    key-parallel dk/dv scan in the backward.
-
-    Marked ``torch._dynamo.disable`` (opaque to torch.compile): the compiler fuses
-    the eager code around it but never traces the custom Function / Triton launches.
+    ``lmk_logw`` (per-landmark log σ(s/τ), differentiable in α) and ``w_cont``
+    (continuous window, differentiable in win_gate) receive ``d_logw`` and ``d_w̃``
+    through autograd. ``n_max`` bounds the key-parallel dk/dv scan in the backward.
+    Opaque to torch.compile.
     """
     return DSALTTrainFunction.apply(
         q, k, v, lmk_pos, lmk_logw, w_cont, cu_seqlens, tau_win, win_edge, n_max, cu_list,

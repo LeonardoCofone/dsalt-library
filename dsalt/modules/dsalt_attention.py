@@ -1,9 +1,9 @@
-"""DSALT sparse attention module: adaptive local window ∪ global landmarks (§4).
+"""DSALT sparse attention: adaptive local window plus landmarks chosen by content.
 
-Wires together the differentiable selectors (soft window edge trains ``win_gate``,
-soft landmark re-weight trains per-head ``alpha``) and dispatches to the Triton
-training/inference kernels on CUDA or a masked-SDPA fallback elsewhere. The selector
-math lives once in ``selectors`` / ``landmark_tokens_ker`` and is shared by every path.
+Builds the differentiable selectors (a soft window edge trains ``win_gate``, a soft
+landmark weight trains the per-head ``alpha``) and dispatches to the Triton training
+and inference kernels on CUDA, or to a masked-SDPA fallback elsewhere. The selector
+math is defined once in ``selectors`` and ``landmark_tokens_ker``.
 """
 
 import math
@@ -22,7 +22,7 @@ from ..kernels.sparse_attn import (
     sparse_attention_forward_packed,
 )
 from ..kernels.landmark_tokens_ker import hybrid_scores_per_head
-# Selectors are triton-free → always importable (CPU fallback / verification).
+# The selectors do not depend on Triton, so they import on CPU too.
 from ..kernels.selectors import _compute_landmark_indices
 
 try:
@@ -39,11 +39,10 @@ except Exception:
 
 
 def _dynamo_opaque(fn):
-    """Make ``fn`` opaque to torch.compile/Dynamo (graph-break, run eager).
+    """Make ``fn`` opaque to torch.compile (graph break, eager execution).
 
-    Same helper as in ``dsalt_triton_train``. Autograd is unaffected (gradients
-    flow normally), only the *tracing* is skipped. Degrades to identity on torch
-    builds without ``_dynamo``.
+    Autograd is unaffected; only tracing is skipped. Identity on torch builds without
+    ``_dynamo``.
     """
     disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
     return disable(fn) if disable is not None else fn
@@ -56,7 +55,7 @@ def _hybrid_scores(
     alpha: torch.Tensor,
     dh:    int,
 ) -> torch.Tensor:
-    # Single source of the formula: see kernels.landmark_tokens_ker
+    # The score formula is defined once, in kernels.landmark_tokens_ker.
     n_heads      = alpha.shape[0]
     scores, _, _ = hybrid_scores_per_head(x, W_V, alpha, n_heads, dh)
     return scores
@@ -73,8 +72,8 @@ def _build_mask_batched(
     dh:       int | None = None,
 ) -> torch.Tensor:
     n_heads = alpha.shape[0]
-    # Pass the true per-head dim explicitly under GQA (where v_weight has only
-    # n_kv_heads head-rows, so v_weight.shape[0] // n_heads would be wrong).
+    # Under GQA v_weight has only n_kv_heads head rows, so the per-head dim is passed
+    # explicitly.
     if dh is None:
         dh = v_weight.shape[0] // n_heads
 
@@ -146,34 +145,31 @@ def _build_mask_packed(
 
 
 class DSALTAttention(nn.Module):
-    """DSALT sparse attention: adaptive local window + global landmark tokens (§4).
+    """DSALT sparse attention: adaptive local window plus landmark tokens.
 
-    Each query's attention set is ``A(i) = W(i) ∪ L(i)``: a causal local window of
-    per-token size ``w(i) = n_min + σ(f(x_i))·(n_max-n_min)`` (§4.2), predicted by
-    ``win_gate`` ``f`` from the previous-layer hidden state, joined with a small set
-    of landmarks selected by the hybrid-energy score (per-head ``alpha_w``, §4.3).
+    Query i attends to ``A(i) = W(i) ∪ L(i)``: a causal local window of
+    ``w(i) = n_min + σ(f(x_i))·(n_max-n_min)`` tokens, predicted by ``win_gate`` from
+    the block input, and the landmarks that precede the window, selected by the hybrid
+    score with per-head balance ``alpha_w``.
 
-    ``win_gate`` (§4.2) and ``alpha_w`` (§4.3) are **trained**. The selection itself
-    (which keys are local / which tokens are landmarks) stays hard and
-    non-differentiable, but the gradient reaches the two predictors through soft,
-    differentiable *weights*:
-      * a **soft window edge**: the window core is hard, but the last ``win_edge``
-        boundary keys get weight ``σ((w̃(i)-d)/τ)`` (continuous in ``w̃`` → trains
-        ``win_gate``);
-      * a **soft landmark weight**: the hard top-k picks the landmarks, but each
-        selected landmark's logit is biased by ``log σ(s_j(α)/τ)`` (continuous in
-        ``α`` → trains ``alpha_w``).
-    The union ``A(i)=W(i)∪L(i)`` (eq. 32) is the elementwise max of the two
-    log-biases. ``q·k`` itself is never biased by the score.
+    Landmarks are selected once per sequence and head: the score is standardized over
+    the whole sequence and the top-k is taken over all positions. A query never attends
+    to a later token, but which earlier tokens are landmarks depends on later tokens, so
+    the selection is not causal in the strict sense.
 
-    Two regimes:
-      * **training** → a differentiable dense path (per sequence) carrying the soft
-        edges, both for batched and packed inputs;
-      * **inference** → the fast Triton kernel ``dsalt_triton_attention`` (packed)
-        or a dense hard mask (batched), using the discretised selectors.
+    ``win_gate`` and ``alpha_w`` are trained. The selection itself is hard; the gradient
+    reaches the two predictors through soft weights:
+      * soft window edge: the last ``win_edge`` keys at the window border get weight
+        ``σ((w̃(i)-d)/τ)``, continuous in ``w̃`` (trains ``win_gate``);
+      * soft landmark weight: each selected landmark's logit gets ``log σ(s_j(α)/τ)``,
+        continuous in ``α`` (trains ``alpha_w``).
+    The union is the elementwise max of the two log-biases; ``q·k`` is never biased by
+    the score.
 
-    In ``eval`` it stores in ``_last_P`` the dense attention matrix of the first
-    sequence, used by the trainer's rank/entropy/attention-sink metrics.
+    Training uses a differentiable path (Triton kernel on CUDA, dense SDPA otherwise);
+    inference uses ``dsalt_triton_attention`` (packed) or a dense hard mask (batched).
+    In eval mode ``_last_P`` stores the dense attention matrix of the first sequence,
+    used by the trainer's metrics.
     """
 
     def __init__(
@@ -197,13 +193,11 @@ class DSALTAttention(nn.Module):
         self.d_model     = d_model
         self.n_heads     = n_heads
         self.head_dim    = d_model // n_heads
-        # Grouped-Query Attention: ``n_kv_heads`` key/value heads shared across the
-        # ``n_heads`` query heads (each kv head serves ``n_rep`` query heads). None
-        # => full MHA. The kv heads are expanded to ``n_heads`` at runtime (repeat_kv)
-        # right after the projections, so every downstream consumer — the Triton
-        # kernels, the selectors, the SDPA fallback — still sees a uniform ``n_heads``
-        # layout and needs no GQA awareness. We carry the unexpanded kv-head count
-        # only to size k_proj/v_proj and to load a GQA backbone (e.g. Qwen2.5) 1:1.
+        # Grouped-query attention: n_kv_heads key/value heads shared by the n_heads
+        # query heads (None: full MHA). The kv heads are repeated to n_heads right after
+        # the projections, so the kernels, the selectors and the SDPA fallback all see
+        # an n_heads layout; the unexpanded count only sizes k_proj / v_proj, so that a
+        # GQA backbone such as Qwen2.5 loads unchanged.
         self.n_kv_heads  = n_kv_heads if n_kv_heads is not None else n_heads
         assert n_heads % self.n_kv_heads == 0, "n_heads must be a multiple of n_kv_heads"
         self.n_rep       = n_heads // self.n_kv_heads
@@ -217,34 +211,25 @@ class DSALTAttention(nn.Module):
         self.rope_base   = rope_base
         self.layer_idx   = layer_idx
 
-        # q is full-width; k/v are kv_dim-wide (== d_model only when MHA). out_proj
-        # consumes the full n_heads*head_dim. Qwen2.5 ships q/k/v WITH bias.
+        # q is full width; k and v are kv_dim wide. Qwen2.5 has q/k/v biases.
         self.q_proj   = nn.Linear(d_model, d_model,      bias=qkv_bias)
         self.k_proj   = nn.Linear(d_model, self.kv_dim,  bias=qkv_bias)
         self.v_proj   = nn.Linear(d_model, self.kv_dim,  bias=qkv_bias)
         self.out_proj = nn.Linear(d_model, d_model,      bias=False)
 
-        # §4.2 adaptive local window: learned linear projection f: R^d -> R that
-        # predicts, per token, w(i) = n_min + σ(f(x_i))·(n_max-n_min) from the
-        # previous-layer hidden state (the block input → no circular dependency).
-        # f IS trained: the gradient reaches it through the *soft window edge* (see
-        # _soft_window_mask), which makes the boundary of the mask differentiable
-        # in the continuous w̃(i) while the core stays hard. nn.Linear default init.
+        # Adaptive window predictor f: R^d -> R, w(i) = n_min + σ(f(x_i))·(n_max-n_min),
+        # computed from the block input. Trained through the soft window edge (see
+        # _soft_window_logbias).
         self.win_gate = nn.Linear(d_model, 1, bias=True)
 
-        # §4.3 per-head balance α^(l,h) = σ(alpha_w), init σ⁻¹(0.6). It IS trained:
-        # the top-k selection stays hard (non-diff), but each selected landmark's
-        # contribution is re-weighted by σ(s_j(α)/τ) inside the softmax, so the
-        # gradient flows to α through the *weights*, not through which tokens are
-        # picked (see _soft_landmark_logbias).
+        # Per-head balance α = σ(alpha_w), initialized at 0.6. The top-k selection is
+        # hard; α is trained through the σ(s_j(α)/τ) weight of the selected landmarks
+        # (see _soft_landmark_logbias).
         self.alpha_w = nn.Parameter(torch.full((n_heads,), math.log(0.6 / 0.4)))
 
-        # Soft-edge temperatures. tau_win: sharpness of the differentiable window
-        # border (σ transition width); tau_lmk: sharpness of the α-dependent
-        # landmark reweight. win_edge: width (in tokens) of the boundary band that
-        # carries a soft, differentiable weight; deeper inside the window the bias
-        # is forced to exactly 0 (hard core), so the forward ≈ the hard A(i)=W∪L and
-        # the w̃ gradient is concentrated on the boundary.
+        # tau_win and tau_lmk set the sharpness of the soft window edge and of the
+        # landmark weight. win_edge is the width, in tokens, of the soft band at the
+        # window border; inside it the bias is exactly 0.
         self.tau_win  = 1.0
         self.tau_lmk  = 2.0 
         self.win_edge = 4
@@ -259,33 +244,19 @@ class DSALTAttention(nn.Module):
         return torch.sigmoid(self.alpha_w)
 
     def _apply_out_proj(self, out: torch.Tensor) -> torch.Tensor:
-        """Output projection, dtype-safe under and outside autocast.
+        """Output projection, with ``out`` cast to the weight dtype.
 
-        Some attention paths (the dense ``_last_P`` reconstruction, the SDPA fallback,
-        fp32 RoPE promotion) leave ``out`` in fp32 while ``out_proj.weight`` is the
-        compute dtype (bf16 on Ampere). Inside the training autocast region addmm is
-        lenient, but the metrics probe runs the forward WITHOUT autocast, so the fp32
-        activation meets a bf16 weight and addmm raises "mat1 and mat2 must have the
-        same dtype". Cast ``out`` to the weight dtype here: a no-op when they already
-        match, GPU-portable (T4 fp16 / A100 bf16 / CPU fp32). Mirrors the embedding
-        cast in dsalt_lm._to_autocast_dtype.
+        Some paths leave ``out`` in fp32 while the weight is bf16, and the metrics probe
+        runs without autocast, where addmm requires matching dtypes.
         """
         return self.out_proj(out.to(self.out_proj.weight.dtype))
 
     def _repeat_kv(self, t: torch.Tensor) -> torch.Tensor:
-        """Expand grouped key/value heads to the full ``n_heads`` (GQA → MHA view).
+        """Repeat grouped key/value heads to ``n_heads`` (no-op without GQA).
 
-        ``t`` is a key or value tensor laid out with ``n_kv_heads`` in its
-        second-to-last axis: either ``[..., n_kv_heads, head_dim]`` (the
-        ``[T, H, D]`` packed layout) or ``[B, n_kv_heads, T, head_dim]`` (the
-        batched layout). Each kv head is repeated ``n_rep`` times so the result has
-        ``n_heads`` heads, matching ``q``. No-op when MHA (``n_rep == 1``).
-
-        We materialise the expansion (``repeat_interleave``) rather than broadcast so
-        that every downstream consumer — the Triton kernels, the dense selectors, the
-        SDPA fallback — keeps seeing a plain ``n_heads`` layout with no GQA awareness.
-        The extra memory is the deliberate cost of leaving the kernels untouched; on
-        the large-VRAM GPU we fine-tune on it is comfortably affordable.
+        ``t`` is ``[..., n_kv_heads, head_dim]`` (packed) or ``[B, n_kv_heads, T, head_dim]``
+        (batched). The expansion is materialized so the kernels and the SDPA fallback see a
+        plain ``n_heads`` layout.
         """
         if self.n_rep == 1:
             return t
@@ -297,58 +268,45 @@ class DSALTAttention(nn.Module):
         return t.unsqueeze(2).expand(B, self.n_kv_heads, self.n_rep, T, D).reshape(B, self.n_heads, T, D)
 
     def _window_continuous(self, x: torch.Tensor) -> torch.Tensor:
-        """Continuous window size w̃(i) (§4.2), differentiable in ``win_gate``.
-
-        ``w̃(i) = n_min + σ(f(x_i))·(n_max - n_min)`` from the block input (layer
-        ``l-1`` hidden state → no circular dependency). No floor/round here: this
-        is the real-valued window used by the *soft edge* so gradients flow to
-        ``f``. Returns ``[T]`` float in ``[n_min, n_max]``.
+        """Continuous window size w̃(i) = n_min + σ(f(x_i))·(n_max - n_min), differentiable in
+        ``win_gate``. Returns ``[T]`` floats in ``[n_min, n_max]``.
         """
         win_logits = self.win_gate(x).squeeze(-1)                                  # [T]
         return self.n_min + torch.sigmoid(win_logits) * (self.n_max - self.n_min)
 
     @torch.no_grad()
     def _window_sizes(self, x: torch.Tensor, floor: bool) -> torch.Tensor:
-        """Discrete window size w(i) for hard masks (inference / Triton path).
-
-        Same predictor as :meth:`_window_continuous` but discretised: floor at
-        inference (paper eq. 29), round otherwise. ``no_grad`` because the integer
-        window feeds a hard mask. Returns an int-valued float tensor ``[T]`` (≥1).
+        """Discrete window size w(i) for hard masks: floor at inference, round otherwise.
+        Returns an integer-valued float tensor ``[T]``, at least 1.
         """
         w_cont = self._window_continuous(x)
         w_disc = w_cont.floor() if floor else w_cont.round()
         return w_disc.clamp(min=1)
 
     def _soft_window_logbias(self, w_cont: torch.Tensor, T: int, device: torch.device) -> torch.Tensor:
-        """Differentiable log-bias for the local window, hard core + soft edge.
+        """Differentiable log-bias of the local window: hard core plus soft edge.
 
-        For a causal pair (query ``i``, key ``j``) let ``d = i - j ≥ 0``. With the
-        continuous window ``w̃ = w_cont[i]`` and edge width ``B = win_edge``:
+        For query i and key j let ``d = i - j``. With ``w̃ = w_cont[i]`` and ``B = win_edge``:
 
-          * ``d < w̃ - B``           → inside core: bias 0  (g ≈ 1, hard)
-          * ``w̃ - B ≤ d ≤ w̃ + ...`` → soft edge:  bias log σ((w̃ - d)/τ)
-          * far outside              → bias → -inf via the σ tail
+          * ``d < w̃ - B``: inside the core, bias 0;
+          * near ``w̃``:    soft edge, bias log σ((w̃ - d)/τ);
+          * far outside:   bias tends to -inf through the σ tail;
+          * ``d < 0``:     -inf.
 
-        The bias is added to the attention logits; ``∂/∂w̃`` is non-zero only on the
-        boundary tokens, so ``win_gate`` is trained through the edge while the bulk
-        of the window stays a hard mask (forward ≈ the paper's A(i)=W∪L). Non-causal
-        pairs (``d < 0``) get ``-inf``.
-
-        Returns ``[T, T]`` additive log-bias (float32 for numerical headroom).
+        Returns a ``[T, T]`` additive log-bias in float32.
         """
         idx  = torch.arange(T, device=device)
         d    = (idx.unsqueeze(1) - idx.unsqueeze(0)).float()      # [T,T] = i - j
-        w_i  = w_cont.unsqueeze(1)                                # [T,1] broadcast over j
-        # σ((w̃ - d)/τ): →1 well inside, →0 well outside, smooth on the border.
+        w_i  = w_cont.unsqueeze(1)                                # [T,1], broadcast over j
+        # σ((w̃ - d)/τ): close to 1 inside the window, to 0 outside, smooth at the
+        # border.
         g    = torch.sigmoid((w_i - d) / self.tau_win)           # [T,T] in (0,1)
         logb = torch.log(g.clamp(min=1e-20))
-        # Hard core: well inside the window (d ≤ w̃ - win_edge) force bias exactly 0,
-        # so the gradient on w̃ is concentrated on the boundary band and the forward
-        # there is identical to the hard mask. ``+ 0·logb`` keeps autograd connected
-        # outside the core without touching the core values.
+        # Inside the core (d ≤ w̃ - win_edge) the bias is exactly 0, so the gradient on
+        # w̃ comes from the border band only. ``+ 0·logb`` keeps autograd connected.
         core = d <= (w_i - self.win_edge)
         logb = torch.where(core, torch.zeros_like(logb), logb)
-        # Causal hard cut: j > i (d < 0) is never attended.
+        # Keys after the query (d < 0) are never attended.
         logb = logb.masked_fill(d < 0, float("-inf"))
         return logb
 
@@ -358,20 +316,13 @@ class DSALTAttention(nn.Module):
         lmk_mask:  torch.Tensor,
         T:         int,
     ) -> torch.Tensor:
-        """Differentiable log-bias for landmarks, hard selection + soft α-weight.
+        """Differentiable log-bias of the landmarks: hard selection plus soft α-weight.
 
-        ``scores`` ``[T, H]`` is the hybrid score s_j(α) (§4.3, eq. 30), continuous
-        in ``α``. ``lmk_mask`` ``[H, T, T]`` is the *hard* boolean top-k selection
-        (detached, which tokens are landmarks does not depend on the gradient).
-        For every selected landmark key ``j`` of head ``h`` we add to the logits
-        ``log σ(s_j / τ)``, so the landmark's weight inside the softmax depends on
-        ``α`` and the gradient reaches ``alpha_w`` through the weight (not through
-        the selection). At non-selected entries returns ``-inf`` (no landmark there;
-        the caller combines this with the window branch via elementwise max).
-
-        Returns ``[H, T, T]`` additive log-bias.
+        ``scores`` ``[T, H]`` is the hybrid score s_j(α), continuous in ``α``; ``lmk_mask``
+        ``[H, T, T]`` is the hard, detached top-k selection. Selected entries get
+        ``log σ(s_j / τ)``, the others ``-inf``. Returns ``[H, T, T]``.
         """
-        # s_j broadcast over the query dimension: weight depends only on the key j.
+        # The weight depends only on the key j.
         w_lmk = torch.log(torch.sigmoid(scores / self.tau_lmk).clamp(min=1e-20))  # [T,H]
         w_lmk = w_lmk.transpose(0, 1).unsqueeze(1).expand(self.n_heads, T, T)     # [H,T,T] over key j
         neg_inf = torch.full_like(w_lmk, float("-inf"))
@@ -385,9 +336,9 @@ class DSALTAttention(nn.Module):
         return self.rope_cos.to(device), self.rope_sin.to(device)
 
     def _aux_zero(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        # No explicit auxiliary loss: win_gate and alpha_w are trained directly
-        # through the soft window edge / soft landmark weight in the main forward.
-        # We keep the (out, aux) signature by returning an inert zero.
+        # There is no auxiliary loss: win_gate and alpha_w are trained through the soft
+        # window edge and the soft landmark weight. The (out, aux) signature is kept
+        # with a zero.
         return torch.zeros((), device=device, dtype=dtype)
 
     @torch.no_grad()
@@ -423,8 +374,7 @@ class DSALTAttention(nn.Module):
         v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = self._rope(T, device)
-        # RoPE acts on the native (unexpanded) kv heads, then we replicate kv → full
-        # n_heads so the dots below see a uniform MHA layout (no-op when not GQA).
+        # RoPE on the kv heads, then repeat them to n_heads (no-op without GQA).
         q, k     = apply_rotary_emb(q, k, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0))
         k        = self._repeat_kv(k)
         v        = self._repeat_kv(v)
@@ -432,12 +382,9 @@ class DSALTAttention(nn.Module):
         x_1b = x[0] if B > 1 else x.squeeze(0)
         scale = 1.0 / math.sqrt(self.head_dim)
 
-        # §4.2/§4.3 differentiable sparse mask: hard core + soft, learnable edges.
-        # win_logbias [T,T] trains win_gate via the soft window border; lmk_logbias
-        # [H,T,T] trains alpha via the σ(s/τ) re-weight of the (hard-selected)
-        # landmarks. The union A(i)=W∪L is the elementwise max of the two log-biases
-        # (a key is attended if it is in the window OR a landmark, taking whichever
-        # gives the larger, i.e. less negative, bias).
+        # Differentiable sparse mask. win_logbias [T,T] trains win_gate through the soft
+        # window border; lmk_logbias [H,T,T] trains alpha through the weight of the
+        # selected landmarks. The union is the elementwise max of the two biases.
         win_logbias, lmk_logbias = self._diff_logbias(x_1b, T, device)             # [T,T],[H,T,T]
         logbias = torch.maximum(win_logbias.unsqueeze(0), lmk_logbias)            # [H,T,T]
 
@@ -454,55 +401,51 @@ class DSALTAttention(nn.Module):
         return self._apply_out_proj(out.transpose(1, 2).contiguous().view(B, T, self.d_model)), aux
 
     def _diff_logbias(self, x: torch.Tensor, T: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build the two differentiable log-biases (window, landmarks) for [T] tokens.
+        """The two differentiable log-biases for [T] tokens.
 
-        Returns ``(win_logbias [T,T], lmk_logbias [H,T,T])``. The window bias trains
-        ``win_gate``; the landmark bias trains ``alpha_w``. The landmark *selection*
-        (top-k, excluding the local window) is computed under ``no_grad`` and
-        detached, only the per-landmark weight σ(s/τ) carries the α gradient.
+        Returns ``(win_logbias [T,T], lmk_logbias [H,T,T])``. The landmark selection is
+        computed under ``no_grad``; only the weight σ(s/τ) carries the α gradient.
         """
-        w_cont = self._window_continuous(x)                                       # [T] differentiable
-        alpha  = self._alpha()                                                     # [H] differentiable
-        scores, _, _ = hybrid_scores_per_head(                                     # [T,H] diff. in α
+        w_cont = self._window_continuous(x)                                       # [T]
+        alpha  = self._alpha()                                                     # [H]
+        scores, _, _ = hybrid_scores_per_head(                                     # [T,H]
             x, self.v_proj.weight, alpha, self.n_heads, self.head_dim,
         )
 
         win_logbias = self._soft_window_logbias(w_cont, T, device)               # [T,T]
 
-        # Hard landmark selection (which tokens), detached. The exclusion j∉W(i) is
-        # PER-QUERY, not global (a key local to a near query can still be a landmark
-        # for a far query), so we select the global top-k by score and apply the
-        # window exclusion per (i,j) when building the mask, exactly like the Triton
-        # kernel's `causal_lmk = lmk_pos < win_lo`.
+        # Hard landmark selection, detached. The window exclusion is per query (a key
+        # inside the window of one query can be a landmark for a farther one), so the
+        # top-k is taken over the whole sequence and the exclusion is applied per (i,
+        # j), as in the Triton kernel (`lmk_pos < win_lo`).
         with torch.no_grad():
             w_disc = w_cont.floor().clamp(min=1)                                  # [T]
             idx    = torch.arange(T, device=device)
             d      = idx.unsqueeze(1) - idx.unsqueeze(0)                          # [T,T] = i - j
             k_act  = min(self.k_lmk, T)
-            # is-landmark-key per head [H,T], fully vectorised (no python head loop)
+            # landmark keys per head [H,T]
             sel_hk = torch.zeros(self.n_heads, T, dtype=torch.bool, device=device)
             if k_act > 0:
                 _, top = torch.topk(scores.detach(), k_act, dim=0, sorted=False)  # [k,H] key indices
                 sel_hk.scatter_(1, top.transpose(0, 1), True)                     # [H,T]
-            # per-query validity (causal + outside the window) is head-independent
+            # validity per query (causal and outside the window), the same for every
+            # head
             valid_ij = (d >= 0) & (d >= w_disc.unsqueeze(1))                      # [T,T]
             lmk_mask = sel_hk.unsqueeze(1) & valid_ij.unsqueeze(0)               # [H,T,T]
 
-        # -inf where there is no landmark, σ(s/τ) weight where selected (diff. in α).
+        # -inf where there is no landmark, log σ(s/τ) where there is one
         lmk_logbias = self._soft_landmark_logbias(scores, lmk_mask, T)           # [H,T,T]
         return win_logbias, lmk_logbias
 
     def _packed_train_triton(self, q, k, v, x, cu_seqlens, total_len, device, cu_list=None):
-        """Differentiable sparse training via the Triton kernel (GPU only).
+        """Differentiable sparse training with the Triton kernel (GPU only).
 
-        Prepares the three tensors the kernel needs and lets autograd route their
-        gradients to the predictors:
-          * ``w_cont`` ``[total_len]`` continuous window (diff in ``win_gate``);
-          * ``lmk_pos`` ``[H,num_seqs,k]`` hard landmark indices (selection only,
-            detached, computed exactly like the inference kernel);
-          * ``lmk_logw`` ``[H,num_seqs,k]`` = log σ(s_j(α)/τ_lmk) at the selected
-            landmarks (diff in ``alpha`` via the hybrid score).
-        ``cu_list`` (host copy of cu_seqlens) is threaded through to avoid D2H syncs.
+        Inputs to the kernel:
+          * ``w_cont`` ``[total_len]``: continuous window (differentiable in ``win_gate``);
+          * ``lmk_pos`` ``[H,num_seqs,k]``: hard landmark indices, as in the inference kernel;
+          * ``lmk_logw`` ``[H,num_seqs,k]``: log σ(s_j(α)/τ_lmk) at the selected landmarks
+            (differentiable in ``alpha``).
+        ``cu_list`` is a host copy of cu_seqlens, to avoid device-to-host syncs.
         """
         w_cont, lmk_pos, lmk_logw = self._train_selectors(x, cu_seqlens, total_len, device, cu_list)
         return dsalt_triton_train_attention(
@@ -513,32 +456,17 @@ class DSALTAttention(nn.Module):
 
     @_dynamo_opaque
     def _train_selectors(self, x, cu_seqlens, total_len, device, cu_list=None):
-        """Shared selector prelude for BOTH the Triton kernel and the dense fallback.
+        """Selectors shared by the Triton kernel and the dense fallback.
 
-        Marked ``@_dynamo_opaque``: this prelude branches on data-dependent PYTHON
-        values derived from ``cu_list`` (per-step ``total_len`` / ``num_seqs`` /
-        ``max_len`` via ``int()``/``max()``/``range()`` in ``selectors``). Under
-        torch.compile those become guards on concrete python ints that change every
-        step (varlen packing), forcing a full re-trace per step — which dominated
-        wall-clock (~82s/step) while the in-step timer still read ~17s of compute.
-        Running it eager (it is pure-torch, ~5ms/call) keeps the graph stable; the
-        ``w_cont`` / ``lmk_logw`` gradients to ``win_gate`` / ``alpha`` are
-        unaffected (Dynamo opacity skips tracing, not autograd), exactly like the
-        already-opaque ``dsalt_triton_train_attention`` it feeds.
+        Opaque to torch.compile: it branches on Python ints derived from ``cu_list`` that
+        change every step with variable-length packing, which would force a re-trace per
+        step. Gradients to ``win_gate`` and ``alpha`` are unaffected.
 
-        Returns ``(w_cont [total_len], lmk_pos [H,S,k], lmk_logw [H,S,k])``, the
-        SAME tensors both paths must consume, so the dense verification reference
-        and the kernel select identical landmarks (the previous mismatch came from
-        the fallback using its own top-k instead of these).
-
-        Note: ``hybrid_scores_per_head`` (the ``x @ W_V`` GEMM over all tokens) runs
-        twice here, once detached for the hard indices, once differentiable for the
-        landmark logits. Profiled at ~5 ms/call eager (~32 ms/step over 6 layers),
-        but torch.compile fuses it into the surrounding graph, so a manual fusion has
-        low ROI in the real (compiled) training path. Left as-is by design.
+        Returns ``(w_cont [total_len], lmk_pos [H,S,k], lmk_logw [H,S,k])``, consumed by
+        both paths so that they select the same landmarks.
         """
-        w_cont = self._window_continuous(x)                                       # [total_len] diff
-        alpha  = self._alpha()                                                     # [H] diff
+        w_cont = self._window_continuous(x)                                       # [total_len]
+        alpha  = self._alpha()                                                     # [H]
         with torch.no_grad():
             w_disc = w_cont.floor().clamp(min=1)
             lmk_pos, _, _ = _compute_landmark_indices(
@@ -546,26 +474,24 @@ class DSALTAttention(nn.Module):
                 w_disc, cu_seqlens, self.k_lmk, self.n_min, total_len, cu_list,
                 head_dim=self.head_dim,
             )                                                                     # [H,num_seqs,k]
-        scores, _, _ = hybrid_scores_per_head(                                     # [total_len,H] diff in α
+        scores, _, _ = hybrid_scores_per_head(                                     # [total_len,H]
             x, self.v_proj.weight, alpha, self.n_heads, self.head_dim,
         )
         starts   = cu_seqlens[:-1].to(device)
         safe_pos = lmk_pos.clamp(min=0)                                            # [H,S,k]
         abs_pos  = starts[None, :, None] + safe_pos                               # [H,S,k]
         head_ix  = torch.arange(self.n_heads, device=device)[:, None, None]
-        s_sel    = scores[abs_pos, head_ix]                                        # [H,S,k] diff in α
+        s_sel    = scores[abs_pos, head_ix]                                        # [H,S,k]
         lmk_logw = torch.log(torch.sigmoid(s_sel / self.tau_lmk).clamp(min=1e-20))
         lmk_logw = torch.where(lmk_pos >= 0, lmk_logw, torch.full_like(lmk_logw, float("-inf")))
         return w_cont, lmk_pos, lmk_logw
 
     def _packed_train(self, q, k, v, x, cu, lens, total_len, device, cu_seqlens=None):
-        """Dense differentiable training attention, reference for the Triton kernel.
+        """Dense differentiable training attention, the reference for the Triton kernel.
 
-        Builds the SAME log-bias the Triton kernel computes (hard band ``d≤w̃`` +
-        soft edge; landmarks at the kernel-selected ``lmk_pos`` weighted by
-        ``lmk_logw``; union = elementwise max) and runs it through SDPA. Consuming
-        the kernel's exact selectors (via :meth:`_train_selectors`) is what makes
-        this a faithful reference, uniform-length only (the verify/PG-19 case).
+        Builds the same log-bias as the kernel (hard band ``d ≤ w̃`` with soft edge,
+        landmarks at ``lmk_pos`` weighted by ``lmk_logw``, union by elementwise max) from
+        the selectors of :meth:`_train_selectors`, and runs SDPA. Uniform lengths only.
         """
         H, D = self.n_heads, self.head_dim
         uniform = len(lens) > 0 and all(l == lens[0] for l in lens)
@@ -578,7 +504,7 @@ class DSALTAttention(nn.Module):
             )
 
         N, L = len(lens), lens[0]
-        # Same selectors the kernel uses → identical landmarks & weights.
+        # Same selectors as the kernel, hence the same landmarks and weights.
         w_cont, lmk_pos, lmk_logw = self._train_selectors(x, cu_seqlens, total_len, device, cu)
         logbias = self._dense_logbias_from_kernel(w_cont, lmk_pos, lmk_logw, N, L, device)  # [N,H,L,L]
 
@@ -592,20 +518,20 @@ class DSALTAttention(nn.Module):
         return ob.transpose(1, 2).reshape(total_len, H, D)
 
     def _dense_logbias_from_kernel(self, w_cont, lmk_pos, lmk_logw, N, L, device):
-        """Dense ``[N,H,L,L]`` log-bias replicating the Triton kernel math exactly.
+        """Dense ``[N,H,L,L]`` log-bias with the same math as the Triton kernel.
 
-        * window: hard band ``0 ≤ d ≤ w̃`` with soft edge ``log σ((w̃−d)/τ_win)``
-          (0 in the core ``d ≤ w̃−win_edge``);
-        * landmarks: at the (per-head, per-seq) ``lmk_pos`` add ``lmk_logw``, valid
-          only where ``lmk_pos ≤ i`` and ``lmk_pos < i − w̃`` (outside the band);
-        * union = elementwise max of the two.
+        * window: hard band ``0 ≤ d ≤ w̃`` with soft edge ``log σ((w̃−d)/τ_win)``, 0 in the
+          core ``d ≤ w̃−win_edge``;
+        * landmarks: ``lmk_logw`` at ``lmk_pos`` where ``lmk_pos ≤ i`` and
+          ``lmk_pos < i − w̃``;
+        * union: elementwise max.
         """
         H = self.n_heads
         w_seq = w_cont.view(N, L)                                                  # [N,L] per query i
         idx   = torch.arange(L, device=device)
         d     = (idx.unsqueeze(1) - idx.unsqueeze(0)).float()                      # [L,L] = i - j
 
-        # --- window band (trains win_gate) ---
+        # window band (trains win_gate)
         w_i    = w_seq.unsqueeze(-1)                                               # [N,L,1]
         z      = (w_i - d.unsqueeze(0)) / self.tau_win
         win_lb = torch.log(torch.sigmoid(z).clamp(min=1e-20))
@@ -614,11 +540,9 @@ class DSALTAttention(nn.Module):
         in_band = (d.unsqueeze(0) >= 0) & (d.unsqueeze(0) <= w_i)
         win_lb = win_lb.masked_fill(~in_band, float("-inf"))                       # [N,L,L]
 
-        # --- landmarks (trains alpha) ---
-        # For each query i and selected landmark key p: bias = lmk_logw if the
-        # landmark is causal (p ≤ i) and outside the band (p < i − w̃(i)), else -inf.
-        # Built without in-place ops (autograd-safe): each landmark kk produces a
-        # [N,H,L,L] term placed at its column j==p, combined by elementwise max.
+        # landmarks (trains alpha). For query i and selected landmark p the bias is
+        # lmk_logw if p ≤ i and p < i - w̃(i), else -inf. Each landmark adds a [N,H,L,L]
+        # term at column p, combined by elementwise max without in-place ops.
         lmk_lb = torch.full((N, H, L, L), float("-inf"), device=device)
         k_lmk  = lmk_pos.shape[-1]
         i_idx  = idx.view(1, 1, L).float()                                         # [1,1,L] query i
@@ -653,46 +577,37 @@ class DSALTAttention(nn.Module):
             sin = self.rope_sin[pos_ids]
         else:
             cos, sin = rope_cs
-        # The RoPE cache is stored in fp32, but q/k come out of their projections
-        # in the autocast compute dtype (bf16 on Ampere+, fp16 on T4). Multiplying
-        # by an fp32 cos/sin promotes q/k back to fp32, so the training kernel then
-        # re-casts them down (a real [total_len,H,D] copy per tensor) AND, because
-        # the post-RoPE dtype is fp32, its ``in_dtype`` guard falls through to fp16
-        # even on a bf16 run. Cast cos/sin to q's dtype here so RoPE stays in the
-        # compute dtype: q/k reach the kernel already in bf16 (kernel runs in the
-        # right precision, and its .to(in_dtype) becomes a no-op). dtype-agnostic.
+        # The RoPE cache is fp32 while q and k are in the autocast dtype. Casting
+        # cos/sin to q's dtype keeps RoPE in the compute dtype, so the kernel receives q
+        # and k in bf16 without an extra copy.
         cos = cos.to(q.dtype)
         sin = sin.to(q.dtype)
         q, k = apply_rotary_emb(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
-        # GQA: replicate the kv heads to the full n_heads after RoPE, so the kernels /
-        # SDPA fallback below consume a uniform [total_len, n_heads, D] layout. The
-        # landmark *selection* still uses v_proj.weight (kv_dim-wide) directly, which
-        # is correct: a landmark key is selected once per kv group, not per query head.
+        # GQA: repeat the kv heads to n_heads after RoPE. Landmark selection uses
+        # v_proj.weight (kv_dim wide) directly, so a landmark is selected once per kv
+        # group.
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
 
         aux = self._aux_zero(x.device, x.dtype)
 
-        # TRAINING: differentiable dense path, per sequence. This is the ONLY way the
-        # soft window edge (§4.2) and the α-reweight of landmarks (§4.3) can train
-        # win_gate / alpha_w, the Triton kernel's hand-written backward does not
-        # carry those gradients. Slower than Triton but exact and gradcheck-verified.
-        # INFERENCE: fall through to the fast Triton (or SDPA) selector path below.
+        # TRAINING: differentiable path carrying the gradients of the soft window edge
+        # and of the landmark weight to win_gate and alpha_w.
+        # INFERENCE: the Triton (or SDPA) path below.
         if self.training:
             self._last_P = None
-            # Fast path: differentiable sparse Triton kernel (only w(i)+k tokens per
-            # query, no dense [N,H,L,L]). Carries the gradients to win_gate (soft
-            # window edge) and alpha (soft landmark weight) directly in the kernel.
+            # Triton training kernel: only w(i)+k keys per query, and it carries both
+            # gradients.
             if _TRITON_TRAIN_OK and device.type == "cuda":
                 out = self._packed_train_triton(q, k, v, x, cu_seqlens, total_len, device, cu_list)
                 return self._apply_out_proj(out.view(total_len, self.d_model)), aux
-            # Fallback (CPU / no Triton): dense SDPA path, same math, gradcheck-tested.
+            # Without Triton: dense SDPA path with the same math.
             cu   = cu_list if cu_list is not None else cu_seqlens.detach().to("cpu").tolist()
             lens = [cu[b + 1] - cu[b] for b in range(len(cu) - 1)]
             out  = self._packed_train(q, k, v, x, cu, lens, total_len, device, cu_seqlens)
             return self._apply_out_proj(out.reshape(total_len, self.d_model)), aux
 
-        # ---- inference (selectors, no gradient) ----
+        # inference (hard selectors, no gradient)
         w_sizes = self._window_sizes(x, floor=True)
         alpha   = self._alpha()
 
@@ -703,7 +618,7 @@ class DSALTAttention(nn.Module):
                 cu_seqlens, self.k_lmk, self.n_min, total_len, cu_list,
                 head_dim=self.head_dim,
             )
-            # Pure A(i)=W∪L (eq. 32): the score only selects, zero logit bias.
+            # Hard A(i) = W(i) ∪ L(i): the score only selects, with no logit bias.
             lmk_bias = torch.zeros_like(lmk_indices, dtype=torch.float32)
             out = dsalt_triton_attention(
                 q, k, v, lmk_indices, lmk_bias, w_sizes, cu_seqlens,
@@ -718,11 +633,9 @@ class DSALTAttention(nn.Module):
                 q, k, v, attn_mask, self.dropout, self.training,
             )
 
-        # The rest of this method reconstructs the DENSE [H,T,T] attention matrix of
-        # the first sequence purely to populate ``_last_P`` for analysis metrics
-        # (rank / Dobrushin in paper_eval). It is O(T^2) and cancels the sparse
-        # memory advantage, so it is gated: callers that only need the output (e.g.
-        # the context-scaling experiment) set ``_collect_last_P = False`` to skip it.
+        # The rest of this method rebuilds the dense [H,T,T] attention matrix of the
+        # first sequence for the analysis metrics (rank, Dobrushin). It costs O(T^2)
+        # memory, so callers that need only the output set ``_collect_last_P = False``.
         if not getattr(self, "_collect_last_P", True):
             self._last_P = None
             return self._apply_out_proj(out.view(total_len, self.d_model)), aux
@@ -748,7 +661,7 @@ class DSALTAttention(nn.Module):
                 self.k_lmk,
                 self.n_min,
                 T0,
-                [0, T0],   # host-side cu_list → no D2H sync / graph break
+                [0, T0],   # host-side cu_list avoids a device-to-host sync
                 head_dim=self.head_dim,
             )
 
@@ -764,24 +677,21 @@ class DSALTAttention(nn.Module):
             in_lmk    = torch.zeros(self.n_heads, T0, T0, dtype=torch.bool, device=device)
             for h in range(self.n_heads):
                 valid_pos = lmk_abs[h]
-                # ``_compute_landmark_indices`` pads unfilled slots with -1 (fewer than
-                # k_lmk valid landmarks — common under the near-dense window seed, where
-                # almost every token is already in-window so few landmark candidates
-                # remain). A -1 is an illegal scatter index (device-side assert). We mark
-                # the landmark columns directly with index_fill_ on the valid positions
-                # only, which also avoids scatter's duplicate-index races; the per-query
-                # causal cut (a landmark key must be ≤ the query) is reapplied after.
+                # Unfilled landmark slots are padded with -1, which is not a valid index
+                # (this happens when almost every token is already inside the window).
+                # Mark only the valid landmark columns with index_fill_, then reapply
+                # the causal cut.
                 vp = valid_pos[valid_pos >= 0]                                     # [k_valid]
                 if vp.numel() == 0:
                     continue
                 col_is_lmk = torch.zeros(T0, dtype=torch.bool, device=device)
                 col_is_lmk[vp] = True                                              # [T0] over keys
-                # a landmark key j is attended by query i iff it is causal (j ≤ i)
+                # landmark key j is attended by query i iff j ≤ i
                 in_lmk[h] = col_is_lmk.unsqueeze(0) & (cols.unsqueeze(0) <= rows.unsqueeze(1))
 
             full_mask = in_win.unsqueeze(0) | in_lmk
         else:
-            # Fallback without Triton: dense mask shared across heads [T0, T0]
+            # Without Triton: dense mask shared across heads [T0, T0]
             full_mask = _build_mask_packed(
                 x[s0:e0], w0, self.v_proj.weight.detach(),
                 alpha0, cu0, T0, self.k_lmk, self.head_dim, device,

@@ -122,8 +122,8 @@ class _StepFormatter(logging.Formatter):
             return self._val(msg)
         if "checkpoint" in msg or "done |" in msg:
             return f"  {MAGENTA}✓  {msg}{RESET}"
-        # Two step layouts: ``kind=cheap`` (every log_every) is a single compact
-        # line; ``kind=metrics`` (every metrics_every) is the full diagnostics box.
+        # Two layouts: ``kind=cheap`` (every log_every) is one line; ``kind=metrics``
+        # (every metrics_every) is the full box.
         if "kind=cheap" in msg:
             return self._step_cheap(record, msg)
         return self._step(record, msg)
@@ -222,11 +222,10 @@ class _StepFormatter(logging.Formatter):
         hstd   = _fmt_val(p.get("head_std", p.get("hstd", "nan")),   color=MAGENTA)
         tdist  = _fmt_val(p.get("token_dist", "nan"),                color=LAVENDER)
         lr_s   = f"{MAGENTA}{p.get('lr', '?')}{RESET}"
-        # §4.2 window (min/mean/max) and §4.3 alpha (min/mean/max): shown raw
-        # as already-formatted "a/b/c" triplets, not numerically reformatted.
+        # window and alpha as preformatted min/mean/max triplets
         win_s   = f"{CYAN}{p.get('win',   'nan'):>{_W_VAL}}{RESET}"
         alpha_s = f"{GREEN}{p.get('alpha', 'nan'):>{_W_VAL}}{RESET}"
-        # kernel key-block scan cost (per-block win-MAX): the real it/s driver
+        # kernel key-block scan cost
         scan_s  = f"{RED}{p.get('scan',  'nan'):>{_W_VAL}}{RESET}"
 
         speed_s = f"{CYAN}{it_s:6.2f} it/s{RESET}" if it_s   > 0 else f"{DIM}  ?.?? it/s{RESET}"

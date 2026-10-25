@@ -1,4 +1,4 @@
-"""Hardware / distributed helpers: DDP setup, device selection, VRAM stats."""
+"""Hardware and distributed helpers: DDP setup, device selection, VRAM stats."""
 
 import os
 import torch

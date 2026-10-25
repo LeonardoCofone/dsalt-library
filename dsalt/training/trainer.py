@@ -7,7 +7,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-from datetime import datetime #SOLO per debug a riga 761
+from datetime import datetime
 
 from .gpu_auto import (
     get_device,
@@ -21,14 +21,9 @@ from .logging_config import get_logger, StepTimer
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
-    """Strip DDP and torch.compile wrappers in any nesting order.
-
-    We now compile BEFORE DDP (DDP outside, ``_orig_mod`` inside), but older code
-    compiled after (``_orig_mod`` outside, DDP inside). Peel both wrappers in a loop
-    so the real module is returned regardless of order.
-    """
+    """Strip DDP and torch.compile wrappers, in either nesting order."""
     seen = 0
-    while seen < 4:  # at most DDP+compile, bounded loop guards against cycles
+    while seen < 4:
         if isinstance(model, DDP):
             model = model.module
         elif hasattr(model, "_orig_mod"):
@@ -47,22 +42,17 @@ def compute_metrics(
     max_seqlen: int,
     heavy: bool = True,
     ) -> dict:
-    """Model diagnostics for the paper (rank/entropy/sink/noise + window/alpha).
+    """Model diagnostics: rank, entropy, sink, noise, window and alpha.
 
-    Two cost tiers controlled by ``heavy``:
-      * ``heavy=False`` (cheap, every ``log_every``): only quantities that come
-        straight from weights / a single forward pass — per-head ``alpha``, the
-        adaptive ``window`` spread, and the kernel ``scan`` cost. No SVD, no dense
-        ``_last_P`` materialisation, no perturbed forward. A few ms.
-      * ``heavy=True`` (full, every ``metrics_every``): the above plus effective
-        rank (GPU SVD), attention entropy, attention sink, residual norms, token
-        distance and the noise-propagation probe (a second, perturbed forward).
-        Seconds, not minutes, now that the SVDs run on the GPU.
+    Two tiers, selected with ``heavy``:
+      * ``heavy=False`` (every ``log_every``): per-head ``alpha``, the spread of the
+        adaptive window and the kernel scan cost, from one forward. No SVD.
+      * ``heavy=True`` (every ``metrics_every``): also effective ranks (GPU SVD),
+        attention entropy, attention sink, residual norms, token distance and the
+        noise-propagation probe (a second, perturbed forward).
 
-    The heavy block needs the per-layer dense attention ``_last_P``, which the
-    attention module only stores in ``eval``; for the cheap tier we still run a
-    forward (needed for the window sizes from each block input) but skip every
-    SVD / entropy / sink computation.
+    The heavy tier needs the per-layer dense attention ``_last_P``, which the attention
+    module stores only in eval mode.
     """
     m = _unwrap_model(model)
     m.eval()
@@ -90,17 +80,14 @@ def compute_metrics(
     token_dist = float("nan")
     token_dist_per_layer = []
 
-    # residual norm is cheap (no SVD) and used by the noise gate below, keep it.
+    # The residual norm is cheap and gates the noise probe below.
     h_final = layer_hiddens[-1]
     h_mean = h_final.mean(dim=0, keepdim=True)
     res_norm = ((h_final - h_mean).norm() / (layer_hiddens[0].norm() + 1e-9)).item()
 
     if heavy:
         if hasattr(last_attn, "_last_P") and last_attn._last_P is not None:
-            # SVD on the GPU (no .cpu()): svdvals of a [T,T] attention matrix on the
-            # CPU costs ~seconds and is called ~once per layer, which dominated the
-            # whole metrics pass (~minutes/log). On the A100 it is orders of magnitude
-            # faster and avoids the D2H copy of the dense [H,T,T] matrix.
+            # SVD on the GPU: on the CPU it dominated the metrics pass.
             P = last_attn._last_P.float()
             P_avg = P.mean(dim=0).detach()
             sv = torch.linalg.svdvals(P_avg)
@@ -164,15 +151,10 @@ def compute_metrics(
     noise_per_layer = []
     seq0_len = (cu_seqlens[1] - cu_seqlens[0]).item()
 
-    # The noise probe is gated to skip *degenerate* hidden states (NaN/inf or a residual
-    # that has blown up), where injecting a perturbation would measure garbage. The cap
-    # must scale with depth: ``res_norm`` is the depth-accumulated residual / input ratio,
-    # so a 36-layer multi-billion model legitimately reaches a few hundred (≈320 on
-    # Qwen2.5-3B) where a 14-18 layer prototype sat well below. A fixed 200 cap silently
-    # skipped the probe at 3B (=> noise=nan). Tie it to depth so the gate still catches a
-    # true blow-up but admits the large grafted models. GPU/scale-portable.
-    res_cap  = 60.0 * (len(m.layers) ** 0.5)        # ~360 at 36L (admits Qwen-3B's ~320),
-                                                     # ~255 at 18L, ~225 at 14L (still gates blow-ups)
+    # The noise probe skips degenerate hidden states (NaN/inf or a blown-up residual).
+    # ``res_norm`` grows with depth (about 320 on Qwen2.5-3B), so the cap scales with
+    # the number of layers.
+    res_cap  = 60.0 * (len(m.layers) ** 0.5)
     run_noise = heavy and seq0_len > 128 and math.isfinite(res_norm) and res_norm < res_cap
 
     if run_noise:
@@ -207,9 +189,7 @@ def compute_metrics(
         head_spec_std = entropy_heads.std(correction=0).item() if entropy_heads.numel() > 0 else float("nan")
         attn_sink = last_attn._last_P.float()[:, :, 0].mean().item()
 
-    # §4.3 hybrid-score balance alpha = σ(alpha_w), per head per layer. It is a
-    # selection-only buffer (not trained), so this confirms it stays at its init
-    # (≈0.6); we still log min/mean/max across all heads×layers for the paper.
+    # Per-head balance alpha = σ(alpha_w), min/mean/max over heads and layers.
     alpha_per_head = []
     alpha_vals = []
     for li, layer in enumerate(m.layers):
@@ -224,18 +204,15 @@ def compute_metrics(
     else:
         alpha_min = alpha_mean = alpha_max = float("nan")
 
-    # §4.2 adaptive local window w(i) = n_min + σ(f(x_i))·(n_max-n_min). Unlike
-    # alpha this is genuinely content-dependent (f(x_i) varies per token), so the
-    # spread min<mean<max across positions is the real evidence the window adapts.
-    # We recompute it from the same per-layer hidden states fed to each attn (the
-    # block input is layer_hiddens[li]); inference floor matches forward (eval).
+    # Adaptive window w(i) = n_min + σ(f(x_i))·(n_max-n_min), recomputed from the input
+    # of each block (floor, as in eval).
     win_min = win_mean = win_max = float("nan")
     win_per_layer = []
     win_vals_all = []
     for li, layer in enumerate(m.layers):
         attn = layer.attn
         if hasattr(attn, "_window_sizes"):
-            w = attn._window_sizes(layer_hiddens[li], floor=True)  # [T], int-valued
+            w = attn._window_sizes(layer_hiddens[li], floor=True)  # [T]
             wmin, wmean, wmax = w.min().item(), w.mean().item(), w.max().item()
             win_per_layer.append([wmin, wmean, wmax])
             win_vals_all.append(w)
@@ -243,18 +220,15 @@ def compute_metrics(
         w_all   = torch.cat(win_vals_all)
         win_min, win_mean, win_max = w_all.min().item(), w_all.mean().item(), w_all.max().item()
 
-    # --- diagnostic: kernel key-block scan cost (the real it/s driver) ---
-    # The Triton fwd/bwd scan key blocks back to ``window_start = m_start -
-    # w_max_block + 1`` where ``w_max_block`` is the MAX of w̃ over each BLOCK_M
-    # block of queries (kernels/dsalt_triton_train.py:132). So ONE wide query in
-    # a block widens the scan for all 32. This metric reproduces that: it averages
-    # the per-block win-MAX across all query blocks, which is what actually grows
-    # as heads specialise, NOT the global mean. ``scan_ratio`` normalises it by
-    # the global win-mean so >1 quantifies the per-block MAX inflation tax.
+    # Kernel scan cost. The Triton kernels scan key blocks back to ``m_start -
+    # w_max_block + 1``, where ``w_max_block`` is the largest window in each block of
+    # queries, so one wide query widens the scan of its whole block. This metric
+    # averages the per-block maximum; ``scan_ratio`` divides it by the global mean
+    # window.
     scan_block_max = float("nan")
     scan_ratio     = float("nan")
     if win_vals_all:
-        _BM = 32  # matches the kernel's BLOCK_M tiling granularity for the scan
+        _BM = 32  # BLOCK_M tiling of the kernel
         block_maxes = []
         for w in win_vals_all:
             T = w.numel()
@@ -351,11 +325,9 @@ class DSALTTrainer:
         self.total_steps            = total_steps
         self.grad_accum             = grad_accum
         self.log_every              = log_every
-        # Heavy diagnostics (SVD rank / entropy / sink / noise probe) cadence. They
-        # cost a full extra forward + per-layer SVDs, so by default we run them only
-        # once every 20 logs; cheap metrics (loss/ppl/lr/mem + alpha/window/scan)
-        # still print every ``log_every``. Set ``metrics_every`` to ``log_every`` to
-        # get the full pack on every log, or large to keep production runs fast.
+        # Heavy diagnostics (SVD rank, entropy, sink, noise probe) cost an extra forward
+        # and per-layer SVDs, so by default they run every 20 logs; the cheap metrics
+        # print every ``log_every``.
         self.metrics_every          = metrics_every if metrics_every is not None else log_every * 20
         self.val_every              = val_every
         self.max_val_batches        = max_val_batches
@@ -371,10 +343,8 @@ class DSALTTrainer:
         self.logger = get_logger("dsalt.trainer", log_dir=str(self.save_dir))
         self.device = get_device(local_rank)
 
-        # Portable perf knobs: TF32 speeds up fp32 GEMMs (FFN/lm_head matmuls) on
-        # Ampere+ (A100/H100/L4), inert on T4 (sm_75 has no TF32), so harmless on
-        # Kaggle but a real win the day this runs on a newer GPU. cudnn.benchmark
-        # picks the fastest conv/algo per shape (shapes here are fixed-length).
+        # TF32 for fp32 GEMMs on Ampere and newer (no effect on sm_75); cudnn.benchmark
+        # for the fixed shapes.
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32       = True
@@ -402,34 +372,20 @@ class DSALTTrainer:
                 gradient_as_bucket_view=True,
             )
 
-        # Compile AFTER wrapping in DDP, the PyTorch-recommended order for
-        # DDP + torch.compile. The DSALT Triton kernels are `torch._dynamo.disable`'d
-        # (opaque), so compile still fuses all the eager code around them (RoPE,
-        # selectors, RMSNorm, residuals, FFN, loss), where the launch overhead lives.
-        # fullgraph=False allows those graph-breaks; a hard compile failure falls back
-        # to eager (compile is a perf knob, never a correctness gate).
+        # Compile after the DDP wrap. The Triton kernels are opaque to dynamo, so
+        # compile fuses the code around them; a compile failure falls back to eager.
         #
-        # DDPOptimizer OFF under DDP: Dynamo's `DDPOptimizer` splits the compiled
-        # graph at DDP allreduce buckets, but it does NOT cope with our opaque custom
-        # autograd Function (DSALTTrainFunction) sitting mid-graph, the backward link
-        # between the post-kernel subgraph (loss) and the pre-kernel params is severed,
-        # so `loss.backward()` raises "element 0 ... does not require grad". Disabling
-        # DDPOptimizer keeps a single fused graph with clean graph-breaks at the kernel
-        # and lets DDP's eager allreduce hooks fire normally. We lose the bucket/compute
-        # overlap DDPOptimizer would give, but that overlap was never the bottleneck
-        # here (the kernel is), and correctness wins. Single-GPU compile is unaffected.
+        # Under DDP, Dynamo's DDPOptimizer is disabled: it splits the graph at the
+        # allreduce buckets and breaks the backward link across the custom autograd
+        # Function (DSALTTrainFunction), so ``loss.backward()`` fails.
         if compile_model and hasattr(torch, "compile"):
             try:
                 if world_size > 1 and hasattr(torch, "_dynamo"):
                     torch._dynamo.config.optimize_ddp = False
-                # dynamic=True: the packed varlen format gives a different total
-                # token count (and cu_seqlens length) on almost every step. With
-                # the default dynamic=None, Dynamo specializes on the first shape
-                # then RE-COMPILES whenever it changes — i.e. nearly every step,
-                # which dominated wall-clock (~82s/step vs ~17s of real compute).
-                # Forcing symbolic shapes compiles once and reuses the graph.
+                # dynamic=True: variable-length packing changes the token count almost
+                # every step, which with static shapes triggers a recompile per step.
                 model = torch.compile(model, fullgraph=False, dynamic=True)
-            except Exception as e:  # pragma: no cover - environment dependent
+            except Exception as e:
                 print(f"[trainer] torch.compile failed ({type(e).__name__}); running eager.")
 
         self.model = model
@@ -458,10 +414,8 @@ class DSALTTrainer:
             "scan_block_max", "scan_ratio",
             "oow_mass_per_layer",
             "val_ppl", "val_steps", "gpu_mem_gb", "it_s", "tok_s",
-            # cheap-history (train_loss/it_s/...) is appended every log_every, while
-            # the heavy metrics above are appended only every metrics_every, so the
-            # two groups have different lengths; metrics_steps records the step of
-            # each heavy entry so they can be aligned back to the timeline.
+            # Cheap history is appended every log_every and heavy metrics every
+            # metrics_every; metrics_steps aligns the heavy entries with the timeline.
             "metrics_steps",
         ]}
 
@@ -469,10 +423,9 @@ class DSALTTrainer:
         if self.device.type != "cuda":
             return None
         if mixed_precision == "auto":
-            # bf16 only on GPUs with native HW support (sm_80+: A100/H100/L4/...).
-            # NB: torch.cuda.is_bf16_supported() returns True even on sm_75 (T4),
-            # where bf16 is SW-emulated and does not compile → we check the compute
-            # capability directly.
+            # bf16 only with native support (sm_80+). torch.cuda.is_bf16_supported() is
+            # also True on sm_75, where bf16 is emulated, so the compute capability is
+            # checked directly.
             major, _ = torch.cuda.get_device_capability(self.device)
             mixed_precision = "bf16" if major >= 8 else "fp16"
         if mixed_precision == "bf16":
@@ -485,11 +438,9 @@ class DSALTTrainer:
         base = _unwrap_model(self.model)
         decay, nodecay, dsalt_params = [], [], []
 
-        # win_gate (§4.2) and alpha_w (§4.3) ARE trained: the gradient reaches them
-        # through the soft window edge and the σ(s/τ) landmark re-weight in the
-        # forward. That gradient is weaker than the dense projections', so we route
-        # them to a dedicated group with lr×2 and no weight decay (they are gates,
-        # not feature weights), matching the reference setup.
+        # win_gate and alpha_w are trained through the soft window edge and the landmark
+        # weight. Their gradient is weaker than that of the projections, so they get
+        # their own group with lr x2 and no weight decay.
         for name, p in base.named_parameters():
             if not p.requires_grad:
                 continue
@@ -530,9 +481,6 @@ class DSALTTrainer:
         labels     = labels.to(self.device, non_blocking=True)
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         max_seqlen = int(max_seqlen)
-        # NOTE: removed a per-batch ``(labels != -100).sum().item()`` that only fed a
-        # commented-out debug print, ``.item()`` forces a D2H sync that stalls the
-        # GPU queue every batch. Pure waste; the loss already counts valid tokens.
         return ids, labels, cu_seqlens, max_seqlen
 
     def _forward_step(self, batch) -> torch.Tensor:
@@ -560,10 +508,7 @@ class DSALTTrainer:
         self.model.eval()
         total_loss, total_tokens = 0.0, 0
 
-        # Cap the number of validation batches: the full val set can be thousands
-        # of batches, and validating every ``val_every`` steps over all of them can
-        # cost more wall-time than the training itself. A few dozen batches give a
-        # stable enough perplexity estimate. ``None`` keeps the full sweep.
+        # Cap the number of validation batches; None evaluates the whole set.
         for vi, batch in enumerate(self.val_loader):
             if self.max_val_batches is not None and vi >= self.max_val_batches:
                 break
@@ -624,9 +569,8 @@ class DSALTTrainer:
 
         stats  = self._timer.stop()
         it_s   = stats.get("it_s", 0.0)
-        # Global tokens per second: tokens/step (averaged over steps since the
-        # last log) × it/s × world_size. In DDP each rank counts only its own
-        # tokens, so we multiply by the process count to get total throughput.
+        # Global tokens per second: tokens per step × it/s × world_size (each DDP rank
+        # counts only its own tokens).
         steps_since_log = max(1, self.log_every)
         tokens_per_step = self._step_tokens / steps_since_log
         tok_s           = tokens_per_step * it_s * self.world_size
@@ -647,7 +591,6 @@ class DSALTTrainer:
         extra = {"it_s": it_s, "tok_s": tok_s, "mem_gb": mem_gb,
                  "peak_gb": peak_gb, "total_gb": stats.get("total_gb", 0.0)}
 
-        # always record the cheap history (one entry per log_every)
         self.history["gpu_peak_gb"] = self.history.get("gpu_peak_gb", [])
         self.history["gpu_peak_gb"].append(peak_gb)
         self.history["train_loss"].append(accum_loss)
@@ -658,9 +601,7 @@ class DSALTTrainer:
 
         heavy = (self.global_step % self.metrics_every == 0)
 
-        # --- cheap line, EVERY log_every: a single compact row, no model re-run,
-        # no SVD, no forward. ``kind=cheap`` tells the formatter to render one line
-        # (step | loss | ppl | lr | it/s | tok/s | mem) instead of the full box.
+        # cheap line, every log_every
         if not heavy:
             self.logger.info(
                 f"kind=cheap | step={self.global_step} | "
@@ -669,10 +610,7 @@ class DSALTTrainer:
             )
             return
 
-        # --- heavy diagnostics, every metrics_every: a model re-run + per-layer
-        # GPU SVDs (rank/entropy/sink/noise) + the window/alpha/scan probe. Carries
-        # loss/ppl/lr too so the full box never shows nan. ``kind=metrics`` selects
-        # the box layout in the formatter.
+        # heavy diagnostics, every metrics_every
         metrics = compute_metrics(
             _unwrap_model(self.model),
             self._last_ids,
@@ -766,10 +704,6 @@ class DSALTTrainer:
                 self.optimizer.step()
 
             gn_val = grad_norm.item() if grad_norm is not None else 0.0
-            #PER DEBUG:
-            #if self.rank == 0:
-                #current_time = datetime.now().strftime("%H:%M:%S")
-                #print(f"[{current_time}] step {self.global_step} | grad_norm={gn_val:.4f} | accum_loss={accum_loss:.4f}")
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1

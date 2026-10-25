@@ -18,9 +18,8 @@ from .sparse_attn import (
     sparse_attention_forward_packed,
 )
 
-# The Triton kernels are optional: without Triton/CUDA the library stays
-# importable and uses the SDPA fallback (sparse_attn). The Triton objects are
-# ``None`` when the backend is unavailable.
+# The Triton kernels are optional: without Triton or CUDA the library uses the SDPA
+# fallback (sparse_attn), and the Triton objects are ``None``.
 try:
     from .dsalt_triton_bwd import dsalt_triton_backward
     from .dsalt_triton_attn import dsalt_triton_attention

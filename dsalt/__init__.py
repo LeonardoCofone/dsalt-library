@@ -1,15 +1,15 @@
-"""DSALT, Dynamic Sparse Attention with Landmark Tokens.
+"""DSALT: sparse attention with adaptive windows and content-selected landmarks.
 
-This package aggregates the library's main components:
-- :class:`DSALTConfig` / :class:`DSALTLMHeadModel`, config and language model;
-- :class:`DSALTAttention`, :class:`DSALTTransformerBlock`, :class:`SwiGLUFFN`, the blocks;
-- :func:`hybrid_scores_per_head`, single source of the hybrid-energy score (§4.3),
-  shared between the SDPA path and the Triton kernel;
+Main components:
+- :class:`DSALTConfig` / :class:`DSALTLMHeadModel`: configuration and language model;
+- :class:`DSALTAttention`, :class:`DSALTTransformerBlock`, :class:`SwiGLUFFN`: blocks;
+- :func:`hybrid_scores_per_head`: the landmark score, shared by the SDPA path and
+  the Triton kernels;
 - utilities for the adaptive window and RoPE;
-- :class:`DSALTTrainer`, training loop with DDP and checkpointing.
+- :class:`DSALTTrainer`: training loop with DDP and checkpointing.
 
-The Triton kernels (sparse attention and fused cross-entropy) are optional:
-without Triton the library stays importable and uses the SDPA fallback.
+The Triton kernels (sparse attention, fused cross-entropy) are optional; without
+Triton the library uses the SDPA fallback.
 
 Example::
 
@@ -17,7 +17,7 @@ Example::
     cfg   = DSALTConfig(vocab_size=50257, d_model=512, n_layers=6, n_heads=8,
                         n_min=64, n_max=256, k_lmk=16, max_seq_len=1024)
     model = DSALTLMHeadModel.from_config(cfg)
-""" 
+"""
 
 from dsalt.kernels import (
     dsalt_triton_attention,

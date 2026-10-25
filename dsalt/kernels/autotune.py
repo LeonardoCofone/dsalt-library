@@ -1,23 +1,19 @@
 """Autotuning of the DSALT kernel block sizes.
 
-Unlike ``@triton.autotune`` (which re-evaluates on every new shape-key and, with
-variable-length packed sequences, would re-tune continuously), here the tuning
-runs **only once** per ``(head_dim, compute capability)`` pair and fixes the
-configuration for the whole training run.
+Unlike ``@triton.autotune``, which re-tunes for every new shape key (and with
+variable-length packing would re-tune continuously), tuning runs once per
+``(head_dim, compute capability)`` and fixes the configuration for the run.
 
-Kernel constraints (to be respected by the candidate configs):
+Kernel constraints:
 
-* ``BLOCK_M`` is shared between forward and backward: the ``seq_block_map`` is
-  built with a given ``BLOCK_M`` in the forward and reused identically in the
-  backward. A single choice of ``BLOCK_M`` for fwd+bwd.
-* The backward forces ``BLOCK_N = min(BLOCK_N, 32)`` (a heavier kernel in
-  registers/smem because of the ``atomic_add``). Tuning ``BLOCK_N > 32`` only
-  optimises the forward; the backward will use ≤32 anyway.
-* ``HEAD_DIM``, ``K_LMK`` and ``scale`` are imposed by the shapes: not tunable.
+* ``BLOCK_M`` is shared by forward and backward, which reuse the same
+  ``seq_block_map``.
+* The inference backward caps ``BLOCK_N`` at 32 (atomic_add), so ``BLOCK_N > 32``
+  only affects the forward.
+* ``HEAD_DIM``, ``K_LMK`` and ``scale`` are fixed by the shapes.
 
-The genuinely free parameters are therefore: ``BLOCK_M``, ``BLOCK_N``,
-``num_warps`` and ``num_stages``. The measured cost is that of a full
-forward + backward step on a real batch.
+The tuned parameters are ``BLOCK_M``, ``BLOCK_N``, ``num_warps`` and ``num_stages``;
+the cost measured is a full forward + backward step on a real batch.
 """
 
 import os
@@ -31,20 +27,12 @@ _TUNED_CONFIG: dict = {}
 
 
 def _is_main_process(device: torch.device | None = None) -> bool:
-    """True only on the main rank (or always, when not under DDP).
+    """True only on the main rank (or always, without DDP).
 
-    Every rank still benchmarks its own GPU, timings may differ from card to
-    card, but the debug table must be printed only once. We read the rank
-    directly from the environment (``torch.distributed`` or the ``torchrun``
-    env vars) so as not to depend on the ``training`` package and to avoid
-    circular imports in the kernels.
-
-    Under ``mp.spawn`` (e.g. Kaggle) the autotune may fire on the very first
-    forward, *before* ``init_process_group``: there ``is_initialized()`` is
-    still ``False`` and ``RANK``/``LOCAL_RANK`` may be unset, so every worker
-    would fall through to ``True`` and print a duplicate table. As a last
-    resort we key off the CUDA device ordinal, distinct per worker in DDP,
-    and treat only ``cuda:0`` as main.
+    Every rank benchmarks its own GPU, but the table is printed once. The rank is read
+    from ``torch.distributed`` or the ``torchrun`` environment variables. Under
+    ``mp.spawn`` the autotune can run before ``init_process_group``; then only
+    ``cuda:0`` counts as main.
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank() == 0
@@ -52,8 +40,8 @@ def _is_main_process(device: torch.device | None = None) -> bool:
         val = os.environ.get(var)
         if val is not None:
             return int(val) == 0
-    # No torch.distributed and no env rank: fall back to the device ordinal so
-    # mp.spawn workers don't each print before init_process_group.
+    # Without torch.distributed or an env rank, use the device ordinal, so mp.spawn
+    # workers do not each print before init_process_group.
     dev = device if device is not None else torch.device("cuda", torch.cuda.current_device())
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
     return int(idx) == 0
@@ -65,11 +53,8 @@ def _device_key(head_dim: int, device: torch.device) -> tuple:
 
 
 def _heuristic_config(head_dim: int, device: torch.device) -> dict:
-    """Safe configuration (the former ``_pick_block_*`` made dynamic).
-
-    Used both as the seed of the candidates and as the fallback if tuning fails
-    on a hostile GPU. ``num_stages`` follows the compute capability: 3 pipeline
-    stages on sm_80+ (more smem available), 2 on the tighter GPUs (T4/sm_75).
+    """Safe configuration, used as a candidate and as the fallback if tuning fails.
+    ``num_stages`` is 3 on sm_80+ and 2 on smaller GPUs.
     """
     if head_dim <= 64:
         block_m, block_n, num_warps = 64, 64, 4
@@ -92,17 +77,15 @@ def _heuristic_config(head_dim: int, device: torch.device) -> dict:
 
 def _candidate_configs(head_dim: int, device: torch.device,
                        with_bwd_tile: bool = False) -> list[dict]:
-    """Generate the candidates to benchmark (autotune phase 1).
+    """Candidates for phase 1 of the autotune.
 
-    We vary ``BLOCK_M`` (½/1/2/4× the heuristic, within [16, 128]), ``num_warps``
-    (2/4/8) and ``num_stages`` (2/3 on sm_80+). ``BLOCK_N`` is aligned to
-    ``BLOCK_M`` but capped at 64. All filtered by estimated shared memory.
+    ``BLOCK_M`` takes ½/1/2/4× the heuristic value within [16, 128], ``num_warps``
+    2/4/8 and ``num_stages`` 2/3 on sm_80+. ``BLOCK_N`` follows ``BLOCK_M`` up to 64.
+    Configs are filtered by estimated shared memory.
 
-    ``with_bwd_tile`` (training only): seed every candidate with the safe baseline
-    backward key tile ``BLOCK_N_BWD = 32``. The *best* backward tile is searched in
-    a cheap PHASE 2 afterwards (`_bwd_tile_candidates`), once the forward axes are
-    fixed, this keeps phase 1 small (no BLOCK_N_BWD × warps blow-up) while still
-    choosing the bwd tile per device (T4→32, A100/H100→maybe 64/128).
+    With ``with_bwd_tile`` (training only) every candidate starts from
+    ``BLOCK_N_BWD = 32``; the backward tile is searched in phase 2
+    (`_bwd_tile_candidates`) once the forward axes are fixed.
     """
     base = _heuristic_config(head_dim, device)
     major, _ = torch.cuda.get_device_capability(device)
@@ -140,12 +123,9 @@ def _candidate_configs(head_dim: int, device: torch.device,
 
 
 def _bwd_tile_candidates(cfg: dict, head_dim: int, device: torch.device) -> list[dict]:
-    """Phase-2 candidates: vary only ``BLOCK_N_BWD`` around a fixed phase-1 config.
-
-    Given the winning forward config, try the backward key tile over {32, 64, 128}
-    filtered by the backward smem budget on THIS device. T4 (HEAD_DIM small) keeps
-    only 32; A100/H100 also get 64/128. Cheap: at most 3 benchmarks. Returns the
-    list including the incumbent (32) so the search never regresses below it.
+    """Phase-2 candidates: ``BLOCK_N_BWD`` in {32, 64, 128} around the winning phase-1
+    config, filtered by the backward shared-memory budget of this device. Always
+    includes 32.
     """
     bm = cfg["BLOCK_M"]
     tiles = [n for n in (32, 64, 128)
@@ -159,11 +139,8 @@ def _bwd_tile_candidates(cfg: dict, head_dim: int, device: torch.device) -> list
 
 
 def _smem_budget(device: torch.device) -> int:
-    """Usable per-block shared memory in bytes (75% of the declared max).
-
-    Read dynamically from the device so the same code adapts across GPUs: T4
-    (sm_75) exposes ~64 KB, A100/H100 far more. The 75% margin leaves room for
-    the compiler's own scratch/spill.
+    """Usable per-block shared memory in bytes: 75% of the device maximum, leaving room
+    for the compiler's own scratch.
     """
     try:
         props = torch.cuda.get_device_properties(device)
@@ -175,11 +152,8 @@ def _smem_budget(device: torch.device) -> int:
 
 
 def _fits_shared_memory(cfg: dict, head_dim: int, device: torch.device) -> bool:
-    """Conservative estimate of a config's shared-memory footprint (forward).
-
-    The kernel keeps the tiles ``q[BM, D]``, ``k/v[BN, D]`` and the accumulators
-    in registers/smem. We estimate the peak as ``(BM + 2*BN) * D`` elements at
-    4 bytes (fp32 accumulators) and compare it with the GPU's per-block smem.
+    """Conservative estimate of the forward shared-memory footprint:
+    ``(BM + 2*BN) * D`` elements at 4 bytes, against the per-block limit.
     """
     head_dim_c = triton.next_power_of_2(head_dim)
     est_bytes = (cfg["BLOCK_M"] + 2 * cfg["BLOCK_N"]) * head_dim_c * 4
@@ -190,14 +164,9 @@ def _bwd_tile_fits_smem(block_m: int, block_n_bwd: int, head_dim: int,
                         device: torch.device) -> bool:
     """Whether a backward key tile of ``block_n_bwd`` fits in shared memory.
 
-    The dk/dv kernel holds the tiles ``q/do[BM, D]`` and ``k/v[BN, D]`` in smem;
-    the ``dk/dv`` accumulators live in registers (not smem). So the smem estimate
-    is ``(2*BM + 2*BN) * D`` fp32 elements, same shape as the forward, just with
-    two query-side tiles (q and do). This is only a *pre-filter* to drop configs
-    that clearly cannot fit; the real benchmark still runs each survivor and a
-    config that overruns registers/smem fails there and is discarded. The filter
-    is read from the device, so a large BLOCK_N is dropped on T4 (HEAD_DIM=16) but
-    allowed on A100, never hard-coded to one GPU.
+    The dk/dv kernel keeps ``q/do[BM, D]`` and ``k/v[BN, D]`` in shared memory, so the
+    estimate is ``(2*BM + 2*BN) * D`` fp32 elements. This only drops configs that cannot
+    fit; the benchmark discards those that still fail.
     """
     head_dim_c = triton.next_power_of_2(head_dim)
     est_bytes = (2 * block_m + 2 * block_n_bwd) * head_dim_c * 4
@@ -262,8 +231,7 @@ def autotune_blocks(head_dim: int, device: torch.device, make_runner, verbose: b
 
     _TUNED_CONFIG[key] = best_cfg
 
-    # Under DDP every rank benchmarks its own GPU, but only the main one prints:
-    # no duplicated tables (one per device).
+    # Every DDP rank benchmarks its own GPU; only the main one prints.
     if verbose and _is_main_process(device):
         _print_table(head_dim, device, results, best_cfg, best_ms)
 

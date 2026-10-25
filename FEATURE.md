@@ -1,10 +1,7 @@
 # DSALT, Features & Hyperparameters Guide
 
-A complete reference for **every** public component, its real constructor
-signature, every default, every option, and the recommended usage. Everything
-here is verified against the source, no placeholders, no planned-but-missing
-APIs. Reading this file takes you from zero knowledge of the library to full
-working command of it.
+A reference for the public components: constructor signatures, defaults, options
+and usage, checked against the source.
 
 ---
 
@@ -35,10 +32,10 @@ working command of it.
 attention with the union of two sparse sets per query `i`:
 
 ```
-A(i) = W(i) ∪ L(i)            (paper eq. 32)
+A(i) = W(i) ∪ L(i)
 ```
 
-- **`W(i)`, adaptive local causal window (§4.2).** A learned linear projection
+- **`W(i)`, adaptive local causal window.** A learned linear projection
   `win_gate: R^d → R` predicts, per token, a continuous window size
 
   ```
@@ -50,9 +47,9 @@ A(i) = W(i) ∪ L(i)            (paper eq. 32)
   loads the key tiles inside its radius, which is what keeps the cost
   sub-quadratic, but the boundary carries a **soft, differentiable** edge of
   width `win_edge` so that `win_gate` is trained. At inference `w̃` is floored to
-  an integer window (paper eq. 29).
+  an integer window.
 
-- **`L(i)`, global landmark tokens (§4.3).** A per-head **hybrid-energy** score
+- **`L(i)`, global landmark tokens.** A per-head **hybrid-energy** score
 
   ```
   s_j = α · z(‖x_j · W_V‖₂) + (1 − α) · z(‖x_j‖₂),   α = σ(α̃)  (per head)
@@ -62,8 +59,13 @@ A(i) = W(i) ∪ L(i)            (paper eq. 32)
   top-`k_lmk` per head become landmarks. The **selection is hard** (top-k,
   detached, it only addresses memory), while a **soft re-weight** `log σ(s_j/τ)`
   added to the admitted landmarks' logits makes the per-head balance `α` trainable.
+  Landmarks are selected once per sequence and head, with the standardization and
+  the top-k over the whole sequence. A query only attends to landmarks before its
+  window, but which earlier tokens become landmarks depends on later tokens, so the
+  selection is not causal in the strict sense; autoregressive generation needs a
+  selection computed on the prefix.
 
-Both predictors, `win_gate` (§4.2) and the per-head `α` (§4.3), are **trained**.
+Both predictors, `win_gate` and the per-head `α`, are **trained**.
 The union `W ∪ L` is realised as the elementwise `max` of the two additive
 log-biases; the raw `q·k` score itself is never biased by the selector. There is
 **no separate auxiliary loss**: the predictors receive their gradient directly
@@ -108,9 +110,9 @@ vocab_size:  int   # Vocabulary size
 d_model:     int   # Hidden dimension; must be divisible by n_heads
 n_layers:    int   # Number of transformer blocks
 n_heads:     int   # Number of attention heads
-n_min:       int   # Lower bound of the adaptive window (§4.2)
-n_max:       int   # Upper bound of the adaptive window (§4.2)
-k_lmk:       int   # Number of landmark tokens per query/head (§4.3)
+n_min:       int   # Lower bound of the adaptive window
+n_max:       int   # Upper bound of the adaptive window
+k_lmk:       int   # Number of landmark tokens per head
 max_seq_len: int   # Max length for the RoPE/YaRN cache
 ```
 
@@ -123,8 +125,11 @@ yarn_scale:         float      = 1.0       # RoPE / YaRN positional scaling fact
 tie_weights:        bool       = True      # Share embedding and LM-head weights
 padding_idx:        int | None = None      # Embedding padding index
 lm_head_chunk_size: int        = 2048      # Chunk size for the "chunked" cross-entropy
-loss_fn:            str        = "chunked" # "chunked" | "liger" | "auto"  (see §7)
+loss_fn:            str        = "chunked" # "chunked" | "liger" | "auto"  (see section 7)
 aux_loss_weight:    float      = 0.0       # Weight of the auxiliary term (inert: predictors train in the main forward)
+n_kv_heads:         int | None = None      # Key/value heads for grouped-query attention; None = n_heads
+qkv_bias:           bool       = False     # Bias on the q/k/v projections (True for Qwen2.5)
+rope_base:          float      = 10000.0   # RoPE base frequency (1e6 for Qwen2.5)
 ```
 
 - `d_ff=None` resolves to `((⌈8/3·d_model⌉ + 127) // 128) · 128`, the standard
@@ -181,7 +186,7 @@ from dsalt.model import DSALTConfig, DSALTLMHeadModel
 cfg = DSALTConfig(
     vocab_size=50257, d_model=512, n_layers=6, n_heads=8,
     n_min=64, n_max=256, k_lmk=16, max_seq_len=1024,
-    # any optional field from §3 is also accepted, e.g.:
+    # any optional field from section 3 is also accepted, e.g.:
     loss_fn="chunked", lm_head_chunk_size=2048, tie_weights=True,
 )
 model = DSALTLMHeadModel.from_config(cfg)
@@ -192,7 +197,7 @@ d    = cfg.to_dict()                      # plain dict
 cfg3 = DSALTConfig.from_dict(d)           # ignores unknown keys
 ```
 
-It has the same fields and defaults as the model constructor (§3), and validates
+It has the same fields and defaults as the model constructor (section 3), and validates
 on construction:
 
 - `d_model % n_heads == 0`
@@ -221,11 +226,14 @@ max_seq_len: int
 dropout:     float = 0.0
 yarn_scale:  float = 1.0
 layer_idx:   int   = 0
+n_kv_heads:  int | None = None
+qkv_bias:    bool  = False
+rope_base:   float = 10000.0
 ```
 
 ### Learnable parameters
 
-- **`win_gate`**, `nn.Linear(d_model, 1)`: the §4.2 window-size predictor.
+- **`win_gate`**, `nn.Linear(d_model, 1)`: the window-size predictor, one window per token shared by the heads of the layer.
   Trained through the *soft window edge* (`_soft_window_logbias`): inside the
   window the bias is exactly `0` (hard core), and only the last `win_edge` keys
   before the boundary carry `log σ((w̃ − d)/τ_win)`, so `∂/∂w̃` is non-zero only on
@@ -268,7 +276,8 @@ diagnostics.
   ```
 
   Constructed as `DSALTTransformerBlock(d_model, n_heads, n_min, n_max, k_lmk,
-  max_seq_len, d_ff, dropout=0.0, yarn_scale=1.0, layer_idx=0)`. All
+  max_seq_len, d_ff, dropout=0.0, yarn_scale=1.0, layer_idx=0, n_kv_heads=None,
+  qkv_bias=False, rope_base=10000.0)`. All
   architectural hyperparameters are inherited from `DSALTLMHeadModel`. Its
   `forward` returns `(x, aux)` where `aux` is the inert zero auxiliary term.
 
@@ -302,7 +311,7 @@ Notes:
 
 `dsalt.training.DSALTTrainer`, single- and multi-GPU (DDP) training with AMP
 autodetect, cosine LR schedule, checkpointing, and rich diagnostics. It expects
-**packed** batches shaped `(input_ids, labels, cu_seqlens, max_seqlen)` (see §9).
+**packed** batches shaped `(input_ids, labels, cu_seqlens, max_seqlen)` (see section 9).
 
 ### Required parameters
 
@@ -321,7 +330,7 @@ local_rank:  int = 0
 world_size:  int = 1            # > 1 wraps the model in DistributedDataParallel
 
 # Optimisation (AdamW)
-lr:            float = 3e-4     # base LR; the alpha_w parameters get 2× this LR
+lr:            float = 3e-4     # base LR; win_gate and alpha_w get 2× this LR, no weight decay
 weight_decay:  float = 0.1
 max_grad_norm: float = 0.5      # gradient clipping (0 disables)
 grad_accum:    int   = 1        # micro-steps accumulated per optimizer step
@@ -331,15 +340,17 @@ warmup_steps: int = 1000
 total_steps:  int = 10000
 
 # Logging / checkpointing
-log_every:  int = 100
-val_every:  int = 500
-save_every: int = 1000
-save_dir:   str = "./checkpoints_dsalt"
+log_every:       int = 100
+metrics_every:   int | None = None   # heavy diagnostics cadence; None = 20 × log_every
+val_every:       int = 500
+max_val_batches: int | None = None   # cap on validation batches; None = full set
+save_every:      int = 1000
+save_dir:        str = "./checkpoints_dsalt"
 
 # Precision & performance
-mixed_precision:        str  = "auto"   # "auto" | "bf16" | "fp16" | "none"  (§10)
+mixed_precision:        str  = "auto"   # "auto" | "bf16" | "fp16" | "none"  (section 10)
 gradient_checkpointing: bool = False    # recompute blocks in backward to save memory
-compile_model:          bool = False    # apply torch.compile (after the DDP wrap)  (§11)
+compile_model:          bool = False    # apply torch.compile (after the DDP wrap)  (section 11)
 ddp_backend:            str  = "nccl"
 seed:                   int  = 42        # per-rank seed = seed + rank
 ```
@@ -409,18 +420,19 @@ budgets are all resolved at runtime per device.
   backward graph intact across the custom autograd Function (otherwise the loss
   loses its `grad_fn`). `torch.compile` is a pure performance knob: any hard compile
   failure falls back to eager and never affects correctness. See
-  [DESIGN_NOTES.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/DESIGN_NOTES.md)
-  §2 for the full rationale.
+  section 2 of
+  [DESIGN_NOTES.md](https://github.com/LeonardoCofone/dsalt-library/blob/main/DESIGN_NOTES.md).
 
 ---
 
 ## 12. Diagnostics & checkpointing
 
-### Diagnostics (logged every `log_every` steps)
+### Diagnostics
 
-Besides loss, perplexity, LR, it/s and tok/s, the trainer computes a suite of
-per-layer **representation-health** metrics in `eval` mode from the cached
-attention matrices (`_last_P`):
+Loss, perplexity, LR, it/s and tok/s are logged every `log_every` steps, together
+with the window, alpha and scan statistics. Every `metrics_every` steps the trainer
+also computes per-layer metrics in `eval` mode from the cached attention matrices
+(`_last_P`):
 
 - `σ²`, second singular value of the attention matrix (rank-collapse signal)
 - `eff_rank`, effective rank of the representations
@@ -432,9 +444,8 @@ attention matrices (`_last_P`):
 - `attn_sink`, attention mass on token 0 (sink)
 - `alpha_{min,mean,max}` and per-head `alpha`
 - `win_{min,mean,max}` and per-layer window sizes
-- `scan_block_max`, `scan_ratio`, the per-block max window `max(w̃)` and realised
-  scan ratio (this is what makes the early throughput dip = head specialisation
-  visible; it saturates as heads specialise)
+- `scan_block_max`, `scan_ratio`, the per-block maximum window `max(w̃)`, which
+  sets how far the kernel scans, and its ratio to the mean window
 - `oow_mass_per_layer`, out-of-window attention mass
 
 ### Checkpointing
@@ -499,7 +510,7 @@ from dsalt import (
     DSALTAttention, DSALTTransformerBlock, SwiGLUFFN,
     # training
     DSALTTrainer,
-    # landmark scoring (single source of the §4.3 formula)
+    # landmark scoring
     hybrid_scores_per_head, compute_hybrid_scores,
     select_landmarks, soft_landmark_weights, HybridEnergyLandmarkSelector,
     # dense sparse-attention helpers

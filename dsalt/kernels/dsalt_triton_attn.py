@@ -1,9 +1,8 @@
-"""DSALT *inference* Triton kernel: sparse attention over window ∪ landmarks.
+"""DSALT inference Triton kernel: sparse attention over the window and the landmarks.
 
-The fast forward path used at eval time (packed sequences). It selects the local
-window and the precomputed landmark indices and runs a FlashAttention-style fused
-attention with online softmax. The differentiable backward lives in
-``dsalt_triton_bwd``; block sizes come from the one-shot ``autotune``.
+Fused attention with online softmax over the local window and the precomputed
+landmark indices, for packed sequences. The backward is in ``dsalt_triton_bwd``;
+block sizes come from ``autotune``.
 """
 
 import math
@@ -14,8 +13,8 @@ import triton.language as tl
 from .dsalt_triton_bwd import dsalt_triton_backward
 from .landmark_tokens_ker import hybrid_scores_per_head
 from .autotune import autotune_blocks, get_tuned_config, _heuristic_config
-# Pure-torch selectors live in a triton-free module so the CPU fallback can import
-# them; re-exported here for backward compatibility with existing call sites.
+# The selectors live in a Triton-free module so the CPU fallback can import them;
+# re-exported here.
 from .selectors import (
     _seq_meta,
     _build_seq_block_map,
@@ -109,7 +108,8 @@ def _dsalt_fwd_kernel(
 
         m_new  = tl.maximum(m_i, tl.max(qk, axis=1))
         p      = tl.where(final, tl.exp(qk - m_new[:, None]), 0.0)
-        # Guard -inf-(-inf)=nan when this row had no valid token yet (m_i still -inf).
+        # When m_i is still -inf (no valid token yet for this row), avoid
+        # -inf-(-inf)=nan.
         l_corr = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i - m_new))
         l_i    = l_i * l_corr + tl.sum(p, axis=1)
         acc    = acc * l_corr[:, None] + tl.dot(p.to(k_blk.dtype), tl.trans(v_blk))
@@ -184,11 +184,8 @@ def _resolve_blocks(head_dim: int, device: torch.device) -> dict:
 def _launch_fwd(q_c, k_c, v_c, out, lse, w_int, lmk_K, lmk_V, lmk_pos,
                 lmk_bias_c, cu_int, seq_block_map, total_blk, n_heads,
                 scale, HEAD_DIM_C, k_lmk, cfg):
-    """Forward kernel launch parameterised by the block config.
-
-    Extracted into a function so that the same path is used by both the normal
-    run and the autotune benchmark (no duplication, no divergence between what is
-    measured and what runs in training).
+    """Launch the forward kernel with a given block config; used by both the normal run
+    and the autotune benchmark.
     """
     _dsalt_fwd_kernel[(total_blk, n_heads)](
         q_c, k_c, v_c, out, lse,
@@ -214,11 +211,8 @@ def _launch_fwd(q_c, k_c, v_c, out, lse, w_int, lmk_K, lmk_V, lmk_pos,
 
 def _maybe_autotune(head_dim, device, q_c, k_c, v_c, lmk_indices, lmk_bias,
                     w_sizes, cu_seqlens, n_heads, scale, HEAD_DIM_C, k_lmk):
-    """Run the fwd+bwd autotune only once per (head_dim, GPU).
-
-    Builds a ``make_runner`` that, given a config, prepares the buffers and
-    returns a closure running a full fwd + bwd with that config. The result is
-    cached in ``autotune._TUNED_CONFIG``.
+    """Run the fwd+bwd autotune once per (head_dim, GPU); the result is cached in
+    ``autotune._TUNED_CONFIG``.
     """
     if get_tuned_config(head_dim, device) is not None:
         return
@@ -333,9 +327,8 @@ class DSALTAttentionFunction(torch.autograd.Function):
             None, d_bias.to(ctx.out_dtype), None, None,
         )
 
-# Opaque to torch.compile/Dynamo: the inference kernel is a custom autograd
-# Function with raw Triton launches, the compiler must graph-break here and never
-# trace inside. Guarded getattr so the lib still imports without `torch._dynamo`.
+# The custom autograd Function is opaque to torch.compile. Identity on torch builds
+# without `torch._dynamo`.
 def _dynamo_opaque(fn):
     disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
     return disable(fn) if disable is not None else fn

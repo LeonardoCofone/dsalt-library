@@ -9,11 +9,8 @@ from pathlib import Path
 
 @dataclass
 class DSALTConfig:
-    """Hyperparameters of :class:`~dsalt.model.dsalt_lm.DSALTLMHeadModel`.
-
-    Collects in a single serializable object all the model's arguments, so an
-    experiment's configuration can be saved/reloaded and the model instantiated
-    with ``DSALTLMHeadModel.from_config(cfg)``.
+    """Hyperparameters of :class:`~dsalt.model.dsalt_lm.DSALTLMHeadModel`, in one
+    serializable object.
 
     Example::
 
@@ -40,18 +37,15 @@ class DSALTConfig:
     dropout:            float      = 0.0
     yarn_scale:         float      = 1.0
     tie_weights:        bool       = True
-    # Grouped-Query Attention: number of key/value heads. ``None`` (default) means
-    # full multi-head attention (n_kv_heads == n_heads). When loading a GQA backbone
-    # (e.g. Qwen2.5, 16 query heads / 2 kv heads) set this to the backbone value;
-    # k_proj/v_proj are then sized to ``n_kv_heads * head_dim`` and the kv heads are
-    # repeated to ``n_heads`` at runtime before the dots (so the kernels see full MHA).
+    # Grouped-query attention: number of key/value heads. None means full multi-head
+    # attention. For a GQA backbone (e.g. Qwen2.5) use the backbone value; k_proj/v_proj
+    # are sized to n_kv_heads * head_dim and the kv heads are repeated to n_heads at
+    # runtime.
     n_kv_heads:         int | None = None
-    # q/k/v projection bias. False for our from-scratch models; Qwen2.5 ships q/k/v
-    # WITH bias (and out_proj without), so set True to load that backbone faithfully.
+    # q/k/v projection bias: False for the from-scratch models, True for Qwen2.5.
     qkv_bias:           bool       = False
-    # RoPE base frequency (``rope_theta``). 10000 for our models; Qwen2.5 uses 1e6.
-    # Wrong base => the pretrained positions are misread and the backbone outputs
-    # garbage, so this MUST match the checkpoint when fine-tuning from one.
+    # RoPE base (``rope_theta``): 10000 for the from-scratch models, 1e6 for Qwen2.5. It
+    # must match the checkpoint when fine-tuning from one.
     rope_base:          float      = 10000.0
     padding_idx:        int | None = None
     lm_head_chunk_size: int        = 2048

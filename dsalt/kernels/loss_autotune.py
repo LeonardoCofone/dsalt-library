@@ -1,25 +1,12 @@
-"""Per-device autotuning of the language-model loss.
+"""Per-device choice of the language-model loss.
 
-The LM loss can be computed two ways:
+* ``chunked`` (PyTorch): materializes ``[chunk, vocab]`` logits in fp32 and runs a
+  dense ``cross_entropy`` per chunk. Works everywhere.
+* ``liger`` (Triton): fuses ``lm_head @ x`` with the cross-entropy and never
+  materializes the logits. Faster on recent GPUs, slower on older ones.
 
-* ``chunked``, pure PyTorch: materialises ``[chunk, vocab]`` logits in fp32 and
-  runs a dense ``cross_entropy`` per chunk. Memory-frugal, no Triton, works
-  everywhere, but the fp32 logits materialisation + dense softmax cost real time
-  on large vocabularies.
-* ``liger`` , fused Triton kernel: never materialises the full logits, fuses
-  ``lm_head @ x`` with the cross-entropy. Wins on newer GPUs (A100/H100/B200) with
-  fast tensor cores and ample shared memory; *loses* on older cards (e.g. T4 sm_75)
-  where the fp32 grad writes + ``@ weight.t()`` GEMM dominate.
-
-Which one wins is a property of the **GPU**, not something to hard-code. So, in the
-same spirit as the kernel block-size autotune (:mod:`dsalt.kernels.autotune`), when
-``loss_fn="auto"`` we *measure* both strategies, and, for ``chunked``, a sweep of
-``chunk_size`` candidates derived from the real token count, once per
-``(device, vocab)`` and cache the winner for the whole run.
-
-Nothing here is device-specific: the candidates are generated from the runtime
-token count and the choice falls out of the measurement. The day this runs on an
-A100/B200 the tuner will pick ``liger`` (or a larger chunk) on its own.
+With ``loss_fn="auto"`` both are measured, ``chunked`` over chunk sizes derived
+from the token count, once per ``(device, vocab)``, and the faster one is cached.
 """
 
 import os
@@ -37,12 +24,7 @@ def _key(device: torch.device, vocab: int) -> tuple:
 
 
 def _is_main_process(device: torch.device | None = None) -> bool:
-    """True only on the main rank (mirrors :func:`autotune._is_main_process`).
-
-    Each rank tunes its own GPU, but the debug table prints once. We avoid
-    importing from ``autotune`` to keep this module's import graph minimal;
-    the logic is identical (DDP rank → env rank → CUDA ordinal fallback).
-    """
+    """True only on the main rank (same logic as :func:`autotune._is_main_process`)."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank() == 0
     for var in ("RANK", "LOCAL_RANK"):
@@ -55,16 +37,8 @@ def _is_main_process(device: torch.device | None = None) -> bool:
 
 
 def _chunk_candidates(n_tok: int, vocab: int) -> list[int]:
-    """Candidate ``chunk_size`` values for the chunked loss, derived from runtime.
-
-    Fractions of the real token count (1/16 … full), clamped to a sane floor and
-    to ``n_tok``. NOT a fixed constant: a big-VRAM GPU keeps the large chunk
-    (fewer kernel launches), a small one falls back to smaller chunks. The
-    measurement decides, this only enumerates plausible sizes.
-
-    Returned in **ascending** order so the caller can sweep small→large and stop
-    at the first OOM: a larger chunk allocates strictly more (its ``[chunk,
-    vocab]`` fp32 logits grow), so once one OOMs every larger one would too.
+    """Candidate chunk sizes for the chunked loss: fractions of the token count (1/16 to
+    all), with a floor. Ascending, so the sweep can stop at the first OOM.
     """
     cands: list[int] = []
     for div in (16, 8, 4, 2, 1):
@@ -76,23 +50,11 @@ def _chunk_candidates(n_tok: int, vocab: int) -> list[int]:
 
 
 def _bench(loss_call, warmup: int = 2, iters: int = 5) -> float:
-    """CUDA forward-only time (ms) of a loss strategy; ``inf`` on OOM/fail.
+    """Forward-only CUDA time (ms) of a loss strategy; ``inf`` on OOM or failure.
 
-    Timed **forward-only** under ``torch.no_grad()`` on detached *views* of the
-    live tensors (no clones, no extra grad buffers): this is the whole point of
-    the design choice, the autotune fires inside the first forward, while the
-    training graph is still alive and VRAM is already tight, so allocating clones
-    of the 50k×512 embedding + their grads is exactly what blew up the T4. A
-    forward-only measure on views adds ~zero memory.
-
-    Forward-only is enough to *rank* the strategies: chunked's cost is dominated
-    by the fp32 logits materialisation + dense softmax (a forward effect), and
-    Liger's whole advantage is *not* materialising those logits, visible in the
-    forward already. The backward tracks the forward for both, so the order is
-    preserved on every GPU (chunked wins on T4, liger wins on A100+).
-
-    ``empty_cache()`` is called on OOM so a failed (too-large) candidate does not
-    leave fragmentation behind for the next candidate or for the real training.
+    Timed under ``torch.no_grad()`` on detached views, so it allocates almost no extra
+    memory. The forward is enough to rank the two strategies, since the difference is
+    whether the logits are materialized. ``empty_cache()`` runs after an OOM.
     """
     try:
         with torch.no_grad():
@@ -125,28 +87,20 @@ def autotune_loss(
     liger_ok: bool,
     default_chunk: int,
 ) -> dict:
-    """Measure loss strategies once per ``(device, vocab)`` and cache the winner.
+    """Measure the loss strategies once per ``(device, vocab)`` and cache the winner.
 
-    Marked ``@torch._dynamo.disable``: this runs inside the first compiled forward
-    but is a one-shot eager routine (CUDA ``Event`` timing, ``print`` progress,
-    ``empty_cache``). Letting Dynamo trace it both defeats the purpose (re-timing
-    every recompile) and crashes — the ``print`` calls trigger a graph break whose
-    own formatting raises ``'tuple' object has no attribute 'splitlines'``. Keep it
-    opaque so it always executes eagerly, once, returning a plain dict.
+    Opaque to torch.compile: it runs inside the first compiled forward but is a one-shot
+    eager routine (CUDA event timing, prints, ``empty_cache``).
 
-    Args mirror what :class:`DSALTLMHeadModel` already has on hand: ``x`` flat
-    ``[n_tok, d_model]`` hidden states, the lm_head ``weight``, flat ``labels``,
-    and the two loss callables. Returns ``{"loss_fn", "chunk_size"}``.
-
-    Forward-only timing (no backward) is enough to rank the strategies: the
-    backward cost tracks the forward cost for both, and we only need the *order*.
+    ``x`` is the flat ``[n_tok, d_model]`` hidden state, ``weight`` the lm_head weight,
+    ``labels`` the flat labels. Returns ``{"loss_fn", "chunk_size"}``.
     """
     device = x.device
     key = _key(device, vocab)
     if key in _LOSS_TUNED:
         return _LOSS_TUNED[key]
 
-    # CPU / no-Triton: chunked is the only option (Liger needs Triton).
+    # Without Triton only the chunked loss is available.
     if device.type != "cuda" or not liger_ok or liger_fn is None:
         choice = {"loss_fn": "chunked", "chunk_size": default_chunk}
         _LOSS_TUNED[key] = choice
@@ -156,18 +110,14 @@ def autotune_loss(
     results: list[tuple[str, int | None, float]] = []
     main = _is_main_process(device)
 
-    # Detached VIEWS of the live tensors, NOT clones. The autotune runs inside
-    # the first forward, with the training graph alive and VRAM already tight;
-    # cloning the 50k×512 embedding + grads is what OOM'd the T4. Forward-only
-    # under no_grad on these views never writes a grad into the real parameter
-    # and allocates ~nothing beyond each candidate's own logits.
+    # Detached views of the live tensors, not clones: the autotune runs inside the first
+    # forward, when memory is already in use. Forward-only timing under no_grad
+    # allocates only each candidate's logits.
     x_d = x.detach()
     w_d = weight.detach()
     lbl = labels.detach()
 
-    # Progress log (only on the main rank), in the same spirit as the kernel
-    # block-size autotune: one line per benchmarked candidate so the user sees
-    # the tuner working instead of a silent stall on the first forward.
+    # One progress line per candidate, on the main rank.
     chunk_cands = _chunk_candidates(n_tok, vocab)
     n_cands = len(chunk_cands) + 1  # + liger
     if main:
@@ -175,8 +125,8 @@ def autotune_loss(
         print(f"\n  DSALT loss autotune | vocab={vocab} | n_tok={n_tok} | {name}")
         print(f"  measuring {n_cands} candidate(s) (forward-only, no clones)…")
 
-    # chunked: sweep chunk_size candidates small→large; stop at the first OOM
-    # (a larger chunk allocates strictly more, so it would OOM too).
+    # chunked: chunk sizes from small to large, stopping at the first OOM (a larger
+    # chunk needs more memory).
     for i, cs in enumerate(chunk_cands, start=1):
         ms = _bench(lambda cs=cs: chunked_fn(x_d, w_d, lbl, cs))
         results.append(("chunked", cs, ms))
@@ -184,25 +134,23 @@ def autotune_loss(
             ms_s = "OOM/fail" if ms == float("inf") else f"{ms:8.4f} ms"
             print(f"    [{i}/{n_cands}] chunked  chunk={cs:<8} {ms_s}")
         if ms == float("inf"):
-            # Skip the remaining (larger) chunked candidates, all would OOM.
             for cs_skip in chunk_cands[i:]:
                 results.append(("chunked", cs_skip, float("inf")))
             break
 
-    # liger: single fused config (its own internal block sizing is shape-driven).
+    # liger: one fused config.
     ms = _bench(lambda: liger_fn(x_d, w_d, lbl))
     results.append(("liger", None, ms))
     if main:
         ms_s = "OOM/fail" if ms == float("inf") else f"{ms:8.4f} ms"
         print(f"    [{n_cands}/{n_cands}] liger    chunk={'-':<8} {ms_s}")
 
-    # Release any scratch the candidates left so the real training step starts
-    # from a clean allocator (no fragmentation carried over from the sweep).
+    # Free the candidates' scratch before training starts.
     torch.cuda.empty_cache()
 
     valid = [r for r in results if r[2] != float("inf")]
     if not valid:
-        # Everything OOM'd (shouldn't happen): safe fallback.
+        # Every candidate ran out of memory: fall back to chunked.
         choice = {"loss_fn": "chunked", "chunk_size": default_chunk}
     else:
         best = min(valid, key=lambda r: r[2])
